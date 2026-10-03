@@ -554,6 +554,55 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
   swap_chain_width = 0;
 }
 
+namespace {
+// DRED breadcrumbs for a device loss detected on the present path.
+//
+// The command processor has an equivalent (LogDeviceRemovalDiagnostics), but it
+// only runs when *it* notices the loss, which happens when it opens a
+// submission. When the loss surfaces at Present instead -- which is what happens
+// if the game is idle or dies between submissions -- nothing dumps DRED, and the
+// one piece of evidence that actually names the faulting GPU operation is lost.
+//
+// A real example (UFC 3, 2026-10-03): runs died at 65s, 90s and 105s with
+// byte-identical abort reports and no DRED anywhere, even though DRED was
+// enabled and had been decisive on an earlier run. It was enabled precisely so
+// this information would exist; not collecting it at the point of loss made the
+// enabling pointless.
+void DumpDeviceRemovedDiagnostics(ID3D12Device* device, HRESULT reason) {
+  Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+  if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred)))) {
+    REXLOG_ERROR("Device removed (0x{:08X}) but DRED is unavailable on this device",
+                 static_cast<unsigned>(reason));
+    return;
+  }
+
+  D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs = {};
+  if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
+    for (const D3D12_AUTO_BREADCRUMB_NODE* node = breadcrumbs.pHeadAutoBreadcrumbNode; node;
+         node = node->pNext) {
+      if (!node->pLastBreadcrumbValue || !node->pCommandHistory ||
+          *node->pLastBreadcrumbValue == 0) {
+        continue;
+      }
+      REXLOG_ERROR("DRED breadcrumb: completed {} of {} ops", *node->pLastBreadcrumbValue,
+                   node->BreadcrumbCount);
+      const uint32_t last = std::min(*node->pLastBreadcrumbValue, node->BreadcrumbCount);
+      const uint32_t start = last > 3 ? last - 3 : 0;
+      const uint32_t end = std::min(last + 1, node->BreadcrumbCount);
+      for (uint32_t i = start; i < end; i++) {
+        REXLOG_ERROR("  [{}] op type {}{}", i, static_cast<int>(node->pCommandHistory[i]),
+                     (i == last ? " <-- FAULT" : ""));
+      }
+    }
+  }
+
+  D3D12_DRED_PAGE_FAULT_OUTPUT page_fault = {};
+  if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&page_fault)) && page_fault.PageFaultVA != 0) {
+    REXLOG_ERROR("DRED page fault at VA 0x{:016X}", page_fault.PageFaultVA);
+  }
+}
+}  // namespace
+
 Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
   // Begin the command list with the command allocator not currently potentially
   // used on the GPU.
@@ -1162,15 +1211,45 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
   paint_context_.present_submission_tracker.NextSubmission();
+  if (FAILED(present_result)) {
+    // Say what happened, and ask the device why.
+    //
+    // Two reasons this is worth the two lines. First, Present reports
+    // DXGI_ERROR_DEVICE_REMOVED for *any* device loss, including one the OS
+    // already reset -- so once Windows has reacted to a TDR, the HRESULT from
+    // Present no longer says what went wrong. GetDeviceRemovedReason does: it
+    // keeps the original reason, so a timeout still reads back as
+    // DXGI_ERROR_DEVICE_HUNG (0x887A0006) rather than the generic
+    // DEVICE_REMOVED. Second, the presenter is often the only place device loss
+    // is noticed at all, because the command processor only checks
+    // GetDeviceRemovedReason() when it opens a submission; if the game is idle
+    // or dies between submissions, the loss surfaces here first and the runtime
+    // used to abort with nothing in the log but whatever preceded it.
+    const HRESULT removed_reason = provider_.GetDevice()->GetDeviceRemovedReason();
+    REXLOG_ERROR("Present failed: HRESULT 0x{:08X}; GetDeviceRemovedReason: 0x{:08X}",
+                 static_cast<unsigned>(present_result), static_cast<unsigned>(removed_reason));
+    if (removed_reason == DXGI_ERROR_DEVICE_HUNG || removed_reason == DXGI_ERROR_DEVICE_REMOVED ||
+        removed_reason == DXGI_ERROR_DRIVER_INTERNAL_ERROR ||
+        removed_reason == DXGI_ERROR_DEVICE_RESET) {
+      DumpDeviceRemovedDiagnostics(provider_.GetDevice(), removed_reason);
+    }
+  }
   switch (present_result) {
     case DXGI_ERROR_DEVICE_REMOVED:
       return PaintResult::kGpuLostExternally;
     case DXGI_ERROR_DEVICE_RESET:
       return PaintResult::kGpuLostResponsible;
+    case DXGI_ERROR_DEVICE_HUNG:
+      // A timeout. This was missing: it fell through to `default`, where
+      // SUCCEEDED() is false, so the presenter answered kNotPresented and kept
+      // going with a device the OS was about to reset -- the one loss reason
+      // that actually matters for a GPU-bound workload, silently ignored.
+      return PaintResult::kGpuLostResponsible;
     default:
       return SUCCEEDED(present_result) ? PaintResult::kPresented : PaintResult::kNotPresented;
   }
 }
+
 
 bool D3D12Presenter::InitializeSurfaceIndependent() {
   // Check if DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING is supported.
