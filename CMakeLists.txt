@@ -186,9 +186,13 @@ add_compile_definitions(REXGLUE_BUILD_CONFIG="$<CONFIG>")
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_pch.cmake)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_version.cmake)
+# SOURCE_DIR is this SDK's root on purpose: see the note in rex_version.cmake.
+# Without it the default is CMAKE_SOURCE_DIR, which for an add_subdirectory()
+# consumer is the consumer's tree, and its release tags abort the configure.
 rex_resolve_version(REXGLUE_FULL_VERSION
     FLOOR_MAJOR ${PROJECT_VERSION_MAJOR}
-    FLOOR_MINOR ${PROJECT_VERSION_MINOR})
+    FLOOR_MINOR ${PROJECT_VERSION_MINOR}
+    SOURCE_DIR ${REXGLUE_ROOT})
 
 # Strip the -id trailer (if any) for the numeric-only version.
 string(REGEX REPLACE "-.*$" "" REXGLUE_NUMERIC_VERSION "${REXGLUE_FULL_VERSION}")

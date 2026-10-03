@@ -109,8 +109,31 @@ function(rex_resolve_version out_var)
     set(one_value FLOOR_MAJOR FLOOR_MINOR SOURCE_DIR)
     cmake_parse_arguments(ARG "" "${one_value}" "" ${ARGN})
 
+    # Default to the SDK's own root, NOT CMAKE_SOURCE_DIR.
+    #
+    # CMAKE_SOURCE_DIR is the top-level project. When the SDK is consumed the
+    # normal way -- add_subdirectory() from generated/rexglue.cmake, which is
+    # what REXSDK_DIR sets up -- the top-level project is the *consumer*, not the
+    # SDK. So `git describe` ends up running in the consumer's working tree and
+    # reports the consumer's release tags.
+    #
+    # That is not hypothetical. Configuring paulogaab21/ufc3recomp against this
+    # SDK aborts with:
+    #
+    #   rex_compute_version: floor version (0.10) is behind tag version (1.0).
+    #   The floor in CMakeLists.txt must not regress.
+    #
+    # because ufc3recomp is tagged v1.0.0/v1.0.1/v1.0.2 and the SDK's floor is
+    # 0.10. The consumer's version has no bearing on the SDK's own version, so
+    # reading it is simply wrong -- and it fails hardest for exactly the projects
+    # most likely to consume the SDK, since those are the ones with their own
+    # release tags.
     if(NOT ARG_SOURCE_DIR)
-        set(ARG_SOURCE_DIR "${CMAKE_SOURCE_DIR}")
+        if(REXGLUE_ROOT)
+            set(ARG_SOURCE_DIR "${REXGLUE_ROOT}")
+        else()
+            set(ARG_SOURCE_DIR "${CMAKE_SOURCE_DIR}")
+        endif()
     endif()
 
     find_program(GIT_EXECUTABLE git)
