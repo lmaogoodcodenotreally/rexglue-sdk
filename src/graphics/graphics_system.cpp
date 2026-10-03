@@ -217,6 +217,25 @@ void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_respons
   if (host_gpu_loss_reported_.test_and_set(std::memory_order_relaxed)) {
     return;
   }
+  // Say so before giving up, and say how we got here.
+  //
+  // This is reached from two very different places. One is the command
+  // processor's BeginSubmission, which checks GetDeviceRemovedReason() and logs
+  // the reason plus DRED breadcrumbs first -- that path is well diagnosed. The
+  // other is the presenter's loss callback (graphics_system.cpp, via
+  // CreatePresenter's loss_cb), which fires on whichever thread noticed the loss
+  // and carries no reason at all. On that second path the process used to abort
+  // with nothing in the log whatsoever: the message went to stderr, which a
+  // GUI-subsystem executable does not have, so the log simply stopped mid-frame.
+  //
+  // A real example, 2026-10-03: three runs of a recompiled game died at 65s,
+  // 105s and 290s with byte-identical abort reports (0xC0000409 at the same
+  // offset) and not one error line between them. The reason only became visible
+  // by attaching a terminal and letting the runtime print it:
+  //
+  //   FATAL ERROR: Graphics device lost (probably due to an internal error)
+  REXLOG_ERROR("Host GPU lost (reported by {}), is_responsible={}. Giving up.",
+               is_responsible ? "the command processor" : "the presenter", is_responsible);
   rex::FatalError("Graphics device lost (probably due to an internal error)");
 }
 

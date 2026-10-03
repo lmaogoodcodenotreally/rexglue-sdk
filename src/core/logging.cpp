@@ -155,6 +155,12 @@ namespace {
 // makes those failures nameable.
 void ReportFatalErrorToLog(const char* message) {
   REXLOG_ERROR("FATAL ERROR: {}", message);
+  // Flush explicitly. Whatever comes next is std::abort(), which does not run
+  // destructors and does not flush: without this the line above is still sitting
+  // in the sink's buffer when the process dies, which makes the hook no more use
+  // than the stderr write it replaces. A fatal error that is logged but not
+  // flushed is the same invisible fatal error.
+  FlushLogging();
 }
 }  // namespace
 
