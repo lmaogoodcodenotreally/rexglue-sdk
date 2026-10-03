@@ -1528,17 +1528,15 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
     }
     REXSYS_ERROR(
         "BaseHeap::Alloc failed to find contiguous range: asked {} pages ({} bytes, align 0x{:X}, "
-        "top_down={}) in window pages {}..{} of heap {} pages ({} free, largest run {}); "
-        "heap-wide: {} free of {} ({} reserved)",
-        page_count, size, alignment, top_down ? 1 : 0, low_page_number, high_page_number,
-        uint32_t(page_table_.size()), window_pages, free_in_window, largest_in_window,
-        unreserved_page_count_, uint32_t(page_table_.size()),
-        total_page_count() - unreserved_page_count_);
+        "top_down={}); window pages {}..{} = {} pages; free in window {} pages, largest contiguous "
+        "run in window {} pages; heap-wide: {} free of {} pages",
+        page_count, size, alignment, top_down ? 1 : 0, low_page_number, high_page_number, window_pages,
+        free_in_window, largest_in_window, unreserved_page_count_, uint32_t(page_table_.size()));
     if (largest_in_window >= page_count) {
       REXSYS_ERROR(
-          "BaseHeap::Alloc: the window DOES contain {} contiguous free pages, at least {} "
-          "needed. The free-range search failed to find a run that exists -- this is a bug in "
-          "the search, not an out-of-memory condition.",
+          "BaseHeap::Alloc: the window DOES contain {} contiguous free pages, at least {} needed. "
+          "The free-range search failed to find a run that exists -- this is a bug in the search, "
+          "not an out-of-memory condition.",
           largest_in_window, page_count);
     }
     assert_always("Heap exhausted!");
