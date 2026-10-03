@@ -66,4 +66,23 @@ set(REXKERNEL_SOURCES
 list(TRANSFORM REXKERNEL_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 target_sources(rexruntime PRIVATE ${REXKERNEL_SOURCES})
 
-target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexaudio rexinput imgui)
+target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexaudio rexinput)
+
+# imgui is PUBLIC on rexruntime, not PRIVATE.
+#
+# include/rex/rex_app.h is a public header of rexruntime and it reaches
+# <imgui.h> transitively:
+#
+#   rex/rex_app.h -> rex/ui/imgui_dialog.h -> rex/ui/imgui_drawer.h
+#                 -> rex/ui/style.h -> #include <imgui.h>
+#
+# The imgui target does export its include directory as PUBLIC, but a PRIVATE
+# link from rexruntime stops the propagation there. Every consumer of rexruntime
+# -- which is every generated project, since that is how the runtime is reached
+# -- then fails to compile, with an error in a file it never wrote:
+#
+#   include/rex/ui/style.h:18:10: fatal error: 'imgui.h' file not found
+#
+# Nothing about imgui needs to be private here: it is vendored into the build,
+# and this target is the only thing standing between it and the consumer.
+target_link_libraries(rexruntime PUBLIC imgui)
