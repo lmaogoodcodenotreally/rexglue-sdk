@@ -419,3 +419,9 @@ FodyWeavers.xsd
 
 # CMake User Overrides
 CMakeUserPresets.json
+
+# standalone differential tests (build artifacts)
+tests/standalone/*.exe
+tests/standalone/*.obj
+tests/standalone/*.pdb
+tests/standalone/*.ilk
