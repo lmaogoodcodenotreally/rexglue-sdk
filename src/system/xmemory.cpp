@@ -1497,8 +1497,50 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
     }
   }
   if (start_page_number == UINT_MAX || end_page_number == UINT_MAX) {
-    // Out of memory.
-    REXSYS_ERROR("BaseHeap::Alloc failed to find contiguous range");
+    // Out of memory -- but "out of memory" is doing a lot of work in that
+    // sentence, and the log used to say nothing more than the fact of the
+    // failure. A heap that reports itself nearly empty while refusing a small
+    // request is the case worth separating out, because the two have different
+    // causes and different fixes:
+    //
+    //   * genuinely full      -> the caller asked for more than exists.
+    //   * window exhausted    -> the heap has room, but not in the range the
+    //                            caller asked for. MmAllocatePhysicalMemoryEx
+    //                            forwards the guest's own min/max range, so this
+    //                            is a normal outcome, not a bug in the search.
+    //
+    // Both look identical from the outside: false, and an out_address of 0. The
+    // Xbox 360 ABI has no status code for this, so the caller returns 0 to the
+    // guest, and a guest that does not check dereferences it. That is the whole
+    // story of a crash that starts here, so print what makes it decidable.
+    const uint32_t window_pages = high_page_number - low_page_number + 1;
+    uint32_t free_in_window = 0;
+    uint32_t largest_in_window = 0;
+    uint32_t run = 0;
+    for (uint32_t page_number = low_page_number; page_number <= high_page_number; ++page_number) {
+      if (page_table_[page_number].state == 0) {
+        ++free_in_window;
+        ++run;
+        largest_in_window = std::max(largest_in_window, run);
+      } else {
+        run = 0;
+      }
+    }
+    REXSYS_ERROR(
+        "BaseHeap::Alloc failed to find contiguous range: asked {} pages ({} bytes, align 0x{:X}, "
+        "top_down={}) in window pages {}..{} of heap {} pages ({} free, largest run {}); "
+        "heap-wide: {} free of {} ({} reserved)",
+        page_count, size, alignment, top_down ? 1 : 0, low_page_number, high_page_number,
+        uint32_t(page_table_.size()), window_pages, free_in_window, largest_in_window,
+        unreserved_page_count_, uint32_t(page_table_.size()),
+        total_page_count() - unreserved_page_count_);
+    if (largest_in_window >= page_count) {
+      REXSYS_ERROR(
+          "BaseHeap::Alloc: the window DOES contain {} contiguous free pages, at least {} "
+          "needed. The free-range search failed to find a run that exists -- this is a bug in "
+          "the search, not an out-of-memory condition.",
+          largest_in_window, page_count);
+    }
     assert_always("Heap exhausted!");
     return false;
   }
