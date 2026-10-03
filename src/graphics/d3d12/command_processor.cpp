@@ -2922,6 +2922,41 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       return true;
     }
     if (rb.buffers[write_index]) {
+      // Wait for the GPU before dropping the buffer this one replaces.
+      //
+      // A readback buffer is written by a CopyBufferRegion that the GPU may
+      // still be executing, and it is read back on a *later* frame -- that is
+      // the whole point of the two-buffer ping-pong. So releasing it here
+      // without a fence drops the last reference while the copy is still in
+      // flight, and the GPU then faults on the copy.
+      //
+      // This is not theoretical. With readback_resolve = "some" (and "fast"),
+      // use_delayed_sync is true, which is precisely a promise not to wait
+      // between frames -- so nothing else in this function covers for the gap.
+      // On AMD a fault inside a copy does not come back as a clean
+      // DXGI_ERROR_DEVICE_HUNG; it hangs, Windows resets the device, and the
+      // runtime aborts.
+      //
+      // DRED from a real UFC 3 run (2026-10-03), with readback_resolve = "some":
+      //
+      //   D3D12 device removed: 0x887A0006 - DEVICE_HUNG
+      //   DRED breadcrumb: completed 2584 of 3808 ops
+      //     [2582] op type 6   DISPATCH
+      //     [2583] op type 15  RESOURCEBARRIER
+      //     [2584] op type 7   COPYBUFFERREGION   <-- FAULT
+      //   DRED page fault at VA 0x0000000280781000
+      //
+      // The recreate path is reached whenever the resolve *grows*, and the log
+      // shows it growing: readback requests of 0, 1 and 4 MB in the same
+      // session. Every one of those drops a buffer the GPU may still be
+      // copying from.
+      //
+      // The cost is one queue flush when a resolve outgrows its buffer, which
+      // is a rare event by construction -- it only happens on a size increase.
+      if (!AwaitAllQueueOperationsCompletion()) {
+        buffer->Release();
+        return true;
+      }
       if (rb.mapped_data[write_index]) {
         rb.buffers[write_index]->Unmap(0, nullptr);
         rb.mapped_data[write_index] = nullptr;
