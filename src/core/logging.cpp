@@ -22,6 +22,7 @@
 
 #include <toml++/toml.hpp>
 
+#include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
@@ -143,7 +144,25 @@ std::shared_ptr<spdlog::logger> CreateCategoryLogger(const std::string& name) {
 
 }  // namespace
 
+namespace {
+// Fatal errors have to reach the log, not only stderr.
+//
+// rex::FatalError reports to stderr and then aborts. For a GUI-subsystem
+// executable -- which is how recompiled games are built, e.g.
+// add_executable(ufc3 WIN32 ...) -- there is no console and no attached stderr,
+// so the message was discarded and the process died with 0xC0000409 and no
+// explanation in the log. Registering the log as a fatal-error sink is what
+// makes those failures nameable.
+void ReportFatalErrorToLog(const char* message) {
+  REXLOG_ERROR("FATAL ERROR: {}", message);
+}
+}  // namespace
+
 void InitLoggingEarly() {
+  // Registered here, at the earliest point where a sink exists, so a fatal
+  // error during later startup is still reported.
+  rex::SetFatalErrorHook(&ReportFatalErrorToLog);
+
   std::lock_guard lock(g_mutex);
   if (g_early_initialized || g_initialized)
     return;

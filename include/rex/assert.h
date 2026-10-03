@@ -115,11 +115,56 @@ namespace rex {
 /// Use in switch default cases and after exhaustive if-else chains.
 #define rex_unreachable() std::unreachable()
 
+// Fatal error hook.
+//
+// FatalError below cannot include the logging headers directly: this header is
+// included essentially everywhere in the SDK, and rex/logging.h is not a
+// dependency any of those translation units should inherit. So the log
+// subsystem registers a sink here instead.
+//
+// WHY THIS EXISTS
+//
+// FatalError used to report only to stderr. For a console application that is
+// fine. For a GUI-subsystem executable it is not: the process has no console and
+// no attached stderr, so the message goes nowhere at all and the program aborts
+// with 0xC0000409 and nothing in the log to explain it.
+//
+// That is not a corner case, it is how recompiled games actually ship --
+// ufc3recomp builds its executable with add_executable(ufc3 WIN32 ...), i.e.
+// subsystem 2, and its crash reports come out as bare aborts. Two runs on
+// 2026-10-03 died this way and the log contained no error line whatsoever, only
+// whatever incidental noise preceded it. Whatever the fatal condition was, it
+// was invisible; with the hook registered it would have been named.
+using FatalErrorHook = void (*)(const char* message);
+
+inline FatalErrorHook* GetFatalErrorHookSlot() {
+  static FatalErrorHook hook = nullptr;
+  return &hook;
+}
+
+inline void SetFatalErrorHook(FatalErrorHook hook) {
+  *GetFatalErrorHookSlot() = hook;
+}
+
 // Fatal error that terminates the program with a message
 [[noreturn]] inline void FatalError(const char* message) {
   // Print to stderr and terminate
   fprintf(stderr, "FATAL ERROR: %s\n", message);
   fflush(stderr);
+  // And to the log, which is the only channel that exists in a GUI-subsystem
+  // process. Guarded against re-entry: if logging itself fails fatally, the
+  // abort below must still happen rather than recursing.
+  if (FatalErrorHook hook = *GetFatalErrorHookSlot()) {
+    static bool reentered = false;
+    if (!reentered) {
+      reentered = true;
+      try {
+        hook(message);
+      } catch (...) {
+        // Never let the reporter stop the abort it is reporting.
+      }
+    }
+  }
   std::abort();
 }
 
