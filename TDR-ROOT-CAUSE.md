@@ -78,27 +78,97 @@ Likely because `AwaitAllQueueOperationsCompletion()` ends the open submission an
 submission boundaries appears to stop pages being recycled. That mechanism is a
 hypothesis, not a measurement.
 
-It is retained, **default off**, with the reversal recorded at the declaration.
+It has since been **removed from the tree**, because it was the wrong cure — see
+below.
 
-Note the fault is *inside* the copy, not on a released buffer, so a fence before
-the release was addressing the wrong thing.
+The earlier note in this document said the fault was *inside* the copy rather
+than on a released buffer, so a fence before release was addressing the wrong
+thing. That inference was wrong: "the copy faulted" and "the copy's destination
+was freed" are the same observation seen from two sides, and instrumenting the
+copy is what finally separated them.
 
-## Next step
+## Instrumenting the copy ruled out the obvious suspect
 
-The copy that faults is the resolve readback:
+Setting `draw_resolution_scale_x/y = 1` makes `IsDrawResolutionScaled()` false,
+so the branch taken is the unscaled one:
 
+    shared_memory_->UseAsCopySource();
+    SubmitBarriers();
     deferred_command_list_.D3DCopyBufferRegion(
         rb.buffers[write_index], 0, shared_memory_buffer, written_address, written_length);
 
-Open question: which of those two resources is faulting, and why a `DISPATCH`
-immediately precedes it. Worth checking whether a compute UAV is being created on
-an upload- or readback-heap resource, which Direct3D 12 does not permit —
-`D3D12_HEAP_TYPE_UPLOAD` is CPU-write-only and `D3D12_HEAP_TYPE_READBACK` is
-`COPY_DEST`-only. There is also a downscale path in the same function that
-creates a `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS` buffer and runs a compute
-dispatch over it, though it should be inactive at `draw_resolution_scale` 1.
+Shared memory is a **tiled reserved resource**, `kBufferSize = 512 MB`
+(`kBufferSizeLog2 = 29`), created with `CreateReservedResource` and mapped on
+demand. The copy's source offset is a raw guest physical address. That looked
+like the fault: an unmapped tile, or a source offset past the end of the
+resource.
 
-That is the next thing to investigate, not something this document concludes.
+Logging the operands disproved it. From a real run:
+
+    shared memory : 0x203700000 + 0x20000000 -> ends 0x223700000
+    last copy     : dst 0x226CC0000 (4 MB) | src 0x203700000 + 0x13596000, len 0x398000
+    fault VA      : 0x24B382000
+
+The fault is **outside shared memory** and **outside the destination of the last
+recorded copy**. A range guard across every one of the 2,309 recorded copies in
+that run never fired: every shared-memory range was in bounds. So neither operand
+of the resolve copy owns the fault address.
+
+Two runs gave fault VAs (`0x24A8AA000`, `0x24B382000`) that belong to no live
+logged resource at all.
+
+## What does release resources while copies are in flight
+
+`readback_buffers_` — keyed by `(written_address, written_length)` — is a cache
+with `kMaxReadbackBuffers = 256`. A 30-second UFC 3 session accumulated
+**492 distinct resolve keys and 342 buffer creations**, so the map is over its
+cap almost immediately and `EvictOldReadbackBuffers` runs **every frame**.
+
+Three sites drop readback buffers. Two had no synchronization whatsoever:
+
+| site | what it did |
+|---|---|
+| resolve growth | bare `Release()` |
+| memexport growth | queue flush, then `Release()` |
+| `EvictOldReadbackBuffers` | **bare `Release()`, no fence, no deferral** |
+
+`DeferredCommandList` stores raw `ID3D12Resource*` with no `AddRef`, and a
+Direct3D 12 command list does not keep the resources it names alive for the
+application. Releasing a buffer that a recorded copy still references means the
+GPU writes into memory that no longer exists — which is not reported as an API
+error. It surfaces as a DRED page fault, a breadcrumb that stops on
+`COPYBUFFERREGION`, and `DXGI_ERROR_DEVICE_HUNG`.
+
+That fits every observation: the faulting op is a copy, and the fault address
+belongs to nothing live.
+
+## The fix
+
+`ScheduleResourceDeletion()` hands the resource to `resources_for_deletion_` —
+the SDK's own deferred-deletion queue, already used correctly for the resolve
+downscale buffer — and all three sites now go through it. It waits one
+submission past both the current and the last completed submission, which covers
+work that is *recorded but not yet submitted*, the state nearly all of these
+buffers are in when dropped.
+
+Crucially there is **no queue flush**. That was the fatal flaw in the fence:
+`AwaitAllQueueOperationsCompletion()` closes the open submission, and
+`GraphicsUploadBufferPool` reclaims pages by submission index, which is why the
+fence made deaths faster rather than slower. Deferral fixes the lifetime bug
+without touching submission boundaries, so the cvar is gone — there is nothing
+left to toggle.
+
+Also added: a range guard on every `CopyBufferRegion` at the replay choke point
+(an out-of-range copy records without complaint and faults on the GPU; now it is
+logged with full operands and skipped), operand logging behind
+`d3d12_readback_copy_log`, and a per-call eviction count so the churn is
+measurable rather than assumed.
+
+**Status: hypothesis with a complete evidence chain, not yet confirmed by a
+surviving run.** Two earlier "fixes" were disproven by test. Confirmation means
+a match well past the 60–90s mark with evictions still firing; refutation means
+another `DEVICE_HUNG`, in which case the watcher attributes the fault VA against
+every recorded copy's operand ranges and against readback buffer bases.
 
 ## Crash 1 is unrelated and still open
 
