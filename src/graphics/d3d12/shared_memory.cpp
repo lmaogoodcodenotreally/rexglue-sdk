@@ -81,6 +81,14 @@ bool D3D12SharedMemory::Initialize() {
   buffer_gpu_address_ = buffer_->GetGPUVirtualAddress();
   buffer_uav_writes_commit_needed_ = false;
 
+  // The resolve readback path copies out of this buffer using a guest physical
+  // address directly as the D3D12 source offset, so this base address is one of
+  // the two candidate owners of any DRED page-fault address observed while
+  // resolving. Recorded once so a fault VA can be resolved to a resource and an
+  // offset rather than left as an unattributable number.
+  REXGPU_INFO("Shared memory: GPU VA 0x{:016X}, {} MB, guest physical maps 1:1 from offset 0",
+              uint64_t(buffer_gpu_address_), kBufferSize >> 20);
+
   D3D12_DESCRIPTOR_HEAP_DESC buffer_descriptor_heap_desc;
   buffer_descriptor_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
   buffer_descriptor_heap_desc.NumDescriptors = uint32_t(BufferDescriptorIndex::kCount);

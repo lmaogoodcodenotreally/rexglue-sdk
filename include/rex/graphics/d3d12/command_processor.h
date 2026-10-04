@@ -382,6 +382,18 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint64_t last_used_frame = 0;
   };
   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
+
+  // Hand a resource to the deferred-deletion queue instead of releasing it now.
+  //
+  // A deferred command list stores raw ID3D12Resource* with no AddRef, and a
+  // Direct3D 12 command list does not keep the resources it references alive
+  // for the application. Releasing a buffer that a recorded copy still names
+  // therefore lets the GPU write into memory that no longer exists, which is
+  // not reported as an API error -- it shows up as a DRED page fault, a
+  // breadcrumb that stops on a COPYBUFFERREGION, and DXGI_ERROR_DEVICE_HUNG.
+  // See ScheduleResourceDeletion in command_processor.cpp for why it waits one
+  // submission further back than the obvious choice.
+  void ScheduleResourceDeletion(ID3D12Resource* resource);
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
   static constexpr size_t kMaxReadbackBuffers = 256;
   static constexpr uint64_t kReadbackBufferEvictionAgeFrames = 60;

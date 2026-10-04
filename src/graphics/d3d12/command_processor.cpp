@@ -35,6 +35,40 @@
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// d3d12_readback_fence_before_release used to be defined here.
+//
+// It waited for the queue before releasing a replaced resolve readback buffer.
+// The race it guarded was real and DRED pointed right at it:
+//
+//   DRED breadcrumb: completed 2584 of 3808 ops
+//     [2584] op type 7   COPYBUFFERREGION   <-- FAULT
+//   DRED page fault at VA 0x0000000280781000
+//
+// But waiting for the queue made in-match runs die *sooner* (90s, then 38s)
+// than the unmodified build (230s, 82s, 75s), because
+// AwaitAllQueueOperationsCompletion() closes the open submission and
+// GraphicsUploadBufferPool reclaims its pages by submission index.
+//
+// The race was then fixed the right way instead: the buffer is handed to
+// resources_for_deletion_ and released once the GPU is genuinely done with it,
+// without touching submission boundaries. See ScheduleResourceDeletion. The
+// cvar is gone because there is nothing left to toggle.
+
+// Log the GPU virtual addresses of every buffer copy the emulator records.
+//
+// DRED names the faulting operation and the faulting address, but not *which
+// resource* that address belongs to. Two runs faulted at 0x000000024A8AA000 and
+// 0x0000000280781000 -- meaningless on their own, because the copy has two
+// operands and both are host-side allocations: the readback destination and the
+// tiled shared-memory source. Logging the operands makes the fault address
+// resolve to a resource and an offset, which is what turns "a copy faulted" into
+// "this buffer, at this offset".
+//
+// Off by default because it logs every copy the emulator records.
+REXCVAR_DEFINE_BOOL(d3d12_readback_copy_log, false, "GPU/D3D12",
+                    "Log the GPU VAs, offsets and lengths of every recorded buffer copy.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -2809,15 +2843,14 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
     }
 
     if (readback.buffers[index]) {
-      if (!AwaitAllQueueOperationsCompletion()) {
-        buffer->Unmap(0, nullptr);
-        buffer->Release();
-        return false;
-      }
       if (readback.mapped_data[index]) {
         readback.buffers[index]->Unmap(0, nullptr);
       }
-      readback.buffers[index]->Release();
+      // Same defect as the resolve and eviction paths: a buffer a recorded copy
+      // still names must not be released now. Replacing the queue flush that used
+      // to sit here -- it disturbed submission boundaries, which is what made the
+      // readback-fence experiment in the resolve path make things worse.
+      ScheduleResourceDeletion(readback.buffers[index]);
     }
 
     readback.buffers[index] = buffer;
@@ -2922,46 +2955,19 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       return true;
     }
     if (rb.buffers[write_index]) {
-      // Wait for the GPU before dropping the buffer this one replaces.
-      //
-      // A readback buffer is written by a CopyBufferRegion that the GPU may
-      // still be executing, and it is read back on a *later* frame -- that is
-      // the whole point of the two-buffer ping-pong. So releasing it here
-      // without a fence drops the last reference while the copy is still in
-      // flight, and the GPU then faults on the copy.
-      //
-      // This is not theoretical. With readback_resolve = "some" (and "fast"),
-      // use_delayed_sync is true, which is precisely a promise not to wait
-      // between frames -- so nothing else in this function covers for the gap.
-      // On AMD a fault inside a copy does not come back as a clean
-      // DXGI_ERROR_DEVICE_HUNG; it hangs, Windows resets the device, and the
-      // runtime aborts.
-      //
-      // DRED from a real UFC 3 run (2026-10-03), with readback_resolve = "some":
-      //
-      //   D3D12 device removed: 0x887A0006 - DEVICE_HUNG
-      //   DRED breadcrumb: completed 2584 of 3808 ops
-      //     [2582] op type 6   DISPATCH
-      //     [2583] op type 15  RESOURCEBARRIER
-      //     [2584] op type 7   COPYBUFFERREGION   <-- FAULT
-      //   DRED page fault at VA 0x0000000280781000
-      //
-      // The recreate path is reached whenever the resolve *grows*, and the log
-      // shows it growing: readback requests of 0, 1 and 4 MB in the same
-      // session. Every one of those drops a buffer the GPU may still be
-      // copying from.
-      //
-      // The cost is one queue flush when a resolve outgrows its buffer, which
-      // is a rare event by construction -- it only happens on a size increase.
-      if (!AwaitAllQueueOperationsCompletion()) {
-        buffer->Release();
-        return true;
-      }
       if (rb.mapped_data[write_index]) {
         rb.buffers[write_index]->Unmap(0, nullptr);
         rb.mapped_data[write_index] = nullptr;
       }
-      rb.buffers[write_index]->Release();
+      // Replacing a buffer the GPU may still be copying into. Release it through
+      // the deferred-deletion queue rather than here; see ScheduleResourceDeletion.
+      // This used to be a bare Release(), with an optional queue flush behind the
+      // d3d12_readback_fence_before_release cvar. The flush made in-match runs die
+      // sooner -- it closes the open submission, and GraphicsUploadBufferPool
+      // reclaims its pages by submission index -- so it was the wrong cure for a
+      // real disease. Deferring the release keeps the buffer alive without
+      // touching submission boundaries at all.
+      ScheduleResourceDeletion(rb.buffers[write_index]);
     }
     rb.buffers[write_index] = buffer;
     rb.sizes[write_index] = size;
@@ -2970,6 +2976,11 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       REXGPU_ERROR("Failed to persistently map resolve readback buffer");
       rb.mapped_data[write_index] = nullptr;
     }
+    // The other candidate owner of a DRED page-fault address: this buffer is the
+    // destination of the resolve copy. Recorded so a fault VA can be attributed
+    // to a resource and an offset instead of being left unexplained.
+    REXGPU_INFO("Resolve readback[{}]: GPU VA 0x{:016X}, {} MB", write_index,
+                uint64_t(buffer->GetGPUVirtualAddress()), size >> 20);
   }
 
   if (!rb.buffers[write_index]) {
@@ -3097,9 +3108,27 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     texture_cache_->TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     SubmitBarriers();
   } else {
+    // The source offset is a guest physical address used directly as a D3D12
+    // offset into the shared-memory buffer, which is kBufferSize (512 MB) and is
+    // a tiled reserved resource whose tiles are mapped on demand. Past the end
+    // of that resource the GPU reads an address nobody backs -- which does not
+    // come back as an API error, because nothing validates it on the recording
+    // side. It comes back as a fault inside the copy, a page fault in DRED, and
+    // DXGI_ERROR_DEVICE_HUNG. Refuse the copy instead.
+    if (uint64_t(written_address) + uint64_t(written_length) >
+        uint64_t(rex::graphics::SharedMemory::kBufferSize)) {
+      REXGPU_ERROR("Resolve copy out of range: source 0x{:08X} + 0x{:08X} exceeds shared memory "
+                   "0x{:08X} - copy skipped",
+                   written_address, written_length, rex::graphics::SharedMemory::kBufferSize);
+      return true;
+    }
+
     shared_memory_->UseAsCopySource();
     SubmitBarriers();
     ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
+    // Copy operands are logged (and range-checked) in DeferredCommandList::Execute,
+    // which every copy passes through -- including the ones here that have nothing
+    // to do with a resolve. See d3d12_readback_copy_log there.
     deferred_command_list_.D3DCopyBufferRegion(rb.buffers[write_index], 0, shared_memory_buffer,
                                                written_address, written_length);
   }
@@ -4778,6 +4807,21 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   return true;
 }
 
+void D3D12CommandProcessor::ScheduleResourceDeletion(ID3D12Resource* resource) {
+  if (!resource) {
+    return;
+  }
+  // Not simply GetCurrentSubmission(). The copy that still names this resource
+  // may be sitting in a deferred list whose submission has not been opened yet,
+  // in which case GetCurrentSubmission() is still the previous submission and
+  // the release would land before that work runs. Waiting for one submission
+  // past both the current and the last completed one covers work that is
+  // recorded but not yet submitted, which is the state almost all of these
+  // buffers are in when they are dropped.
+  resources_for_deletion_.emplace_back(std::max(GetCurrentSubmission(), GetCompletedSubmission() + 1),
+                                       resource);
+}
+
 void D3D12CommandProcessor::EvictOldReadbackBuffers(
     std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map) {
   if (buffer_map.empty()) {
@@ -4786,6 +4830,7 @@ void D3D12CommandProcessor::EvictOldReadbackBuffers(
   const uint64_t eviction_frame_floor = (frame_current_ > kReadbackBufferEvictionAgeFrames)
                                             ? (frame_current_ - kReadbackBufferEvictionAgeFrames)
                                             : 0;
+  size_t evicted = 0;
   for (auto it = buffer_map.begin(); it != buffer_map.end();) {
     ReadbackBuffer& readback = it->second;
     bool evict =
@@ -4799,7 +4844,13 @@ void D3D12CommandProcessor::EvictOldReadbackBuffers(
         if (readback.mapped_data[i]) {
           readback.buffers[i]->Unmap(0, nullptr);
         }
-        readback.buffers[i]->Release();
+        // Releasing here was use-after-free with the GPU. See the note on
+        // ScheduleResourceDeletion. This is the path that mattered: resolve
+        // addresses vary enough that a session accumulates hundreds of distinct
+        // readback keys -- 492 in 30 seconds in a real UFC 3 run against a cap of
+        // kMaxReadbackBuffers (256) -- so this loop runs every frame and was
+        // dropping buffers that copies were still in flight to.
+        ScheduleResourceDeletion(readback.buffers[i]);
       }
       readback.buffers[i] = nullptr;
       readback.mapped_data[i] = nullptr;
@@ -4808,6 +4859,10 @@ void D3D12CommandProcessor::EvictOldReadbackBuffers(
       readback.written_size[i] = 0;
     }
     it = buffer_map.erase(it);
+    ++evicted;
+  }
+  if (evicted) {
+    REXGPU_INFO("Evicted {} readback buffer(s); {} still cached", evicted, buffer_map.size());
   }
 }
 

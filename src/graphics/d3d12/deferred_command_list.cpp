@@ -10,11 +10,17 @@
  */
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
 #include <rex/graphics/flags.h>
+#include <rex/logging.h>
 #include <rex/math.h>
+
+// Declared here, defined in command_processor.cpp along with the rest of the
+// D3D12 cvars. See the use below.
+REXCVAR_DECLARE(bool, d3d12_readback_copy_log);
 
 namespace rex::graphics::d3d12 {
 
@@ -62,6 +68,56 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
       } break;
       case Command::kD3DCopyBufferRegion: {
         auto& args = *reinterpret_cast<const D3DCopyBufferRegionArguments*>(stream);
+
+        // Validate every buffer copy before it reaches the GPU.
+        //
+        // CopyBufferRegion does not check its ranges. A copy whose offset plus
+        // length runs past the end of either operand records successfully, and
+        // then faults on the GPU -- no HRESULT, no debug-layer error in the log,
+        // nothing on the CPU side ever learns anything went wrong. What it looks
+        // like instead: the breadcrumb stops advancing on a COPYBUFFERREGION, DRED
+        // reports a page fault, and GetDeviceRemovedReason comes back
+        // DXGI_ERROR_DEVICE_HUNG (0x887A0006).
+        //
+        // That is exactly what UFC 3 does, twice, in two separate runs:
+        //   DRED breadcrumb: completed 3843 of 4825 ops
+        //     [3843] op type 7  COPYBUFFERREGION   <-- FAULT
+        //   DRED page fault at VA 0x000000024A8AA000
+        //   DRED page fault at VA 0x000000024B382000
+        //
+        // Instrumenting the one resolve copy we suspected turned out not to be
+        // enough: neither fault address belonged to either operand of it. So the
+        // check lives here instead, because this is the single point every buffer
+        // copy in the emulator passes through, and it has the operands in hand.
+        // An out-of-range copy is logged with its full operands and skipped --
+        // a wrong frame beats a reset device.
+        const uint64_t dst_size =
+            args.dst_buffer ? uint64_t(args.dst_buffer->GetDesc().Width) : uint64_t(0);
+        const uint64_t src_size =
+            args.src_buffer ? uint64_t(args.src_buffer->GetDesc().Width) : uint64_t(0);
+        const uint64_t dst_va =
+            args.dst_buffer ? uint64_t(args.dst_buffer->GetGPUVirtualAddress()) : uint64_t(0);
+        const uint64_t src_va =
+            args.src_buffer ? uint64_t(args.src_buffer->GetGPUVirtualAddress()) : uint64_t(0);
+        if (args.dst_offset > dst_size || args.src_offset > src_size ||
+            args.dst_offset + args.num_bytes > dst_size ||
+            args.src_offset + args.num_bytes > src_size) {
+          REXGPU_ERROR(
+              "CopyBufferRegion OUT OF RANGE - skipped: dst 0x{:016X}+0x{:X} of 0x{:X}, "
+              "src 0x{:016X}+0x{:X} of 0x{:X}, num 0x{:X}",
+              dst_va, args.dst_offset, dst_size, src_va, args.src_offset, src_size,
+              args.num_bytes);
+          break;
+        }
+
+        if (REXCVAR_GET(d3d12_readback_copy_log)) {
+          REXGPU_INFO(
+              "copy: dst 0x{:016X}+0x{:X} (size 0x{:X}) | src 0x{:016X}+0x{:X} "
+              "(size 0x{:X}) num 0x{:X}",
+              dst_va, args.dst_offset, dst_size, src_va, args.src_offset, src_size,
+              args.num_bytes);
+        }
+
         command_list->CopyBufferRegion(args.dst_buffer, args.dst_offset, args.src_buffer,
                                        args.src_offset, args.num_bytes);
       } break;
