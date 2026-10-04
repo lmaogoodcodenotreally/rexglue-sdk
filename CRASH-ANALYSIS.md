@@ -176,22 +176,32 @@ The allocator defect is in your **local SDK** (`xmemory.cpp`), not in
 `ufc3recomp` — note that the `heap 'virtual' sem faixa ...` message is your own
 diagnostic patch; it is not in upstream `rexglue-sdk`.
 
-Two things in `BaseHeap::AllocRange` (`xmemory.cpp:1388-1504`) are worth
-hardening regardless of which line is firing:
+Two things in `BaseHeap::AllocRange` are worth a look regardless of which line
+is firing — but only one of the two is actually suspect, and saying so matters
+because the other one would send a fix attempt somewhere it does not belong:
 
-1. **`xmemory.cpp:1449` — `if (page_count > page_number)`** compares a *count*
-   against an *absolute page index*. They are unrelated quantities; the guard
-   that means "no room left below this point" is `page_number < low_page_number + page_count`.
-2. **`xmemory.cpp:1396` — `rex::align(high_address, alignment)` rounds *up***
-   (`rex/math.h:43`), then gets clamped back down by the `std::min`. Harmless
-   here, but the clamp makes the effective window depend on alignment in a way
-   that is easy to misread. Rounding `high_address` *down* would express the
-   intent directly.
+1. **`xmemory.cpp:1449` — `if (page_count > page_number)` is NOT a bug.** This
+   document previously called it "comparing a count against an absolute page
+   index, two unrelated quantities". That reading is wrong. The `else` branch
+   executes `page_number - page_count` in `uint32_t` arithmetic, which underflows
+   exactly when `page_number < page_count` — which is exactly what
+   `page_count > page_number` tests. It is an underflow guard, it is correct, and
+   the comment above it ("not enough space left to fit entire page range")
+   describes it accurately. Left alone deliberately.
+2. **`xmemory.cpp:1396` — `rex::align(high_address, alignment)` rounds up**
+   (`rex/math.h:43`), then gets clamped back down by the `std::min`. So the
+   window's high bound can extend *above* what the caller requested, capped at
+   the heap end. It cannot produce a refusal, so it is not crash 1 — but it does
+   mean an allocation can land outside the caller's stated `max`. Rounding down
+   would state the intent; not changed here because crash 1's cause is still
+   unknown and this is not it.
 
-To localise it definitively, extend your own diagnostic to also print the
-**requested window** (`low_page_number`..`high_page_number`) next to the
-heap-wide free/largest figures. Your note already says *"olhar a faixa pedida"* —
-printing the window next to the totals turns the next run into a one-line answer.
+The search-bug question is now decided by measurement rather than by reading
+the code: on any refusal the allocator prints which heap refused, the stride it
+was stepping by, and one of three verdicts — `BUG IN THE SEARCH` (a
+stride-aligned base fitted and was missed), `ALIGNMENT, NOT SPACE` (contiguous
+pages existed but none landed on the stride), or `GENUINELY NO ROOM`. That lands
+in `src/system/xmemory.cpp` (`BaseHeap::AllocRange`), commit `d45f443`.
 
 Rebuilding `ufc3.exe` needs the XEX plus the full ReXGlue toolchain, so treat
 steps 1-3 as the practical path.
