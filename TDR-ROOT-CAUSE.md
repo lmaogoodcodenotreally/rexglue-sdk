@@ -423,7 +423,7 @@ Reading run 12:
 Launched 10:10:39, ran 27 minutes with no crash, and ended only because the
 window was closed by hand. The log closes normally — `Window closing, shutting
 down...`, `Execution complete`, `Title terminated; hard-exiting process.` at
-10:37:44 — and `diagnostico` still holds exactly the same 25 files as before
+10:37:44 — and `crashdumps` (formerly `diagnostico`) still holds exactly the same 25 files as before
 the run, so no report and no dump were produced.
 
 The probe fired 16 times (the first 16 are printed in full, so the true total

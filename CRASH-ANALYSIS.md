@@ -1,6 +1,6 @@
 # ufc3recomp crash triage — 2026-10-03
 
-Sources: `diagnostico/*.txt` (3 crashes), `userdata/ufc3.log` (3 sessions),
+Sources: `crashdumps/*.txt` (3 crashes), `userdata/ufc3.log` (3 sessions),
 `paulogaab21/ufc3recomp` @ `8341365`, `rexglue/rexglue-sdk` @ `c94f5eb` (v0.10.0).
 
 Installed build: **v1.0.2** (= newest release; repo HEAD is 1 commit ahead, unreleased).
