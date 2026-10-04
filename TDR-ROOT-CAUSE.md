@@ -192,11 +192,78 @@ logged with full operands and skipped), operand logging behind
 `d3d12_readback_copy_log`, and a per-call eviction count so the churn is
 measurable rather than assumed.
 
-**Status: hypothesis with a complete evidence chain, not yet confirmed by a
-surviving run.** Two earlier "fixes" were disproven by test. Confirmation means
-a match well past the 60–90s mark with evictions still firing; refutation means
-another `DEVICE_HUNG`, in which case the watcher attributes the fault VA against
-every recorded copy's operand ranges and against readback buffer bases.
+**Status: the lifetime fix removed `DEVICE_HUNG` from every run — and was
+replaced by a different failure, so it is not confirmed.** The test record after
+deploying deferral (`87a68d5b…`, since rebuilt):
+
+| run | survived | ended with |
+|-----|----------|-----------|
+| playtest6 | 5.5 min | no dump, no report, no event |
+| playtest7 | 1.6 min | no dump, no report, no event |
+| playtest8 | 7.2 min | `.dmp` opened, 0 bytes, no report |
+| playtest9 | 3.0 min | **exit `0xC0000374` STATUS_HEAP_CORRUPTION** |
+
+Before the fix, five of six runs ended in `0xC0000409` with a full dump; the
+device-loss signature has not appeared once since. Whether that is because the
+lifetime bug is gone, or because the process now dies of something else before
+the GPU can complain, is not yet settled — the surviving runs are not a pass.
+
+`0xC0000374` is the first code this project has ever produced that is not
+`0xC0000409` or `0xC0000005`. It is worth noticing what it costs us: the heap's
+own fail-fast runs past `SetUnhandledExceptionFilter`, past both `signal()`
+handlers, and past `MiniDumpWriteDump` — no `.dmp`, no `.txt`, no log line, no
+Windows event. The exit code is the *only* evidence it happens at all, which is
+why `watch-attrib.ps1` alone would have reported "died but no DRED page fault
+recorded" and nothing else.
+
+Two things follow, both committed:
+
+1. `crash_capture.h` now writes the readable `.txt` **before** attempting the
+   `.dmp`, and waits briefly instead of tearing the process down when a second
+   fault arrives during a write. Order is what makes evidence survive a crash
+   inside the dump writer (`6805eb0`).
+2. The deletion queue refuses an address it already holds and says so
+   (`5964ae1`). A double `Release()` through that queue is the most direct cause
+   of `0xC0000374` available in this code, and it was the only new way the fix
+   changed resource ownership.
+
+Reading the tests honestly: run 10 decides whether double-enqueue was it. If it
+dies of `0xC0000374` *without* the `handed to the deletion queue twice` line,
+double-release is ruled out with evidence rather than assumed either way, and
+the search moves on.
+
+A note on timing, because it cuts against the "the fix caused it" reading: every
+pre-fix run died at 60–90 s of device loss, and `0xC0000374` needs longer than
+that to appear. Corruption that predates the fix would have been masked by the
+GPU dying first. Longer survival alone can surface an older bug, so attribution
+is not yet proven either.
+
+### A fourth bare `Release()` that looks like the bug and is not
+
+`RequestReadbackBuffer` (line 4886) releases its shared `readback_buffer_` with
+no fence and no deferral — same shape as the three sites above, and it is
+returned straight into a `D3DCopyBufferRegion` destination (line 2783). It is
+very tempting to convert it as well. It does not need it, and the reason is
+worth writing down because the next person will be tempted too.
+
+Its only caller is `IssueDraw_MemexportReadbackFullPath`, which records the
+copies and then *immediately* calls `AwaitAllQueueOperationsCompletion()` at
+line 2788. That is not a soft flush. It resolves to
+`CheckSubmissionFence(submission_current_)`, which — because
+`await_submission >= submission_current_` — takes the branch that calls
+`EndSubmission(false)` to close the open submission, and then blocks on
+`submission_fence_->SetEventOnCompletion` until `GetCompletedValue()` passes it.
+So when that function returns, the GPU has *finished* the copies that name the
+buffer. The next call's `Release()` therefore lands on an idle resource.
+
+Every path from recording those copies to returning reaches line 2788 with no
+early exit between them, so there is no window where copies are outstanding and
+the buffer is releasable.
+
+This is the counter-example that keeps the other three honest: the defect is not
+"release without a fence", it is "release while a *deferred* copy still names
+it". The memexport singleton is synchronous, the resolve and eviction maps are
+not — which is why three sites needed changing and this one must be left alone.
 
 ## Crash 1 is unrelated and still open
 
