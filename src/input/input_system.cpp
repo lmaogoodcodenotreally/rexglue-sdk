@@ -10,7 +10,9 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <mutex>
 
 #include <rex/dbg.h>
 #include <rex/input/device_assignment.h>
@@ -23,6 +25,7 @@
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
+#include <rex/thread.h>
 
 REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
     .allowed({"sdl", "xinput"});
@@ -36,6 +39,60 @@ namespace {
 // a real pad off guest user 0. SlotAssignment routes them by their synthetic
 // flag and never reads this value.
 constexpr uint32_t kSyntheticOrdinal = UINT32_MAX;
+
+// --------------------------------------------------------------------------
+// Concurrency probe for the query entry points.
+//
+// The counting happens *before* mutex_ is taken and the decrement after it is
+// released, so g_entered measures arrivals rather than protected work: a second
+// thread showing up while the first still holds the lock is the precondition
+// for the data race on devices_/device_owners_, and it is reported even though
+// the mutex now prevents the race itself. Without this a surviving playtest
+// only proves "did not reproduce"; with it we can see the contention happen.
+//
+// Process-wide, because InputSystem is created once per process in practice.
+// --------------------------------------------------------------------------
+std::atomic<uint32_t> g_input_entered{0};
+std::atomic<uint32_t> g_input_overlap_total{0};
+std::atomic<uint32_t> g_input_owner_tid{0};
+std::atomic<const char*> g_input_owner_method{nullptr};
+
+class InputEntryProbe {
+ public:
+  explicit InputEntryProbe(const char* method) : method_(method) {
+    const uint32_t tid = rex::thread::current_thread_system_id();
+    const uint32_t previous = g_input_entered.fetch_add(1, std::memory_order_acq_rel);
+    if (previous == 0) {
+      g_input_owner_tid.store(tid, std::memory_order_release);
+      g_input_owner_method.store(method, std::memory_order_release);
+      return;
+    }
+
+    const uint32_t total = g_input_overlap_total.fetch_add(1, std::memory_order_relaxed) + 1;
+    // The first ones in full, then every 500th, so a hot race cannot flood the
+    // log. The running total is what matters when reading a report.
+    if (total <= 16 || (total % 500) == 0) {
+      const char* owner = g_input_owner_method.load(std::memory_order_acquire);
+      REXLOG_ERROR(
+          "InputSystem concurrent entry #{}: thread {} entering {} while thread {} is inside {}",
+          total, tid, method_, g_input_owner_tid.load(std::memory_order_acquire),
+          owner ? owner : "?");
+    }
+  }
+
+  ~InputEntryProbe() {
+    if (g_input_entered.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      g_input_owner_tid.store(0, std::memory_order_release);
+      g_input_owner_method.store(nullptr, std::memory_order_release);
+    }
+  }
+
+  InputEntryProbe(const InputEntryProbe&) = delete;
+  InputEntryProbe& operator=(const InputEntryProbe&) = delete;
+
+ private:
+  const char* method_;
+};
 
 }  // namespace
 
@@ -187,6 +244,8 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
   SCOPE_profile_cpu_f("hid");
+  InputEntryProbe probe("GetCapabilities");
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   if (!out_caps || !assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -214,6 +273,8 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+  InputEntryProbe probe("GetState");
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -253,6 +314,8 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
+  InputEntryProbe probe("SetState");
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -295,6 +358,8 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
+  InputEntryProbe probe("GetKeystroke");
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }

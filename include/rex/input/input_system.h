@@ -11,6 +11,7 @@
  */
 
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rex/input/device_assignment.h>
@@ -65,6 +66,14 @@ class InputSystem : public system::IInputSystem {
   // does not renumber pad two.
   std::vector<DeviceInfo> devices_;
   std::vector<InputDriver*> device_owners_;
+
+  // Serialises the four query entry points. They are reached from guest threads
+  // through xam_input.cpp with no lock above them either, and RefreshDevices()
+  // rewrites devices_/device_owners_ with clear() + push_back(). Two threads in
+  // there at once is a classic realloc-while-realloc race on CRT heap blocks --
+  // which is exactly what a 0xC0000374 detected by a later free() looks like.
+  // Recursive so RefreshDevices() stays safe if a future caller forgets.
+  std::recursive_mutex mutex_;
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.
