@@ -1526,18 +1526,100 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
         run = 0;
       }
     }
+    // Which pool refused. The crash that starts here is a guest dereferencing the
+    // 0 this returns, and "virtual" versus "physical" is the difference between
+    // an address-space problem and the 512 MB RAM pool being genuinely full.
+    // The message used to say this and the rewrite dropped it; put it back.
+    const char* heap_name = "unknown";
+    switch (heap_type_) {
+      case memory::HeapType::kGuestVirtual:  heap_name = "virtual"; break;
+      case memory::HeapType::kGuestXex:      heap_name = "xex"; break;
+      case memory::HeapType::kGuestPhysical: heap_name = "physical"; break;
+      case memory::HeapType::kHostPhysical:  heap_name = "host-physical"; break;
+    }
     REXSYS_ERROR(
-        "BaseHeap::Alloc failed to find contiguous range: asked {} pages ({} bytes, align 0x{:X}, "
-        "top_down={}); window pages {}..{} = {} pages; free in window {} pages, largest contiguous "
-        "run in window {} pages; heap-wide: {} free of {} pages",
-        page_count, size, alignment, top_down ? 1 : 0, low_page_number, high_page_number, window_pages,
-        free_in_window, largest_in_window, unreserved_page_count_, uint32_t(page_table_.size()));
-    if (largest_in_window >= page_count) {
+        "BaseHeap::Alloc failed to find contiguous range on heap '{}': asked {} pages ({} bytes, "
+        "align 0x{:X}, top_down={}, stride {} pages); window pages {}..{} = {} pages; free in window "
+        "{} pages, largest contiguous run in window {} pages; heap-wide: {} free of {} pages",
+        heap_name, page_count, size, alignment, top_down ? 1 : 0, page_scan_stride, low_page_number,
+        high_page_number, window_pages, free_in_window, largest_in_window, unreserved_page_count_,
+        uint32_t(page_table_.size()));
+
+    // "The window holds a run that is big enough" is not enough to convict the
+    // search. The search does not test every page: it steps by page_scan_stride
+    // so the base keeps the caller's alignment, and it stops at
+    // high + 1 - page_count, not at high. A run can therefore be large and still
+    // hold no base the search was allowed to try -- in which case "bug in the
+    // search" would be a false accusation, and this project has already had two
+    // wrong conclusions from confident reading of partial evidence.
+    //
+    // So recompute over every base, stride 1, then re-apply the exact alignment
+    // lattice the branch above searched (bases ≡ 0 for top_down, bases ≡ low for
+    // bottom-up) and say which of three outcomes actually happened.
+    const uint32_t stride = page_scan_stride ? page_scan_stride : 1;
+    const uint32_t search_top = high_page_number + 1 - page_count;  // page_count <= window_pages
+    uint32_t any_fit_base = UINT_MAX;
+    uint32_t aligned_fit_base = UINT_MAX;
+    uint32_t run_start = low_page_number;
+    uint32_t run_len = 0;
+    auto consider_run = [&](uint32_t start, uint32_t len) {
+      if (len < page_count) {
+        return;
+      }
+      // Bases whose range stays inside this free run and at or below search_top.
+      const uint32_t lo = std::max(start, low_page_number);
+      uint32_t hi = std::min(start + len - page_count, search_top);
+      if (lo > hi) {
+        return;
+      }
+      if (any_fit_base == UINT_MAX) {
+        any_fit_base = lo;
+      }
+      if (top_down) {
+        hi -= hi % stride;  // the branch above rounded max_base_page_number down
+      }
+      const uint32_t lo_mod = lo % stride;
+      const uint32_t want = top_down ? 0 : (low_page_number % stride);
+      const uint32_t delta = (lo_mod <= want) ? (want - lo_mod) : (stride - (lo_mod - want));
+      const uint32_t candidate = lo + delta;
+      if (candidate <= hi && aligned_fit_base == UINT_MAX) {
+        aligned_fit_base = candidate;
+      }
+    };
+    for (uint32_t page_number = low_page_number; page_number <= high_page_number; ++page_number) {
+      if (page_table_[page_number].state == 0) {
+        if (run_len == 0) {
+          run_start = page_number;
+        }
+        ++run_len;
+      } else {
+        consider_run(run_start, run_len);
+        run_len = 0;
+      }
+    }
+    consider_run(run_start, run_len);
+
+    if (aligned_fit_base != UINT_MAX) {
       REXSYS_ERROR(
-          "BaseHeap::Alloc: the window DOES contain {} contiguous free pages, at least {} needed. "
-          "The free-range search failed to find a run that exists -- this is a bug in the search, "
-          "not an out-of-memory condition.",
-          largest_in_window, page_count);
+          "BaseHeap::Alloc: BUG IN THE SEARCH. A stride-aligned base at page {} (heap 0x{:X}) fits "
+          "the requested {} pages inside window {}..{}, and the search did not find it. This is not "
+          "an out-of-memory condition.",
+          aligned_fit_base, (uint64_t(heap_base_) + (uint64_t(aligned_fit_base) << page_size_shift_)),
+          page_count, low_page_number, search_top);
+    } else if (any_fit_base != UINT_MAX) {
+      REXSYS_ERROR(
+          "BaseHeap::Alloc: ALIGNMENT, NOT SPACE. {} contiguous pages are free starting at page {} "
+          "(heap 0x{:X}), but none of its {} bases matches the required {}-page stride, so the "
+          "search was never allowed to take it. Raising the caller's alignment would fix this; "
+          "adding memory would not.",
+          page_count, any_fit_base,
+          (uint64_t(heap_base_) + (uint64_t(any_fit_base) << page_size_shift_)), page_count, stride);
+    } else {
+      REXSYS_ERROR(
+          "BaseHeap::Alloc: GENUINELY NO ROOM. No run of {} contiguous free pages exists anywhere in "
+          "window {}..{}; the largest is {} pages. The caller asked for more than the window holds, "
+          "and the refusal is correct.",
+          page_count, low_page_number, search_top, largest_in_window);
     }
     assert_always("Heap exhausted!");
     return false;
