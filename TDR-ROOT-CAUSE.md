@@ -202,11 +202,22 @@ deploying deferral (`87a68d5b…`, since rebuilt):
 | playtest7 | 1.6 min | no dump, no report, no event |
 | playtest8 | 7.2 min | `.dmp` opened, 0 bytes, no report |
 | playtest9 | 3.0 min | **exit `0xC0000374` STATUS_HEAP_CORRUPTION** |
+| playtest10 | 5.8 min | **exit `0xC0000374` STATUS_HEAP_CORRUPTION**, duplicate guard never fired |
 
 Before the fix, five of six runs ended in `0xC0000409` with a full dump; the
-device-loss signature has not appeared once since. Whether that is because the
-lifetime bug is gone, or because the process now dies of something else before
-the GPU can complain, is not yet settled — the surviving runs are not a pass.
+device-loss signature has not appeared once since. Checked independently of the
+logs: the Application event log holds exactly one `D3DDRED2` report for
+`ufc3.exe` (`DeviceRemovedReason 0x887A0006`, i.e. `DEVICE_HUNG`) in the last
+six hours, and it belongs to **playtest5, which ran 08:11–08:12 — before the
+fix was deployed**. Runs 6 through 10 produced none. Whether the absence is
+because the lifetime bug is gone, or because the process now dies of something
+else before the GPU can complain, is not yet settled — the surviving runs are
+not a pass.
+
+One more thing worth recording about run 10: it produced **no Windows event of
+any kind** at 09:13:10, so WER is not going to hand over a stack either. The
+two `bad_module_info` APPCRASH events in that window belong to other processes
+(different pids) and are unrelated.
 
 `0xC0000374` is the first code this project has ever produced that is not
 `0xC0000409` or `0xC0000005`. It is worth noticing what it costs us: the heap's
@@ -226,11 +237,48 @@ Two things follow, both committed:
    (`5964ae1`). A double `Release()` through that queue is the most direct cause
    of `0xC0000374` available in this code, and it was the only new way the fix
    changed resource ownership.
+3. `crash_capture.h` installs a **vectored first-chance handler** for
+   `0xC0000374`/`0xC0000409`/`0xC0000417`/`0xC0000420` and writes a stack trace
+   into the `.txt`. A vectored handler is dispatched before the structured
+   search that fail-fast skips, so it is the last place in-process that can see
+   the thread with its stack intact. `OnPostInitLogging` logs that the handler
+   is armed, so "died with no report" can be told apart from "handler never
+   installed". If a run still dies with no report despite that line, Windows is
+   not delivering fail-fast to vectored handlers either and the answer has to
+   come from Application Verifier — which needs elevation this session does not
+   have.
 
-Reading the tests honestly: run 10 decides whether double-enqueue was it. If it
-dies of `0xC0000374` *without* the `handed to the deletion queue twice` line,
-double-release is ruled out with evidence rather than assumed either way, and
-the search moves on.
+### What run 10 ruled out
+
+Run 10 was the test the paragraph above set up, and it came back
+`0xC0000374` with the duplicate guard **never once** logging `handed to the
+deletion queue twice`. So, with evidence rather than assumption:
+
+- **Two sites naming one address while it is queued** — ruled out. The guard
+  would have said so; it said nothing in 1759 buffer creations and 42 evictions.
+- **Unbounded growth of the deletion queue** — ruled out. The eviction line
+  prints `N awaiting deletion` and it stayed at 2–4 for the whole run.
+- **The range guard corrupting memory** — it is read-only: four
+  `GetDesc()`/`GetGPUVirtualAddress()` calls and a comparison, no writes.
+- **A `ReadbackBuffer&` outliving its map node** — `EvictOldReadbackBuffers`
+  runs only at frame open (`BeginSubmission`, `is_opening_frame`), every caller
+  takes its reference *after* `BeginSubmission` has returned, and
+  `AwaitAllQueueOperationsCompletion()` is only `CheckSubmissionFence()`, which
+  never touches the readback maps.
+- **A cross-thread race on the queue** — the class has no mutex anywhere, so
+  this was a real concern: `GraphicsSystem` spins up a dedicated command
+  processor thread and outside callers reach it only through `CallInThread`.
+  All 1804 `[gpu]` lines in run 10 are one thread (`t15680`).
+- **The guest heaps** — `xmemory.cpp` allocates no `malloc`/`HeapAlloc`; the
+  guest heaps sit in the mapped arena. Guest-side heap damage therefore *cannot*
+  produce `0xC0000374`. Whatever corrupts it is on the host side.
+
+Still open, and now the whole of the search: a queue-versus-bare-`Release()`
+double free, which the guard structurally cannot see because it only inspects
+queue entries (`RequestReadbackBuffer`'s bare release has exactly one caller and
+is safe); and every host heap user that has nothing to do with this queue —
+spdlog's per-line formatting, the deferred command list's stream, pipeline and
+shader creation. The guard closes one door; it does not mean the room is empty.
 
 A note on timing, because it cuts against the "the fix caused it" reading: every
 pre-fix run died at 60–90 s of device loss, and `0xC0000374` needs longer than
