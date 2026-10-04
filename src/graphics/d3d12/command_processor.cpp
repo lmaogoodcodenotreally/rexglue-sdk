@@ -778,7 +778,11 @@ ID3D12Resource* D3D12CommandProcessor::RequestScratchGPUBuffer(uint32_t size,
     return nullptr;
   }
   if (scratch_buffer_ != nullptr) {
-    resources_for_deletion_.emplace_back(submission_current_, scratch_buffer_);
+    // Transfer semantics: this ref goes to the queue. On a duplicate the ref is
+    // deliberately left unreleased -- a leak is harmless and visible, whereas
+    // releasing here would be the double free the duplicate check exists to
+    // prevent (the queued entry may be this very reference).
+    EnqueueResourceDeletion(submission_current_, scratch_buffer_);
   }
   scratch_buffer_ = buffer;
   scratch_buffer_size_ = size;
@@ -1709,9 +1713,11 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   for (const std::pair<uint64_t, ID3D12Resource*>& resource_for_deletion :
        resources_for_deletion_) {
+    resources_scheduled_for_deletion_.erase(resource_for_deletion.second);
     resource_for_deletion.second->Release();
   }
   resources_for_deletion_.clear();
+  resources_scheduled_for_deletion_.clear();
 
   fxaa_source_texture_submission_ = 0;
   fxaa_source_texture_.Reset();
@@ -2036,9 +2042,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             if (fxaa_source_texture_desc.Width != guest_output_width ||
                 fxaa_source_texture_desc.Height != guest_output_height) {
               if (submission_completed_ < fxaa_source_texture_submission_) {
-                fxaa_source_texture_->AddRef();
-                resources_for_deletion_.emplace_back(fxaa_source_texture_submission_,
-                                                     fxaa_source_texture_.Get());
+                // Ownership is shared here rather than transferred: the queue
+                // entry gets its own AddRef, so a refusal means the queued copy
+                // of this address already carries one and this one must still
+                // be dropped by the Reset below.
+                if (EnqueueResourceDeletion(fxaa_source_texture_submission_,
+                                            fxaa_source_texture_.Get())) {
+                  fxaa_source_texture_->AddRef();
+                }
               }
               fxaa_source_texture_.Reset();
               fxaa_source_texture_submission_ = 0;
@@ -3033,8 +3044,9 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
         return true;
       }
       if (resolve_downscale_buffer_) {
-        resources_for_deletion_.emplace_back(GetCurrentSubmission(),
-                                             resolve_downscale_buffer_.Detach());
+        // Same transfer semantics as the scratch buffer: on a duplicate the ref
+        // is leaked on purpose rather than released twice.
+        EnqueueResourceDeletion(GetCurrentSubmission(), resolve_downscale_buffer_.Detach());
       }
       resolve_downscale_buffer_.Attach(buffer);
       resolve_downscale_buffer_size_ = downscale_buffer_size;
@@ -3245,6 +3257,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     if (resources_for_deletion_.front().first > submission_completed_) {
       break;
     }
+    resources_scheduled_for_deletion_.erase(resources_for_deletion_.front().second);
     resources_for_deletion_.front().second->Release();
     resources_for_deletion_.pop_front();
   }
@@ -4807,6 +4820,29 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   return true;
 }
 
+bool D3D12CommandProcessor::EnqueueResourceDeletion(uint64_t submission,
+                                                    ID3D12Resource* resource) {
+  if (!resource) {
+    return false;
+  }
+  // Second enqueue of the same address. The queue is the sole owner at this
+  // point, so nobody else can be about to free it -- this is a site that
+  // scheduled without releasing its own slot, or two sites naming one
+  // resource. Storing it would mean two Releases and a STATUS_HEAP_CORRUPTION
+  // (0xC0000374) with no dump and no log line, minutes later and far from the
+  // mistake. Refuse, and say so.
+  if (!resources_scheduled_for_deletion_.insert(resource).second) {
+    REXGPU_ERROR(
+        "Resource {} was handed to the deletion queue twice; keeping one entry. "
+        "Two Releases of the same address would double-free it into the process "
+        "heap.",
+        static_cast<const void*>(resource));
+    return false;
+  }
+  resources_for_deletion_.emplace_back(submission, resource);
+  return true;
+}
+
 void D3D12CommandProcessor::ScheduleResourceDeletion(ID3D12Resource* resource) {
   if (!resource) {
     return;
@@ -4818,8 +4854,7 @@ void D3D12CommandProcessor::ScheduleResourceDeletion(ID3D12Resource* resource) {
   // past both the current and the last completed one covers work that is
   // recorded but not yet submitted, which is the state almost all of these
   // buffers are in when they are dropped.
-  resources_for_deletion_.emplace_back(std::max(GetCurrentSubmission(), GetCompletedSubmission() + 1),
-                                       resource);
+  EnqueueResourceDeletion(std::max(GetCurrentSubmission(), GetCompletedSubmission() + 1), resource);
 }
 
 void D3D12CommandProcessor::EvictOldReadbackBuffers(
@@ -4862,7 +4897,8 @@ void D3D12CommandProcessor::EvictOldReadbackBuffers(
     ++evicted;
   }
   if (evicted) {
-    REXGPU_INFO("Evicted {} readback buffer(s); {} still cached", evicted, buffer_map.size());
+    REXGPU_INFO("Evicted {} readback buffer(s); {} still cached, {} awaiting deletion",
+                evicted, buffer_map.size(), resources_for_deletion_.size());
   }
 }
 

@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -394,6 +395,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   // See ScheduleResourceDeletion in command_processor.cpp for why it waits one
   // submission further back than the obvious choice.
   void ScheduleResourceDeletion(ID3D12Resource* resource);
+  // Same as above, for callers that already know which submission must finish
+  // first. Returns whether the entry was stored; false means this address was
+  // already queued and would otherwise have been released twice. Every enqueue
+  // goes through here so the duplicate check covers the whole queue.
+  bool EnqueueResourceDeletion(uint64_t submission, ID3D12Resource* resource);
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
   static constexpr size_t kMaxReadbackBuffers = 256;
   static constexpr uint64_t kReadbackBufferEvictionAgeFrames = 60;
@@ -648,6 +654,21 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // <Submission where requested, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, ID3D12Resource*>> resources_for_deletion_;
+
+  // Every pointer currently waiting in that queue, so a second enqueue of the
+  // same address can be refused instead of stored.
+  //
+  // The queue is the ONLY thing holding the resource once the slot that used to
+  // own it has been overwritten or erased, so nothing else can be about to free
+  // it -- unless a site schedules without clearing its own slot, or schedules
+  // the same pointer on two paths. Either mistake produces two Releases, which
+  // lands as a double free in the process heap and comes back as
+  // STATUS_HEAP_CORRUPTION (0xC0000374) with no dump and no log line at all,
+  // because the heap's own fail-fast runs past every handler installed here.
+  // Seen exactly once, in the first run with deferral enabled, and never before
+  // it. Keeping the set makes that failure loud and cheap: REXGPU_ERROR at the
+  // moment of the mistake rather than a silent death minutes later.
+  std::unordered_set<ID3D12Resource*> resources_scheduled_for_deletion_;
 
   static constexpr uint32_t kScratchBufferSizeIncrement = 16 * 1024 * 1024;
   ID3D12Resource* scratch_buffer_ = nullptr;
