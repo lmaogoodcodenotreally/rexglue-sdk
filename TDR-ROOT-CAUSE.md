@@ -146,10 +146,33 @@ belongs to nothing live.
 
 `ScheduleResourceDeletion()` hands the resource to `resources_for_deletion_` —
 the SDK's own deferred-deletion queue, already used correctly for the resolve
-downscale buffer — and all three sites now go through it. It waits one
-submission past both the current and the last completed submission, which covers
-work that is *recorded but not yet submitted*, the state nearly all of these
-buffers are in when dropped.
+downscale buffer — and all three sites now go through it.
+
+### Why waiting for `GetCurrentSubmission()` is sufficient — checked, not assumed
+
+The queue drains with `if (front().first > submission_completed_) break;`, so a
+resource is released only once `submission_completed_` has reached the
+submission index it was scheduled with. The scheduling side uses
+`max(GetCurrentSubmission(), GetCompletedSubmission() + 1)`. The question is
+whether that index is *at least* the submission whose GPU work still names the
+resource — because if it were smaller, deferral would be a slower version of the
+same bug. Reading `EndSubmission` answers it directly:
+
+    deferred_command_list_.Execute(command_list_, command_list_1_);   // line 3492
+    direct_queue->ExecuteCommandLists(1, execute_command_lists);      // line 3495
+    direct_queue->Signal(submission_fence_, submission_current_++);   // line 3509
+
+The deferred list is executed and then signalled with `submission_current_`
+*before* it is incremented, and `BeginSubmission` resets that list only when it
+opens a submission — while the resolve path opens one first (line 2910). So a
+copy recorded into the list completes exactly when
+`submission_completed_ >= submission_current_`, which is the value
+`GetCurrentSubmission()` reports at record time. The `max(...)` can only ever
+choose that value or a larger one, so the release is provably never early.
+
+`GetCompletedSubmission() + 1` is the conservative half: if the GPU has already
+caught up past the current submission, waiting only for "current" would schedule
+the release at a completed index and the drain would free it immediately.
 
 Crucially there is **no queue flush**. That was the fatal flaw in the fence:
 `AwaitAllQueueOperationsCompletion()` closes the open submission, and
@@ -157,6 +180,11 @@ Crucially there is **no queue flush**. That was the fatal flaw in the fence:
 fence made deaths faster rather than slower. Deferral fixes the lifetime bug
 without touching submission boundaries, so the cvar is gone — there is nothing
 left to toggle.
+
+This is also why the three sites are safe from double-release: each one
+schedules the pointer and then immediately overwrites or nulls its own slot
+(`rb.buffers[write_index] = buffer`, `readback.buffers[i] = nullptr` followed by
+`erase`), so no map entry can schedule the same resource twice.
 
 Also added: a range guard on every `CopyBufferRegion` at the replay choke point
 (an out-of-range copy records without complaint and faults on the GPU; now it is
