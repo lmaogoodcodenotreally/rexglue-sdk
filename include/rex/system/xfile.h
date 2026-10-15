@@ -145,6 +145,15 @@ class XFile : public XObject {
   size_t find_index_ = 0;
 
   bool is_synchronous_ = false;
+
+  // FMV skip support (rex/system/movie_skip.h): true for .sfd movie files,
+  // whose first read after a skip request forces the guest MWPLY player into
+  // its END state (xfile.cpp ReadInternal).
+  bool is_movie_file_ = false;
+  // Poked at most once per opened movie; reads keep serving real data so the
+  // SOFDEC decoder never stalls while the guest winds down. Touched
+  // exclusively under file_lock_.
+  bool movie_skip_poked_ = false;
 };
 
 }  // namespace rex::system

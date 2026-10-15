@@ -19,6 +19,7 @@
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+#include <rex/perf/counter.h>
 
 namespace rex::graphics {
 
@@ -342,6 +343,51 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     return true;
   }
 
+  // FAST PATH (retail DOA4 perf work): single-range requests via
+  // RequestRange (the per-draw vertex and index paths) are the overwhelmingly
+  // common case. Identical semantics to the multi-range path below -
+  // validation, sparse allocation, page scan under the lock, upload - but
+  // without the per-call heap vector allocation, sort, and merge (R41:
+  // fixed per-call machinery was ~24.5 s of the 42.9 s caller total, more
+  // than the 18.4 s memcpy it guards).
+  if (count == 1) {
+    uint32_t start = ranges[0].first;
+    uint32_t length = ranges[0].second;
+    // Some buffer is empty, for example - safe to draw in this case.
+    if (!length) {
+      return true;
+    }
+    if (start > kBufferSize || (kBufferSize - start) < length) {
+      return false;
+    }
+    // TEMP DIAGNOSTIC (retail DOA4 residency attribution): fixed-machinery
+    // split - prep = validation/sparse allocation, scan = lock + bitmap scan.
+    const int64_t up_prep_t0 = rex::perf::PerfNowUs();
+    if (!EnsureHostGpuMemoryAllocated(start, length)) {
+      return false;
+    }
+    upload_ranges_.clear();
+    PERF_counter_add(kGpuUpPrepUs, rex::perf::PerfNowUs() - up_prep_t0);  // TEMP DIAGNOSTIC
+    {
+      const int64_t up_scan_t0 = rex::perf::PerfNowUs();  // TEMP DIAGNOSTIC
+      auto global_lock = global_critical_region_.Acquire();
+      CollectInvalidUploadRange(start, length);
+      PERF_counter_add(kGpuUpScanUs, rex::perf::PerfNowUs() - up_scan_t0);  // TEMP DIAGNOSTIC
+    }
+    COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(1));
+    COUNT_profile_set("gpu/shared_memory/request_ranges_merged_count", uint32_t(1));
+    COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
+                      uint32_t(upload_ranges_.size()));
+    if (upload_ranges_.empty()) {
+      return true;
+    }
+    return UploadRanges(upload_ranges_);
+  }
+
+  // TEMP DIAGNOSTIC (retail DOA4 residency attribution): multi-range path
+  // prep timing, mirroring the fast path.
+  const int64_t up_prep_t0 = rex::perf::PerfNowUs();
+
   // Some texture or buffer is empty, for example - safe to draw in this case.
   std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
   merged_ranges.reserve(count);
@@ -390,69 +436,14 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   upload_ranges_.clear();
-  auto append_upload_range = [this](uint32_t page_start, uint32_t page_count) {
-    if (!page_count) {
-      return;
-    }
-    if (!upload_ranges_.empty()) {
-      std::pair<uint32_t, uint32_t>& last_upload_range = upload_ranges_.back();
-      if (last_upload_range.first + last_upload_range.second == page_start) {
-        last_upload_range.second += page_count;
-        return;
-      }
-    }
-    upload_ranges_.emplace_back(page_start, page_count);
-  };
+  PERF_counter_add(kGpuUpPrepUs, rex::perf::PerfNowUs() - up_prep_t0);  // TEMP DIAGNOSTIC
   {
+    const int64_t up_scan_t0 = rex::perf::PerfNowUs();  // TEMP DIAGNOSTIC
     auto global_lock = global_critical_region_.Acquire();
     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
-      uint32_t page_first = range.first >> page_size_log2_;
-      uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
-      uint32_t block_first = page_first >> 6;
-      uint32_t block_last = page_last >> 6;
-      uint32_t range_start = UINT32_MAX;
-      for (uint32_t i = block_first; i <= block_last; ++i) {
-        uint64_t block_valid = system_page_flags_valid_[i];
-        // Consider pages in the block outside the requested range valid.
-        if (i == block_first) {
-          uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
-          block_valid |= block_before;
-        }
-        if (i == block_last && (page_last & 63) != 63) {
-          uint64_t block_inside = (uint64_t(1) << ((page_last & 63) + 1)) - 1;
-          block_valid |= ~block_inside;
-        }
-
-        while (true) {
-          uint32_t block_page;
-          if (range_start == UINT32_MAX) {
-            // Check if need to open a new range.
-            if (!rex::bit_scan_forward(~block_valid, &block_page)) {
-              break;
-            }
-            range_start = (i << 6) + block_page;
-          } else {
-            // Check if need to close the range.
-            // Ignore the valid pages before the beginning of the range.
-            uint64_t block_valid_from_start = block_valid;
-            if (i == (range_start >> 6)) {
-              block_valid_from_start &= ~((uint64_t(1) << (range_start & 63)) - 1);
-            }
-            if (!rex::bit_scan_forward(block_valid_from_start, &block_page)) {
-              break;
-            }
-            append_upload_range(range_start, (i << 6) + block_page - range_start);
-            // In the next iteration within this block, consider this range
-            // valid since it has been queued for upload.
-            block_valid |= (uint64_t(1) << block_page) - 1;
-            range_start = UINT32_MAX;
-          }
-        }
-      }
-      if (range_start != UINT32_MAX) {
-        append_upload_range(range_start, page_last + 1 - range_start);
-      }
+      CollectInvalidUploadRange(range.first, range.second);
     }
+    PERF_counter_add(kGpuUpScanUs, rex::perf::PerfNowUs() - up_scan_t0);  // TEMP DIAGNOSTIC
   }
 
   COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
@@ -532,6 +523,76 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
 
   return std::make_pair(page_first << page_size_log2_, (page_last - page_first + 1)
                                                            << page_size_log2_);
+}
+
+// Appends a page range to upload_ranges_, merging with the previous range if
+// contiguous. Requires global_critical_region_ held by the caller.
+void SharedMemory::AppendUploadRange(uint32_t page_start, uint32_t page_count) {
+  if (!page_count) {
+    return;
+  }
+  if (!upload_ranges_.empty()) {
+    std::pair<uint32_t, uint32_t>& last_upload_range = upload_ranges_.back();
+    if (last_upload_range.first + last_upload_range.second == page_start) {
+      last_upload_range.second += page_count;
+      return;
+    }
+  }
+  upload_ranges_.emplace_back(page_start, page_count);
+}
+
+// Scans the validity bitmap for [start, start + length) (length must be
+// non-zero) and queues every invalid page span in upload_ranges_. Requires
+// global_critical_region_ held by the caller - the bitmap is shared with the
+// memory invalidation callbacks. Extracted from the original merged-range
+// loop in RequestRanges so the count == 1 fast path behaves identically.
+void SharedMemory::CollectInvalidUploadRange(uint32_t start, uint32_t length) {
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  uint32_t block_first = page_first >> 6;
+  uint32_t block_last = page_last >> 6;
+  uint32_t range_start = UINT32_MAX;
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t block_valid = system_page_flags_valid_[i];
+    // Consider pages in the block outside the requested range valid.
+    if (i == block_first) {
+      uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
+      block_valid |= block_before;
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      uint64_t block_inside = (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+      block_valid |= ~block_inside;
+    }
+
+    while (true) {
+      uint32_t block_page;
+      if (range_start == UINT32_MAX) {
+        // Check if need to open a new range.
+        if (!rex::bit_scan_forward(~block_valid, &block_page)) {
+          break;
+        }
+        range_start = (i << 6) + block_page;
+      } else {
+        // Check if need to close the range.
+        // Ignore the valid pages before the beginning of the range.
+        uint64_t block_valid_from_start = block_valid;
+        if (i == (range_start >> 6)) {
+          block_valid_from_start &= ~((uint64_t(1) << (range_start & 63)) - 1);
+        }
+        if (!rex::bit_scan_forward(block_valid_from_start, &block_page)) {
+          break;
+        }
+        AppendUploadRange(range_start, (i << 6) + block_page - range_start);
+        // In the next iteration within this block, consider this range
+        // valid since it has been queued for upload.
+        block_valid |= (uint64_t(1) << block_page) - 1;
+        range_start = UINT32_MAX;
+      }
+    }
+  }
+  if (range_start != UINT32_MAX) {
+    AppendUploadRange(range_start, page_last + 1 - range_start);
+  }
 }
 
 bool SharedMemory::EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length) {

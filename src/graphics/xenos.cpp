@@ -11,9 +11,15 @@
 
 #include <cmath>
 
+#include <rex/cvar.h>
 #include <rex/graphics/xenos.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+
+// Defined in rexcore (this file is always built into it) rather than in the
+// GPU plugin, which loads after argv is parsed, or in perf/counter.cpp, which
+// is only compiled with REXGLUE_ENABLE_PERF_COUNTERS.
+REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Path to dump shaders to");
 
 namespace rex::graphics {
 namespace xenos {

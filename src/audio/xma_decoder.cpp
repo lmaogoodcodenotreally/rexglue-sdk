@@ -22,6 +22,8 @@
 #include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
 
+#include <chrono>
+
 extern "C" {
 #include "libavutil/log.h"
 }  // extern "C"
@@ -295,6 +297,17 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     }
     // Decode inline. waiting on the worker sweep stalls the realtime
     // audio thread 50-100ms during kick bursts.
+    // TEMP DIAGNOSTIC (retail DOA4 R75 stage-select camera-path stall): measure
+    // the inline kick decode cost on the calling thread; if the guest's main
+    // thread issues XMAWriteRegister this cost lands directly on it.
+    // Bounded: >5ms, first 50 + every 100th.
+    const bool diag_on = rex::diag::enabled();  // TEMP probe gate (REX_DIAG=0)
+    const auto t_kick = diag_on ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
+    uint32_t kick_bits = 0;
+    for (uint32_t v = kicked_value; v; v >>= 1) {
+      kick_bits += v & 1;
+    }
     for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
       if (kicked_value & 1) {
         uint32_t context_id = base_context_id + i;
@@ -305,6 +318,18 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       }
     }
     work_event_->Set();
+    if (diag_on) {
+      const int64_t kick_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - t_kick)
+                                  .count();
+      if (kick_us > 5000) {
+        static uint32_t s_kick_count = 0;
+        const uint32_t n = s_kick_count++;
+        if (n < 50 || (n % 100) == 0) {
+          REXAPU_ERROR("XMAKICK n={} ctxs={} dur_us={}", n, kick_bits, kick_us);
+        }
+      }
+    }
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
     // Context lock command.
     // This requests a lock by flagging the context.

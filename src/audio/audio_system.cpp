@@ -146,8 +146,23 @@ void AudioSystem::WorkerThreadMain() {
         }
         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
         uint64_t args[] = {client_callback_arg};
+        // TEMP DIAGNOSTIC (retail DOA4 R75 stage-select camera-path stall):
+        // audio worker guest-callback dispatch duration; >5ms means the guest
+        // XACT update (and any main-thread wait on XACT state) stalls.
+        // Bounded: >5ms, first 50 + every 100th.
+        const auto t_cb = std::chrono::steady_clock::now();
         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                       rex::countof(args));
+        const int64_t cb_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - t_cb)
+                                  .count();
+        if (cb_us > 5000) {
+          static uint32_t s_cb_count = 0;
+          const uint32_t n = s_cb_count++;
+          if (n < 50 || (n % 100) == 0) {
+            REXAPU_ERROR("XACTCALLBACK n={} client={} dur_us={}", n, index, cb_us);
+          }
+        }
         if (diag_pump_count < 10) {
           REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
         }

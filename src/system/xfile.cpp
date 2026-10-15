@@ -9,24 +9,93 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/movie_skip.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xfile.h>
+#include <rex/system/xthread.h>
 #include <rex/thread/mutex.h>
 
 #include <span>
 
+REXCVAR_DEFINE_BOOL(movie_skip, true, "Movie",
+                    "Allow ending FMV playback early: while an .sfd movie "
+                    "streams, any fresh key or button press forces the guest "
+                    "movie player's end state and the game takes its own "
+                    "movie-finished path");
+REXCVAR_DEFINE_BOOL(skip_intro, false, "Movie",
+                    "Skip the boot intro: the first .sfd movie opened ends at once "
+                    "(the game skips its own disclaimer when it reads this too)");
+
 namespace rex::system {
+
+namespace {
+
+// True for SOFDEC .sfd movie files (the same set the SFDOPEN probe in the VFS
+// reports). Deliberately extension-exact: a substring match on "movie" would
+// also catch assets like D:\dat\sprite\movie\spmovie.xpr, and serving those
+// EOF would corrupt scene loads.
+bool IsMovieFilePath(const std::string& path) {
+  if (path.size() < 4) {
+    return false;
+  }
+  const char* ext = path.c_str() + path.size() - 4;
+  return ext[0] == '.' && (ext[1] == 's' || ext[1] == 'S') &&
+         (ext[2] == 'f' || ext[2] == 'F') && (ext[3] == 'd' || ext[3] == 'D');
+}
+
+// Retail DOA4 (doa4.xex): live MWPLY (SOFDEC wrapper) movie-player handle.
+// Set by the movie open path (sub_8242A2C8 via sub_8242A168), cleared by the
+// stop path (sub_8242B6A8 via sub_8242A0F0, which writes through
+// &dword_833F8070). Object layout: magic dword at +0 (must read 1 for
+// mwPlyGetStat to trust the handle), status dword at +4 (mwPlyGetStat,
+// 0x829D06E0: 'lwz r3,4(r10)' after '*handle == 1' check). mwPlyGetStat
+// returns any status != 2 verbatim, and the movie scene (sub_824046D8 case
+// 3) treats anything outside {1,2} as finished via sub_8242A3A8 and runs its
+// own stop -> fade -> next-scene path (sub_8242A0F0, then 90-frame wait).
+constexpr uint32_t kMwPlyHandleGuestAddr = 0x833F8070u;
+constexpr uint32_t kMwPlyStatusEnd = 4u;
+// mwPlyGetStat's handle-validity check: *handle must read 1 before the
+// object is trusted. Used here as a write guard - the SDK (and this DLL)
+// ships to other titles (UFC3, E3 demo) whose layouts differ, and 0x833F8070
+// there holds unrelated data, so a magic mismatch must never be written to.
+constexpr uint32_t kMwPlyMagicValid = 1u;
+
+}  // namespace
 
 XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous)
     : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
   async_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   assert_not_null(async_event_);
+  // FMV skip: remember whether this is a movie file and arm a fresh skip
+  // window so input aimed at the disclaimer (or an earlier movie) does not
+  // skip this playback. entry() is guarded because the Restore path
+  // constructs XFile without a file.
+  if (file_ && file_->entry()) {
+    is_movie_file_ = IsMovieFilePath(file_->entry()->path());
+    if (is_movie_file_) {
+      if (movie_skip::IsRequested()) {
+        // Diagnostic: a request was already pending when this movie opened -
+        // normal if it was aimed at the disclaimer (log it to prove the
+        // discard), a leak warning if it appears in the next MOVIESKIP line.
+        REXLOG_ERROR("MOVIESKIP discarding pre-open request (from '{}') on '{}'",
+                     movie_skip::Source(), path());
+      }
+      movie_skip::Reset();
+      // The first movie a title opens is its boot intro.
+      static std::atomic<bool> s_first_movie_seen{false};
+      if (!s_first_movie_seen.exchange(true) && REXCVAR_GET(skip_intro) &&
+          REXCVAR_GET(movie_skip)) {
+        movie_skip::Request("skip_intro");
+      }
+    }
+  }
 }
 
 XFile::XFile() : XObject(kObjectType) {
@@ -105,8 +174,52 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info, size_t le
 X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length, uint64_t byte_offset,
                      uint32_t* out_bytes_read, uint32_t apc_context, bool notify_completion) {
   std::lock_guard<std::mutex> lock(file_lock_);
-  return ReadInternal(buffer_guest_address, buffer_length, byte_offset, out_bytes_read, apc_context,
-                      notify_completion);
+  // TEMP DIAGNOSTIC (retail DOA4 stage-preview hitch hunt, R93+): a felt
+  // 150ms stutter at stage-select/main-menu preview switches shows as
+  // 3x 44-51ms frames with normal dispatch counts and no upload spike -
+  // i.e. the calling guest thread busy or blocked somewhere a kernel-wait
+  // probe cannot see. Sync file I/O on that path is the prime suspect; this
+  // logs ANY guest read blocking >2ms (host disk/decode work) with the
+  // calling guest thread. Bounded: first 60 slow ones + every 100th.
+  // Remove after root cause.
+  const bool diag_on = rex::diag::enabled();  // TEMP probe gate (REX_DIAG=0)
+  const auto sr_t0 = diag_on ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
+  X_STATUS result = ReadInternal(buffer_guest_address, buffer_length, byte_offset, out_bytes_read,
+                                 apc_context, notify_completion);
+  if (diag_on) {
+    const int64_t sr_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                              sr_t0)
+            .count();
+    if (sr_us > 2000) {
+      static uint32_t s_slowread_n = 0;
+      if (s_slowread_n < 60 || (s_slowread_n % 100) == 0) {
+        auto thread = XThread::GetCurrentThread();
+        REXLOG_ERROR("SLOWREAD n={} tid={:08X} dur_us={} h={:#x} len=0x{:X} off=0x{:X} got={} st={:#x}",
+                     s_slowread_n++, thread ? thread->guest_object() : 0u, sr_us, handle(),
+                     buffer_length, byte_offset, out_bytes_read ? *out_bytes_read : 0u,
+                     static_cast<uint32_t>(result));
+      } else {
+        s_slowread_n++;
+      }
+    }
+  }
+  // TEMP DIAGNOSTIC (issue #7 E3 walker AV): log every read's handle, guest
+  // destination, length, offset, byte count and status so the exact slot-file
+  // delivery order/sizes can be reconstructed against the GUEST FOPEN lines
+  // (the slot pump opens and reads strictly sequentially). Especially: did
+  // block(1) at 0x880000 land before/after window(0)'s 0x23000-byte spill at
+  // 0x860000, and with what status. Remove after a confirmed passing playtest.
+  {
+    static uint32_t s_fread_n = 0;
+    if (rex::diag::enabled() && s_fread_n < 512) {
+      REXLOG_ERROR("GUEST FREAD n={} h={:#x} dst=0x{:08X} len=0x{:X} off=0x{:X} got={} st={:#x}",
+                   s_fread_n++, handle(), buffer_guest_address, buffer_length, byte_offset,
+                   out_bytes_read ? *out_bytes_read : 0u, static_cast<uint32_t>(result));
+    }
+  }
+  return result;
 }
 
 X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_length,
@@ -125,6 +238,54 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
     if (UINT32_MAX - buffer_guest_address < buffer_length) {
       result = X_STATUS_ACCESS_VIOLATION;
     } else {
+      if (is_movie_file_ && REXCVAR_GET(movie_skip) && movie_skip::IsRequested() &&
+          !movie_skip_poked_) {
+        // FMV skip (user request): force the guest's own end-of-movie state
+        // instead of faking EOF - SOFDEC never treats zero-byte reads as
+        // end-of-stream (R45: 250 EOF reads served, no XMP stop, black movie
+        // hung for the whole 90 s run). Retail DOA4 keeps the live MWPLY
+        // handle in dword_833F8070; the movie scene polls mwPlyGetStat
+        // (sub_8242A3A8) every frame and treats any status outside {1,2} as
+        // finished, then runs its own stop -> fade -> next-scene path. 4 =
+        // END/ERROR passes the game's GetStat wrapper (sub_829D0A68 only
+        // overrides statuses 1/3 under streaming-standby fields). Reads keep
+        // serving real file data below, so the decoder never stalls while
+        // the guest winds down. ReadScatter funnels through here per segment.
+        // Guest memory is big-endian (PPC), so all dword access must go
+        // through load/store_and_swap - R46 poked a byte-swapped handle
+        // (0x835A26AC read as 0xAC265A83) and wrote into thin air.
+        uint32_t handle = memory::load_and_swap<uint32_t>(
+            memory()->TranslateVirtual(kMwPlyHandleGuestAddr));
+        uint32_t magic = 0;
+        if (handle && memory()->LookupHeap(handle) && memory()->LookupHeap(handle + 4)) {
+          magic = memory::load_and_swap<uint32_t>(
+              reinterpret_cast<uint32_t*>(memory()->TranslateVirtual(handle)));
+        }
+        if (magic == kMwPlyMagicValid) {
+          uint32_t* status_host =
+              reinterpret_cast<uint32_t*>(memory()->TranslateVirtual(handle + 4));
+          uint32_t status_pre = memory::load_and_swap<uint32_t>(status_host);
+          memory::store_and_swap<uint32_t>(status_host, kMwPlyStatusEnd);
+          movie_skip_poked_ = true;
+          REXLOG_ERROR(
+              "MOVIESKIP forcing mwPly status END on '{}' (handle=0x{:08X} magic=0x{:08X} "
+              "status {}->{}, request from '{}')",
+              path(), handle, magic, status_pre, kMwPlyStatusEnd, movie_skip::Source());
+        } else {
+          // No live player object: either no movie handle is open or this
+          // build doesn't lay the player out at the retail address (the DLL
+          // ships to other titles - UFC3/E3 - so a magic mismatch must stay
+          // inert instead of writing into unrelated guest memory). Not marked
+          // poked: a request made at open (skip_intro) can arrive before the
+          // player object is live, so later reads retry.
+          if (rex::diag::enabled())
+            REXLOG_ERROR(
+              "MOVIESKIP requested on '{}' but no live mwPly object "
+              "(handle=0x{:08X} magic=0x{:08X}), not poking",
+              path(), handle, magic);
+        }
+      }
+
       // Games often read directly to texture/vertex buffer memory - in this
       // case, invalidation notifications must be sent. However, having any
       // memory callbacks in the range will result in STATUS_ACCESS_VIOLATION at

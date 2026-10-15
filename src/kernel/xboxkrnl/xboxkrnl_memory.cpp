@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <algorithm>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -21,6 +22,7 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xtypes.h>
 
 namespace rex::kernel::xboxkrnl {
@@ -102,6 +104,14 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
   if (alloc_type & X_MEM_RESET && (alloc_type & ~X_MEM_RESET)) {
     return X_STATUS_INVALID_PARAMETER;
   }
+
+  // TEMP DIAGNOSTIC: remember what the guest asked for (the out-param is
+  // overwritten with the granted address below) and which guest code asked.
+  const uint32_t req_base = *base_addr_ptr;
+  uint32_t caller_lr = 0;
+  if (auto* ts = rex::runtime::ThreadState::Get(); ts && ts->context()) {
+    caller_lr = static_cast<uint32_t>(ts->context()->lr);
+  }
   // Don't allow games to set execute bits.
   if (protect_bits & (X_PAGE_EXECUTE | X_PAGE_EXECUTE_READ | X_PAGE_EXECUTE_READWRITE |
                       X_PAGE_EXECUTE_WRITECOPY)) {
@@ -173,6 +183,11 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
   }
   if (!address) {
     // Failed - assume no memory available.
+    // TEMP DIAGNOSTIC: a rejected reservation silently consumes no address
+    // space, so record it - it is exactly the kind of call that would otherwise
+    // have pushed later (game) allocations further up the address space.
+    REXKRNL_ERROR("MALLFAIL NtAllocateVirtualMemory req={:#x} size={:#x} type={:#x} lr={:#x}",
+                  req_base, adjusted_size, alloc_type, caller_lr);
     return X_STATUS_NO_MEMORY;
   }
 
@@ -197,6 +212,17 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
   *region_size_ptr = adjusted_size;
   REXKRNL_IMPORT_RESULT("NtAllocateVirtualMemory", "0x0 addr={:#x} size={:#x}", address,
                         adjusted_size);
+  // TEMP DIAGNOSTIC: low allocations are the ones a block-relative offset table
+  // cannot address (its own offsets exceed the block base), so record who makes
+  // them and with what parameters.
+  if (rex::diag::enabled() && ((address < 0x400000u && adjusted_size >= 0x1000u) ||
+                                (req_base == 0 && adjusted_size >= 0x10000u))) {
+    REXKRNL_ERROR(
+        "MALL NtAllocateVirtualMemory req={:#x} addr={:#x} size={:#x} type={:#x} top_down={} "
+        "lr={:#x}",
+        req_base, address, adjusted_size, alloc_type,
+        static_cast<int>(!!(alloc_type & X_MEM_TOP_DOWN)), caller_lr);
+  }
   return X_STATUS_SUCCESS;
 }
 
@@ -403,6 +429,16 @@ u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bit
     return 0;
   }
   REXKRNL_IMPORT_RESULT("MmAllocatePhysicalMemoryEx", "addr={:#x}", base_address);
+
+  // TEMP DIAGNOSTIC: same as NtAllocateVirtualMemory - a block placed below its
+  // own stored offsets cannot be walked, so report the requester's bounds.
+  if (rex::diag::enabled() && base_address < 0x100000u && adjusted_size >= 0x1000u) {
+    REXKRNL_ERROR(
+        "MALL MmAllocatePhysicalMemoryEx addr={:#x} size={:#x} min={:#x} max={:#x} align={:#x} "
+        "heap=[{:#x},{:#x}]",
+        base_address, adjusted_size, min_addr_range, max_addr_range, alignment, heap_min_addr,
+        heap_max_addr);
+  }
 
   return base_address;
 }
@@ -656,9 +692,48 @@ u32 MmCreateKernelStack_entry(u32 stack_size, u32 r4) {
   return stack_address + stack_size;
 }
 
+// TEMP DIAGNOSTIC: defined in xboxkrnl_threading.cpp, reports the host-fiber
+// registry so a release can be correlated with a stale fiber key.
+void LogGuestFibersForStack(uint32_t stack_base);
+
 u32 MmDeleteKernelStack_entry(mapped_void stack_base, mapped_void stack_end) {
+  const uint32_t lo = std::min(stack_base.guest_address(), stack_end.guest_address());
+  const uint32_t hi = std::max(stack_base.guest_address(), stack_end.guest_address());
+
+  // TEMP DIAGNOSTIC: a released stack whose range still holds this thread's
+  // live frame would explain an epilogue reloading zeros into lr/r31.
+  const auto* ts = rex::runtime::ThreadState::Get();
+  const uint32_t live_sp = (ts && ts->context()) ? ts->context()->r1.u32 : 0;
+  const bool hits_live = live_sp && live_sp >= lo && live_sp <= hi;
+  const bool diag_on = rex::diag::enabled();  // TEMP probe gate (REX_DIAG=0)
+  const auto sample = [&](uint32_t addr) -> uint64_t {
+    if (!diag_on || !ts || !ts->memory()) {
+      return 0;
+    }
+    auto* p = ts->memory()->virtual_membase() + addr;
+    uint64_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+  };
+  const uint64_t before0 = live_sp ? sample(live_sp) : 0;
+  const uint64_t before8 = live_sp ? sample(live_sp + 80) : 0;
+
   // Release the stack (where stack_end is the low address)
-  if (REX_KERNEL_STATE()->memory()->LookupHeap(0x70000000)->Release(stack_end.guest_address())) {
+  const bool released =
+      REX_KERNEL_STATE()->memory()->LookupHeap(0x70000000)->Release(stack_end.guest_address());
+
+  if (diag_on) {
+    REXLOG_ERROR(
+        "MMDKS base=0x{:08X} end=0x{:08X} live_sp=0x{:08X} tid={:08X} hits_live={} ok={} "
+        "[sp]={:016X} [sp+80]={:016X} -> [sp]={:016X} [sp+80]={:016X}",
+        stack_base.guest_address(), stack_end.guest_address(), live_sp,
+        ts ? ts->thread_id() : 0xFFFFFFFFu, hits_live, released, before0, before8,
+        live_sp ? sample(live_sp) : 0, live_sp ? sample(live_sp + 80) : 0);
+  }
+
+  if (released) {
+    // TEMP DIAGNOSTIC: pair the release with the host-fiber registry state.
+    LogGuestFibersForStack(stack_base.guest_address());
     return X_STATUS_SUCCESS;
   }
 

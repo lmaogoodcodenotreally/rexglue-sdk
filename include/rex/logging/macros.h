@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include <rex/logging/api.h>
 
 /* Implementation macro - do not call directly. Uses raw pointer for zero
@@ -169,3 +171,27 @@ REXLOG_DEFINE_CATEGORY(gpu)
 REXLOG_DEFINE_CATEGORY(krnl)
 REXLOG_DEFINE_CATEGORY(sys)
 REXLOG_DEFINE_CATEGORY(fs)
+
+/* --- TEMP diagnostic probe gate (probe cleanup pending) -------------------
+   The TEMP measurement probes (ZSPLIT, GLOCKW, KSPLIT, WAIT1, RTLL,
+   SLOWREAD, WAITREG, VBLANK, XMAKICK, MMDKS, MMDKS-FIBER) are pure
+   timing+logging, wrapped in rex::diag::enabled() so play sessions can run
+   them fully inert via REX_DIAG=0 (see the DOA4 lean launcher). Default is
+   ON -- current dev behavior. Functional workarounds (MOVIESKIP, the RTLL
+   free-section no-op, the zero-timeout-poll yield fix) are NOT gated.
+   Remove together with the probes. */
+// Play builds compile with -DREX_DIAG_DEFAULT=0 so probes stay inert even
+// when the exe is started without REX_DIAG set.
+#ifndef REX_DIAG_DEFAULT
+#define REX_DIAG_DEFAULT 1
+#endif
+namespace rex::diag {
+inline bool enabled() {
+  static const bool value = []() {
+    const char* env = std::getenv("REX_DIAG");
+    if (!env || !env[0]) return REX_DIAG_DEFAULT != 0;
+    return !(env[0] == '0' || env[0] == 'f' || env[0] == 'F' || env[0] == 'n' || env[0] == 'N');
+  }();
+  return value;
+}
+}  // namespace rex::diag

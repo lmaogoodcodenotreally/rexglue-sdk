@@ -226,10 +226,14 @@ configure_file(
     @ONLY
 )
 
-# Output directories (multi-config appends /<Config>/ automatically)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+# Output directories (multi-config appends /<Config>/ automatically).
+# Overridable so two build trees of one app (e.g. dev and lean presets with
+# different compile definitions) don't overwrite each other's SDK DLLs.
+set(REXGLUE_OUTPUT_DIR "${REXGLUE_ROOT}/out/${REX_PLATFORM}" CACHE PATH
+    "Output directory for SDK binaries")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
 
 # Sanitizer support for debugging memory corruption and undefined behavior
 if(REXGLUE_ENABLE_SANITIZERS)

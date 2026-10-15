@@ -196,6 +196,41 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
                                      FileDisposition creation_disposition, uint32_t desired_access,
                                      bool is_directory, bool is_non_directory, File** out_file,
                                      FileAction* out_action) {
+  // TEMP DIAGNOSTIC (retail DOA4 FMV perf work): log guest opens of SOFDEC
+  // movie files so FMV playback windows can be correlated with perf CSV row
+  // ranges and run log timestamps. Matches paths ending in ".sfd" or
+  // containing "movie" (the guest may drop the extension). Fires only on
+  // open calls, so volume stays low. Remove after a confirmed pass.
+  {
+    std::string lower_path;
+    lower_path.reserve(path.size());
+    for (char c : path) {
+      if (c >= 'A' && c <= 'Z') {
+        c = static_cast<char>(c - 'A' + 'a');
+      }
+      lower_path.push_back(c);
+    }
+    const bool is_sfd =
+        lower_path.size() >= 4 && lower_path.compare(lower_path.size() - 4, 4, ".sfd") == 0;
+    const bool is_movie = lower_path.find("movie") != std::string::npos;
+    if (is_sfd || is_movie) {
+      REXFS_ERROR("SFDOPEN '{}'", path);
+    }
+  }
+
+  // TEMP DIAGNOSTIC (issue #7 E3 walker AV): log EVERY guest open with a
+  // sequence number so the slot-file delivery order (window/block/aux magic
+  // -> path) can be reconstructed against the GUEST FREAD lines from the same
+  // run log. The slot pump opens and reads strictly sequentially, so the
+  // interleaving pairs each path with its destination/length. Remove after a
+  // confirmed passing playtest.
+  {
+    static uint32_t s_fopen_n = 0;
+    if (rex::diag::enabled() && s_fopen_n < 256) {
+      REXFS_ERROR("GUEST FOPEN n={} path='{}'", s_fopen_n++, path);
+    }
+  }
+
   // TODO(gibbed): should 'is_directory' remain as a bool or should it be
   // flipped to a generic FileAttributeFlags?
 

@@ -395,13 +395,39 @@ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
 
   // Try to allocate an attribute on an existing binding.
   // If no binding for this fetch slot is found create it.
+  //
+  // TEMP DIAGNOSTIC (retail DOA4 issue #2, VFETCH STRIDE MISMATCH -- root
+  // cause): a vfetch_mini carries no valid const_index of its own; its word-0
+  // const_index bits hold other mini fields, and ParseVertexFetchInstruction
+  // inherits fc/stride/addressing from the preceding vfetch_full (operand 1
+  // below, the same operand codegen reads). The lookup previously keyed on
+  // the RAW op.fetch_constant_index(), so minis inserted phantom bindings
+  // under garbage fc indices and a later real vfetch_full then "mismatched"
+  // against them. Proven on the dumped ucode of shader 48FEB5D785261915
+  // (D01): vf1 Stride=16, vf0 Stride=5, yet the logged pair was
+  // fc=0 bind=16 fetch=5 -- a stride-16 binding on fc0 can only have come
+  // from an fc1 mini. vertex_bindings() has no consumers, so rendering never
+  // depended on this table; the user-visible effect was log spam (and the
+  // R10 modal assert, still commented out below). Key on the effective fc.
   using VertexBinding = Shader::VertexBinding;
+  const uint32_t fetch_constant = fetch_instr.operands[1].storage_index;
   VertexBinding::Attribute* attrib = nullptr;
   for (auto& vertex_binding : vertex_bindings_) {
-    if (vertex_binding.fetch_constant == op.fetch_constant_index()) {
+    if (vertex_binding.fetch_constant == fetch_constant) {
       // It may not hold that all strides are equal, but I hope it does.
-      assert_true(!fetch_instr.attributes.stride ||
-                  vertex_binding.stride_words == fetch_instr.attributes.stride);
+      // TEMP DIAGNOSTIC: the log stays (now keyed on the effective fc, so a
+      // genuine game-side stride conflict would still surface); the assert
+      // stays commented out until a confirmed passing playtest. Remove
+      // together with the other TEMP probes after a confirmed pass.
+      if (fetch_instr.attributes.stride &&
+          vertex_binding.stride_words != fetch_instr.attributes.stride) {
+        REXLOG_ERROR(
+            "VFETCH STRIDE MISMATCH shader={:016X} fc={} bind_stride_words={} fetch_stride={}",
+            ucode_data_hash(), fetch_constant, vertex_binding.stride_words,
+            fetch_instr.attributes.stride);
+      }
+      // assert_true(!fetch_instr.attributes.stride ||
+      //             vertex_binding.stride_words == fetch_instr.attributes.stride);
       vertex_binding.attributes.push_back({});
       attrib = &vertex_binding.attributes.back();
       break;
@@ -411,7 +437,7 @@ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
     assert_not_zero(fetch_instr.attributes.stride);
     VertexBinding vertex_binding;
     vertex_binding.binding_index = int(vertex_bindings_.size());
-    vertex_binding.fetch_constant = op.fetch_constant_index();
+    vertex_binding.fetch_constant = fetch_constant;
     vertex_binding.stride_words = fetch_instr.attributes.stride;
     vertex_binding.attributes.push_back({});
     vertex_bindings_.emplace_back(std::move(vertex_binding));

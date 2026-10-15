@@ -795,8 +795,30 @@ bool PipelineCache::IsCreatingPipelines() {
 D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                                        uint32_t dword_count) {
   // Hash the input memory and lookup the shader.
-  return LoadShader(shader_type, host_address, dword_count,
-                    XXH3_64bits(host_address, dword_count * sizeof(uint32_t)));
+  const size_t byte_count = size_t(dword_count) * sizeof(uint32_t);
+  // TEMP PERF (retail DOA4 perf work): re-push short-circuit. When the payload
+  // byte-exactly matches the previous load for this shader type, reuse the
+  // cached hash instead of re-hashing; the map lookup validates the cached
+  // pointer is still alive (failed translations erase + delete shaders).
+  // Any content difference falls through to the full hash + lookup path.
+  LastLoadEntry& last = last_load_[uint32_t(shader_type) & 3];
+  if (last.shader != nullptr && last.dword_count == dword_count &&
+      last.data.size() == byte_count &&
+      std::memcmp(last.data.data(), host_address, byte_count) == 0) {
+    auto cached_it = shaders_.find(last.data_hash);
+    if (cached_it != shaders_.end() && cached_it->second == last.shader) {
+      PERF_counter_inc(kGpuImmHitCount);  // TEMP DIAGNOSTIC
+      return last.shader;
+    }
+  }
+  uint64_t data_hash = XXH3_64bits(host_address, byte_count);
+  D3D12Shader* shader = LoadShader(shader_type, host_address, dword_count, data_hash);
+  last.dword_count = dword_count;
+  last.data_hash = data_hash;
+  last.data.assign(reinterpret_cast<const uint8_t*>(host_address),
+                   reinterpret_cast<const uint8_t*>(host_address) + byte_count);
+  last.shader = shader;
+  return shader;
 }
 
 D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
@@ -3004,6 +3026,22 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         blend_desc.SrcBlendAlpha = kBlendFactorMap[uint32_t(rt.src_blend_alpha)];
         blend_desc.DestBlendAlpha = kBlendFactorMap[uint32_t(rt.dest_blend_alpha)];
         blend_desc.BlendOpAlpha = kBlendOpMap[uint32_t(rt.blend_op_alpha)];
+        // Xenos applies the blend factors before MIN/MAX; D3D12 ignores them.
+        // DOA4's title "PRESS START" glow is MAX(src*SrcAlpha, dst*One) over a
+        // palette whose empty entry is transparent white, so the host MAX drew
+        // an opaque white box. ADD keeps the factors and matches wherever the
+        // glow is over darker pixels (user-verified R51).
+        // shortcut: ADD over-brightens where src*a and dst are both bright;
+        // apply the factor in the pixel shader output if a title shows that.
+        if (rt.blend_op == xenos::BlendOp::kMax && rt.src_blend == PipelineBlendFactor::kSrcAlpha &&
+            rt.dest_blend == PipelineBlendFactor::kOne) {
+          blend_desc.BlendOp = D3D12_BLEND_OP_ADD;
+        }
+        if (rt.blend_op_alpha == xenos::BlendOp::kMax &&
+            rt.src_blend_alpha == PipelineBlendFactor::kSrcAlpha &&
+            rt.dest_blend_alpha == PipelineBlendFactor::kOne) {
+          blend_desc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        }
       }
       blend_desc.RenderTargetWriteMask = rt.write_mask;
     }

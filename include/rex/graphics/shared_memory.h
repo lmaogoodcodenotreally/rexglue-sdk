@@ -161,6 +161,13 @@ class SharedMemory {
   // persistently allocated vector).
   std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
 
+  // Single-range helpers shared by both RequestRanges paths (retail DOA4 perf
+  // work: the count == 1 fast path skips the per-call vector/sort/merge but
+  // must behave identically). Both require global_critical_region_ to be held
+  // by the caller - they are only invoked from inside the scan lock.
+  void AppendUploadRange(uint32_t page_start, uint32_t page_count);
+  void CollectInvalidUploadRange(uint32_t start, uint32_t length);
+
   // Mutex between the guest memory subsystem and the command processor, to be
   // locked when checking or updating validity of pages/ranges and when firing
   // watches.

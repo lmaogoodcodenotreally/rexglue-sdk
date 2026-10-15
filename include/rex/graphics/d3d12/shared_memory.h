@@ -87,6 +87,11 @@ class D3D12SharedMemory : public SharedMemory {
   // The 512 MB tiled buffer.
   ID3D12Resource* buffer_ = nullptr;
   D3D12_GPU_VIRTUAL_ADDRESS buffer_gpu_address_ = 0;
+  // Full-window backing heap (d3d12_shared_memory_full_window_tile_heap): one
+  // heap created at init so first-use bursts only need UpdateTileMappings
+  // instead of a CreateHeap per 4 MB quantum. Null when the switch is off or
+  // creation failed - per-range heaps in buffer_tiled_heaps_ are used then.
+  ID3D12Heap* buffer_single_heap_ = nullptr;
   std::vector<ID3D12Heap*> buffer_tiled_heaps_;
   D3D12_RESOURCE_STATES buffer_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
   bool buffer_uav_writes_commit_needed_ = false;

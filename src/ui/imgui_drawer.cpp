@@ -437,9 +437,22 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   DetachIfLastDialogRemoved();
 
   if (!dialogs_.empty()) {
-    // Repaint (and handle input) continuously if still active. In detached mode
-    // there is no presenter; the app drives repaint via its own present loop.
-    if (presenter_) {
+    // Repaint (and handle input) continuously if still active - but only when
+    // something was actually drawn this frame. An always-registered dialog
+    // that draws nothing while idle (such as the achievement toast between
+    // toasts) must not keep requesting repaints: that would keep presenting
+    // duplicate frames at the host display tick rate, which pins a
+    // variable-refresh-rate display to its maximum refresh rate instead of
+    // following the guest frame rate (visible judder for a 60 Hz guest on a
+    // higher-Hz display) and adds needless present-queue pressure. Dialogs
+    // with visible content still request a repaint every frame (so animations
+    // such as toast fades stay smooth), and a newly-queued toast is drawn by
+    // the paint requested from the next guest output refresh. In detached
+    // mode there is no presenter; the app drives repaint via its own present
+    // loop.
+    const bool drew_visible_output =
+        draw_data && draw_data->CmdListsCount > 0 && draw_data->TotalVtxCount > 0;
+    if (drew_visible_output && presenter_) {
       presenter_->RequestUIPaintFromUIThread();
     }
   }

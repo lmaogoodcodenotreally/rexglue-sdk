@@ -35,6 +35,13 @@ ThreadState::ThreadState(uint32_t thread_id, uint32_t stack_base, uint32_t pcr_a
   context_->r1.u64 = stack_base;    // Stack pointer
   context_->r13.u64 = pcr_address;  // PCR address
 
+  // TEMP DIAGNOSTIC: a second ThreadState appearing at a live context's address
+  // would show a register file being reset while a frame still references it.
+  if (rex::diag::enabled())
+    REXLOG_ERROR("TSNEW this={:p} ctx={:p} tid={:08X} stack=0x{:08X} pcr=0x{:08X}",
+               static_cast<const void*>(this), static_cast<const void*>(context_), thread_id_,
+               stack_base, pcr_address);
+
   // Note(tomc): the rexglue abi passes memory base via 'base' parameter to each function call,
   // so we don't need to store it in the context like JIT did.
 }

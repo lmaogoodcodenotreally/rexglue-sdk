@@ -20,6 +20,9 @@
 #include <rex/filesystem.h>
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+#include <rex/perf/counter.h>
+#endif
 #include <rex/ui/overlay/achievement_toast.h>
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
@@ -156,6 +159,23 @@ bool ReXApp::SetupEnvironment() {
   // Load config FIRST so log cvars have final values
   if (std::filesystem::exists(config_path_))
     rex::cvar::LoadConfig(config_path_);
+
+  // The paths above were resolved before the config loaded, so a config-only
+  // game_data_root was ignored. Take it now (relative = beside the exe), else
+  // fall back to a game\ folder beside the exe.
+  if (resolved_defaults_.game_data_root.empty()) {
+    std::filesystem::path config_game_dir = REXCVAR_GET(game_data_root);
+    if (config_game_dir.empty() && std::filesystem::is_directory(exe_dir / "game")) {
+      config_game_dir = "game";
+    }
+    if (!config_game_dir.empty()) {
+      if (config_game_dir.is_relative()) {
+        config_game_dir = exe_dir / config_game_dir;
+      }
+      game_data_root_ = config_game_dir;
+      resolved_defaults_.game_data_root = config_game_dir;
+    }
+  }
 
   // Late-phase logging
   std::string log_file_cvar = REXCVAR_GET(log_file);
@@ -506,6 +526,13 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   // lock still held by a straggler TerminateTitle left running. Flush (not
   // ShutdownLogging, which frees loggers a straggler may still use); the OS
   // reclaims the rest.
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+  // std::_Exit skips Profiler::Shutdown, so print the per-state perf summary
+  // here while logging is still alive (state/stage work). The per-frame CSV
+  // rows are already flushed every 60 frames; at most a partial buffer of
+  // them is lost, same as a killed run.
+  rex::perf::LogStateSummary();
+#endif
   REXLOG_INFO("Title terminated; hard-exiting process.");
   rex::FlushLogging();
   std::_Exit(0);

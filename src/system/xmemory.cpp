@@ -201,12 +201,33 @@ bool Memory::Initialize() {
   heaps_.vE0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xE0000000,
                               0x1FD00000, 4096, &heaps_.physical);
 
-  // Protect the first and last 64kb of memory.
-  heaps_.v00000000.AllocFixed(0x00000000, 0x10000, 0x10000,
+  // Protect the first 64kb of guest virtual memory and the last 64kb of physical memory.
+  //
+  // The bottom of the guest address space must not be handed out to the game. Real
+  // hardware does not give those pages away and games rely on it: DOA4's asset relocator
+  // (guest sub_822D5D10) only applies `value += base` when `value < base`, so every
+  // relocated block has to be allocated *above* its own in-block offsets. Reserving only
+  // the first 64kb let the game's first NULL-base reservation claim 0x10000, which put its
+  // 0x62540-byte block at 0x30018 while the block's stored offsets reach 0x324A8 - the
+  // test never fired, the fields were consumed as raw offsets, and the guest dereferenced
+  // 0x3B5C8755 (0xC0000005).
+  //
+  // The reservation spans a full megabyte, but only the zero page keeps the
+  // protect_zero no-access treatment. The rest of that megabyte still has to answer
+  // loads: DOA4's sub_822CDC58 reads `parent->field_0x371AC` before it checks anything,
+  // and parent stays 0 whenever the chunk's record table holds no type-16 node -- the E3
+  // stage chunk has none, so the guest really does dereference 0x371AC. Hardware serves
+  // that load from low RAM; covering the whole megabyte with no-access turned a harmless
+  // read into an unhandled 0xC0000005. It stays reserved, so the allocator still starts
+  // the game's NULL-base search at 0x100000.
+  heaps_.v00000000.AllocFixed(0x00000000, 0x00010000, 0x10000,
                               memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
                               !REXCVAR_GET(protect_zero)
                                   ? memory::kMemoryProtectRead | memory::kMemoryProtectWrite
                                   : memory::kMemoryProtectNoAccess);
+  heaps_.v00000000.AllocFixed(0x00010000, 0x00100000 - 0x00010000, 0x10000,
+                              memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+                              memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
   heaps_.physical.AllocFixed(0x1FFF0000, 0x10000, 0x10000, memory::kMemoryAllocationReserve,
                              memory::kMemoryProtectNoAccess);
 

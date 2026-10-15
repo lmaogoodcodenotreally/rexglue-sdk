@@ -48,6 +48,24 @@ bool build_eieio(BuilderContext& ctx) {
   return true;
 }
 
+bool build_db8cyc(BuilderContext& ctx) {
+  // Xenon-specific 8-cycle delay hint, no effect in recompiled code
+  (void)ctx;
+  return true;
+}
+
+bool build_db10cyc(BuilderContext& ctx) {
+  // Xenon-specific 10-cycle delay hint, no effect in recompiled code
+  (void)ctx;
+  return true;
+}
+
+bool build_db12cyc(BuilderContext& ctx) {
+  // Xenon-specific 12-cycle delay hint, no effect in recompiled code
+  (void)ctx;
+  return true;
+}
+
 bool build_db16cyc(BuilderContext& ctx) {
   // Xenon-specific 16-cycle delay hint, no effect in recompiled code
   (void)ctx;

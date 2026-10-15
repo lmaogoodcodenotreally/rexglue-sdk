@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <cinttypes>
-#include <cmath>
 #include <cstring>
 #include <string_view>
 
@@ -35,7 +34,14 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
+#include "wait_wake.h"
+
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+
+REXCVAR_DEFINE_BOOL(precise_vsync, true, "GPU",
+                    "Precise frame pacing: deadline-paced vblank generation + event-driven "
+                    "wake (WaitOnAddress) for WAIT_REG_MEM memory polls. Off = legacy "
+                    "Sleep(1ms) polling on both ends.");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -83,6 +89,9 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
+// TEMP DIAGNOSTIC (retail DOA4 perf work): microsecond scope timers now live
+// in <rex/perf/counter.h> so both this TU and the d3d12 backend can use them.
+using rex::perf::ScopedUsCounter;
 
 namespace {
 
@@ -213,6 +222,9 @@ void CommandProcessor::WorkerThreadMain() {
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
+      // TEMP DIAGNOSTIC: time spent ring-empty (GPU thread waiting on guest).
+      // Counted to the enclosing scope exit, including the `continue` below.
+      ScopedUsCounter gpu_stall_scope(rex::perf::CounterId::kGpuStallUs);
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
@@ -338,6 +350,25 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
   }
   auto it = extended_register_values_.find(index);
   return it != extended_register_values_.end() ? it->second : 0;
+}
+
+bool CommandProcessor::WriteRegisterHasSideEffects(uint32_t index) {
+  // Scratch register writes push the value to guest memory on every write (the
+  // guest may have modified the target since the previous writeback).
+  if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
+    return true;
+  }
+  // Gamma ramp LUT writes advance internal state machines (component/index
+  // auto-increment) even when the register value itself is unchanged.
+  switch (index) {
+    case XE_GPU_REG_DC_LUT_RW_INDEX:
+    case XE_GPU_REG_DC_LUT_SEQ_COLOR:
+    case XE_GPU_REG_DC_LUT_PWL_DATA:
+    case XE_GPU_REG_DC_LUT_30_COLOR:
+      return true;
+    default:
+      return false;
+  }
 }
 
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
@@ -614,6 +645,7 @@ void CommandProcessor::ReturnFromWait() {}
 
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
   SCOPE_profile_cpu_f("gpu");
+  ScopedUsCounter gpu_exec_scope(rex::perf::CounterId::kGpuExecUs);  // TEMP DIAGNOSTIC
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
@@ -628,13 +660,22 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
     }
   } while (reader.read_count());
 
-  OnPrimaryBufferEnd();
+  {
+    // TEMP DIAGNOSTIC: submission/fence/present work at end-of-buffer.
+    ScopedUsCounter gpu_submit_scope(rex::perf::CounterId::kGpuSubmitUs);
+    OnPrimaryBufferEnd();
+  }
 
   return write_index;
 }
 
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+  PERF_counter_inc(kGpuIbCount);  // TEMP DIAGNOSTIC
   SCOPE_profile_cpu_f("gpu");
+  // NOTE (TEMP DIAGNOSTIC, retail perf work): NOT separately timed -- indirect
+  // buffers execute nested inside ExecutePrimaryBuffer, and a scope here
+  // double-counted the same wall time into gpu_exec_us (it read ~2x
+  // frame_time every frame in run R13).
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
@@ -650,6 +691,8 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 }
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
+  // NOTE (TEMP DIAGNOSTIC, retail perf work): not timed -- no callers in this
+  // backend; a scope here would double-count nested work (see R13 note).
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
@@ -663,6 +706,9 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  // TEMP DIAGNOSTIC: one count per packet dispatch (incl. zero-padded words),
+  // to compute per-packet overhead for the retail perf partition.
+  PERF_counter_inc(kGpuPackets);
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
@@ -689,6 +735,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
 }
 
 bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet) {
+  ScopedUsCounter gpu_reg_scope(rex::perf::CounterId::kGpuRegUs);  // TEMP DIAGNOSTIC
   // Type-0 packet.
   // Write count registers in sequence to the registers starting at
   // (base_index << 2).
@@ -705,6 +752,13 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
+    if (target_index < RegisterFile::kRegisterCount &&
+        register_file_->values[target_index] == reg_data &&
+        !WriteRegisterHasSideEffects(target_index)) {
+      // State re-emission: the register already holds the value and the write
+      // has no side effects - skip the virtual dispatch and bookkeeping.
+      continue;
+    }
     WriteRegister(target_index, reg_data);
   }
 
@@ -712,14 +766,21 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 }
 
 bool CommandProcessor::ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet) {
+  ScopedUsCounter gpu_reg_scope(rex::perf::CounterId::kGpuRegUs);  // TEMP DIAGNOSTIC
   // Type-1 packet.
   // Contains two registers of data. Type-0 should be more common.
   uint32_t reg_index_1 = packet & 0x7FF;
   uint32_t reg_index_2 = (packet >> 11) & 0x7FF;
   uint32_t reg_data_1 = reader->ReadAndSwap<uint32_t>();
   uint32_t reg_data_2 = reader->ReadAndSwap<uint32_t>();
-  WriteRegister(reg_index_1, reg_data_1);
-  WriteRegister(reg_index_2, reg_data_2);
+  if (register_file_->values[reg_index_1] != reg_data_1 ||
+      WriteRegisterHasSideEffects(reg_index_1)) {
+    WriteRegister(reg_index_1, reg_data_1);
+  }
+  if (register_file_->values[reg_index_2] != reg_data_2 ||
+      WriteRegisterHasSideEffects(reg_index_2)) {
+    WriteRegister(reg_index_2, reg_data_2);
+  }
   return true;
 }
 
@@ -730,6 +791,7 @@ bool CommandProcessor::ExecutePacketType2(memory::RingBuffer* reader, uint32_t p
 }
 
 bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet) {
+  ScopedUsCounter gpu_type3_scope(rex::perf::CounterId::kGpuType3Us);  // TEMP DIAGNOSTIC
   // Type-3 packet.
   uint32_t opcode = (packet >> 8) & 0x7F;
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
@@ -893,6 +955,8 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
 
 bool CommandProcessor::ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
+  // TEMP DIAGNOSTIC: un-timed Type3 handler bucket.
+  ScopedUsCounter gpu_misc_scope(rex::perf::CounterId::kGpuMiscUs);  // TEMP DIAGNOSTIC
   // initialize CP's micro-engine
   me_bin_.clear();
   for (uint32_t i = 0; i < count; i++) {
@@ -904,6 +968,7 @@ bool CommandProcessor::ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, ui
 
 bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet,
                                               uint32_t count) {
+  PERF_counter_inc(kGpuNopCount);  // TEMP DIAGNOSTIC
   // skip N 32-bit words to get to the next packet
   // No-op, ignore some data.
   reader->AdvanceRead(count * sizeof(uint32_t));
@@ -914,6 +979,8 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
                                                     uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
+  // TEMP DIAGNOSTIC: un-timed Type3 handler bucket.
+  ScopedUsCounter gpu_misc_scope(rex::perf::CounterId::kGpuMiscUs);  // TEMP DIAGNOSTIC
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
   for (int n = 0; n < 6; n++) {
@@ -932,6 +999,15 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   {
+    // TEMP DIAGNOSTIC (retail DOA4 perf work): perf_log_csv was defined but
+    // never consumed anywhere; wire it once at the first swap so per-frame
+    // counters (frame_time_us, fps, draw_calls, stalls, cache hit/miss) land
+    // in a CSV for bottleneck analysis. Remove after a confirmed pass.
+    static bool csv_path_wired = false;
+    if (!csv_path_wired) {
+      csv_path_wired = true;
+      rex::perf::SetCsvLogPath(REXCVAR_GET(perf_log_csv));
+    }
     static uint64_t last_frame_tick = 0;
     uint64_t now = rex::chrono::Clock::QueryHostTickCount();
     if (last_frame_tick) {
@@ -958,7 +1034,10 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
-  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  {
+    ScopedUsCounter gpu_present_scope(rex::perf::CounterId::kGpuPresentUs);  // TEMP DIAGNOSTIC
+    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  }
 
   ++counter_;
   return true;
@@ -978,6 +1057,7 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
 bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet,
                                                        uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+  ScopedUsCounter gpu_wait_scope(rex::perf::CounterId::kGpuWaitUs);  // TEMP DIAGNOSTIC
 
   // wait until a register or memory location is a specific value
 
@@ -989,8 +1069,40 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  // Event-driven wait support (wait_wake.h): register the polled host address
+  // for the duration of this call so GraphicsSystem::MarkVblank can WakeAll()
+  // right after it has dispatched the guest vblank ISR (which clears the
+  // flip/vblanks flag this loop waits on). RAII-deregistered on every exit.
+  struct WaitWakeGuard {
+    void* addr = nullptr;
+    ~WaitWakeGuard() {
+      if (addr) {
+        wait_wake::Deregister(addr);
+      }
+    }
+  } wait_guard;
+  if (is_memory && REXCVAR_GET(precise_vsync)) {
+    wait_guard.addr = memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3));
+    if (!wait_wake::Register(wait_guard.addr)) {
+      wait_guard.addr = nullptr;
+    }
+  }
+
+  // TEMP DIAGNOSTIC (retail DOA4 judder attribution): frame times cluster in
+  // ~0.5 ms steps and late frames are late exactly by the extra gpu_wait time,
+  // so the guest's pacing hangs on this loop's sleep granularity. Log the poll
+  // target, sleep quantum and iteration count of the first 300 calls + every
+  // 1000th to see what condition is being waited on.
+  static uint32_t s_waitreg_idx = 0;
+  const uint32_t waitreg_idx = s_waitreg_idx++;
+  const uint64_t waitreg_t0 =
+      rex::diag::enabled() ? rex::chrono::Clock::QueryHostTickCount() : 0;  // TEMP probe gate
+  uint32_t waitreg_iters = 0;
+  bool waitreg_used_wake = false;
+
   bool matched = false;
   do {
+    ++waitreg_iters;
     uint32_t value = 0;
     if (is_memory) {
       value =
@@ -1036,6 +1148,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         if (!REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
+        } else if (wait_guard.addr &&
+                   wait_wake::Wait(wait_guard.addr, wait / 0x100 * 1000)) {
+          // Event-driven: asleep on the polled dword itself; MarkVblank's
+          // WakeAll after the guest vblank ISR returns brings us back right
+          // away. The timeout is the old Sleep quantum, so any condition
+          // cleared by a different writer times out exactly like before.
+          waitreg_used_wake = true;
         } else {
           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
         }
@@ -1052,11 +1171,25 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     }
   } while (!matched);
 
+  if (rex::diag::enabled() &&  // TEMP probe gate (REX_DIAG=0)
+      (waitreg_idx < 300 || (waitreg_idx % 1000) == 0)) {
+    const uint64_t waitreg_t1 = rex::chrono::Clock::QueryHostTickCount();
+    const uint64_t waitreg_freq = rex::chrono::Clock::QueryHostTickFrequency();
+    REXLOG_ERROR(
+        "WAITREG idx={} info=0x{:08X} {}=0x{:08X} ref=0x{:08X} mask=0x{:08X} wait=0x{:X} "
+        "iters={} dur_us={} wake={}",
+        waitreg_idx, wait_info, is_memory ? "mem" : "reg", poll_reg_addr, ref, mask, wait,
+        waitreg_iters, (waitreg_t1 - waitreg_t0) * 1000000 / waitreg_freq,
+        waitreg_used_wake);
+  }
+
   return true;
 }
 
 bool CommandProcessor::ExecutePacketType3_REG_RMW(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
+  // TEMP DIAGNOSTIC: un-timed Type3 handler bucket.
+  ScopedUsCounter gpu_misc_scope(rex::perf::CounterId::kGpuMiscUs);  // TEMP DIAGNOSTIC
   // register read/modify/write
   // ? (used during shader upload and edram setup)
   uint32_t rmw_info = reader->ReadAndSwap<uint32_t>();
@@ -1083,6 +1216,8 @@ bool CommandProcessor::ExecutePacketType3_REG_RMW(memory::RingBuffer* reader, ui
 
 bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader, uint32_t packet,
                                                      uint32_t count) {
+  // TEMP DIAGNOSTIC: un-timed Type3 handler bucket.
+  ScopedUsCounter gpu_misc_scope(rex::perf::CounterId::kGpuMiscUs);  // TEMP DIAGNOSTIC
   // Copy Register to Memory (?)
   // Count is 2, assuming a Register Addr and a Memory Addr.
 
@@ -1101,6 +1236,8 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
 
 bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
                                                     uint32_t count) {
+  // TEMP DIAGNOSTIC: un-timed Type3 handler bucket.
+  ScopedUsCounter gpu_misc_scope(rex::perf::CounterId::kGpuMiscUs);  // TEMP DIAGNOSTIC
   uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
   for (uint32_t i = 0; i < count - 1; i++) {
     uint32_t write_data = reader->ReadAndSwap<uint32_t>();
@@ -1117,6 +1254,8 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
 
 bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader, uint32_t packet,
                                                      uint32_t count) {
+  // TEMP DIAGNOSTIC: un-timed Type3 handler bucket.
+  ScopedUsCounter gpu_misc_scope(rex::perf::CounterId::kGpuMiscUs);  // TEMP DIAGNOSTIC
   // conditional write to memory or register
   uint32_t wait_info = reader->ReadAndSwap<uint32_t>();
   uint32_t poll_reg_addr = reader->ReadAndSwap<uint32_t>();
@@ -1180,6 +1319,8 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE(memory::RingBuffer* reader, uint32_t packet,
                                                       uint32_t count) {
+  // TEMP DIAGNOSTIC: un-timed Type3 handler bucket.
+  ScopedUsCounter gpu_evt_scope(rex::perf::CounterId::kGpuEvtUs);  // TEMP DIAGNOSTIC
   // generate an event that creates a write to memory when completed
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   // Writeback initiator.
@@ -1196,6 +1337,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE(memory::RingBuffer* reader
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
+  // TEMP DIAGNOSTIC: un-timed Type3 handler bucket.
+  ScopedUsCounter gpu_evt_scope(rex::perf::CounterId::kGpuEvtUs);  // TEMP DIAGNOSTIC
   // generate a VS|PS_done event
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   uint32_t address = reader->ReadAndSwap<uint32_t>();
@@ -1220,6 +1363,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
+  // TEMP DIAGNOSTIC: un-timed Type3 handler bucket.
+  ScopedUsCounter gpu_evt_scope(rex::perf::CounterId::kGpuEvtUs);  // TEMP DIAGNOSTIC
   // generate a screen extent event
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   uint32_t address = reader->ReadAndSwap<uint32_t>();
@@ -1248,6 +1393,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
+  // TEMP DIAGNOSTIC: un-timed Type3 handler bucket.
+  ScopedUsCounter gpu_evt_scope(rex::perf::CounterId::kGpuEvtUs);  // TEMP DIAGNOSTIC
   // Set by D3D as BE but struct ABI is LE
   const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
   assert_true(count == 1);
@@ -1285,6 +1432,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
 bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet,
                                               const char* opcode_name, uint32_t viz_query_condition,
                                               uint32_t count_remaining) {
+  ScopedUsCounter gpu_draw_scope(rex::perf::CounterId::kGpuDrawUs);  // TEMP DIAGNOSTIC
   // if viz_query_condition != 0, this is a conditional draw based on viz query.
   // This ID matches the one issued in PM4_VIZ_QUERY
   // uint32_t viz_id = viz_query_condition & 0x3F;
@@ -1430,6 +1578,7 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader
 
 bool CommandProcessor::ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reader, uint32_t packet,
                                                        uint32_t count) {
+  ScopedUsCounter gpu_const_scope(rex::perf::CounterId::kGpuConstUs);  // TEMP DIAGNOSTIC
   // load constant into chip and to memory
   // PM4_REG(reg) ((0x4 << 16) | (GSL_HAL_SUBBLOCK_OFFSET(reg)))
   //                                     reg - 0x2000
@@ -1463,6 +1612,7 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reade
 
 bool CommandProcessor::ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* reader, uint32_t packet,
                                                         uint32_t count) {
+  ScopedUsCounter gpu_const_scope(rex::perf::CounterId::kGpuConstUs);  // TEMP DIAGNOSTIC
   uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
   uint32_t index = offset_type & 0xFFFF;
   WriteRegisterRangeFromRing(reader, index, count - 1);
@@ -1471,6 +1621,7 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* read
 
 bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* reader,
                                                             uint32_t packet, uint32_t count) {
+  ScopedUsCounter gpu_const_scope(rex::perf::CounterId::kGpuConstUs);  // TEMP DIAGNOSTIC
   // load constants from memory
   uint32_t address = reader->ReadAndSwap<uint32_t>();
   address &= 0x3FFFFFFF;
@@ -1505,6 +1656,7 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* 
 
 bool CommandProcessor::ExecutePacketType3_SET_SHADER_CONSTANTS(memory::RingBuffer* reader,
                                                                uint32_t packet, uint32_t count) {
+  ScopedUsCounter gpu_const_scope(rex::perf::CounterId::kGpuConstUs);  // TEMP DIAGNOSTIC
   uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
   uint32_t index = offset_type & 0xFFFF;
   WriteRegisterRangeFromRing(reader, index, count - 1);
@@ -1514,6 +1666,7 @@ bool CommandProcessor::ExecutePacketType3_SET_SHADER_CONSTANTS(memory::RingBuffe
 bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+  ScopedUsCounter gpu_imm_scope(rex::perf::CounterId::kGpuImmUs);  // TEMP DIAGNOSTIC
 
   // load sequencer instruction memory (pointer-based)
   uint32_t addr_type = reader->ReadAndSwap<uint32_t>();
@@ -1543,6 +1696,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
 bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* reader,
                                                             uint32_t packet, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+  ScopedUsCounter gpu_imm_scope(rex::perf::CounterId::kGpuImmUs);  // TEMP DIAGNOSTIC
 
   // load sequencer instruction memory (code embedded in packet)
   uint32_t dword0 = reader->ReadAndSwap<uint32_t>();
@@ -1573,6 +1727,8 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
 
 bool CommandProcessor::ExecutePacketType3_INVALIDATE_STATE(memory::RingBuffer* reader,
                                                            uint32_t packet, uint32_t count) {
+  // TEMP DIAGNOSTIC: un-timed Type3 handler bucket.
+  ScopedUsCounter gpu_misc_scope(rex::perf::CounterId::kGpuMiscUs);  // TEMP DIAGNOSTIC
   // selective invalidation of state pointers
   /*uint32_t mask =*/reader->ReadAndSwap<uint32_t>();
   // driver_->InvalidateState(mask);
@@ -1581,6 +1737,8 @@ bool CommandProcessor::ExecutePacketType3_INVALIDATE_STATE(memory::RingBuffer* r
 
 bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, uint32_t packet,
                                                     uint32_t count) {
+  // TEMP DIAGNOSTIC: un-timed Type3 handler bucket.
+  ScopedUsCounter gpu_misc_scope(rex::perf::CounterId::kGpuMiscUs);  // TEMP DIAGNOSTIC
   // begin/end initiator for viz query extent processing
   // https://www.google.com/patents/US20050195186
   assert_true(count == 1);

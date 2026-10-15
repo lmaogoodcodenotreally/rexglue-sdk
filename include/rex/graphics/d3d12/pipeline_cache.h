@@ -314,6 +314,19 @@ class PipelineCache {
   // Ucode hash -> shader.
   std::unordered_map<uint64_t, D3D12Shader*, rex::IdentityHasher<uint64_t>> shaders_;
 
+  // TEMP PERF (retail DOA4 perf work): single-entry re-push cache per shader
+  // type. DOA4 re-pushes identical shader ucode thousands of times per frame;
+  // the byte-exact comparison guards content correctness and the shaders_ map
+  // lookup guards pointer liveness (failed translations delete their shader).
+  // Remove after a confirmed pass.
+  struct LastLoadEntry {
+    uint32_t dword_count = 0;
+    uint64_t data_hash = 0;
+    std::vector<uint8_t> data;
+    D3D12Shader* shader = nullptr;
+  };
+  LastLoadEntry last_load_[4];  // indexed by xenos::ShaderType & 3
+
   struct LayoutUID {
     size_t uid;
     size_t vector_span_offset;

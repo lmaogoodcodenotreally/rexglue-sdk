@@ -55,6 +55,23 @@ add_library(rex::kernel ALIAS rexruntime)
 
 set_target_properties(rexruntime PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
 
+# Delay-load FidelityFX DLLs: rexui (and so its FidelityFX import) lives in
+# this shared library, so tool-mode rexglue can only start without them if
+# the delay-load is applied here rather than on the rexglue executable.
+if(WIN32)
+    if(TARGET amd_fidelityfx_vk)
+        target_link_options(rexruntime PRIVATE
+            "LINKER:/DELAYLOAD:$<TARGET_FILE_NAME:amd_fidelityfx_vk>")
+    endif()
+    if(TARGET amd_fidelityfx_dx12)
+        target_link_options(rexruntime PRIVATE
+            "LINKER:/DELAYLOAD:$<TARGET_FILE_NAME:amd_fidelityfx_dx12>")
+    endif()
+    if(TARGET amd_fidelityfx_vk OR TARGET amd_fidelityfx_dx12)
+        target_link_libraries(rexruntime PRIVATE delayimp)
+    endif()
+endif()
+
 rex_target_pch(rexruntime
     <mutex>
     <unordered_map>

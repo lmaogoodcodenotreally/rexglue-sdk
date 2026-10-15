@@ -51,6 +51,13 @@ install(TARGETS ${REXGLUE_INSTALL_TARGETS}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
+# rexruntime links imgui PUBLIC (include/rex/rex_app.h reaches <imgui.h>
+# through rex/ui/style.h), and install(EXPORT) refuses to emit an export set
+# that mentions a target outside it. imgui is a vendored OBJECT library with no
+# artifact to install, but it must still be listed so the generate step -- and
+# with it every `cmake --build` that has to re-run configure -- can complete.
+install(TARGETS imgui EXPORT rexglueTargets)
+
 # A Debug codegen tool runs an order of magnitude slower, so only Release ships.
 install(TARGETS rexglue
     EXPORT rexglueTargets

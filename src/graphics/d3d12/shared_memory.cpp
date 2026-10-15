@@ -19,10 +19,17 @@
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
                     "Use tiled shared memory on D3D12")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(d3d12_shared_memory_full_window_tile_heap, true, "GPU/D3D12",
+                    "Back the tiled shared-memory buffer with one full-window heap created at "
+                    "init (first-use bursts only update tile mappings) instead of creating a "
+                    "heap per 4 MB range on first touch")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::d3d12 {
@@ -57,6 +64,31 @@ bool D3D12SharedMemory::Initialize() {
     static_assert(D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES == (1 << 16));
     InitializeSparseHostGpuMemory(
         std::max(kHostGpuMemoryOptimalSparseAllocationLog2, uint32_t(16)));
+    if (REXCVAR_GET(d3d12_shared_memory_full_window_tile_heap)) {
+      // R56 (transition-hitch fix): one full-window backing heap created here,
+      // off the render path, so first-use bursts (scene swap touching ~50 MB
+      // of previously-invalid pages in one frame) only issue UpdateTileMappings
+      // instead of one CreateHeap per 4 MB quantum - that CreateHeap storm was
+      // ~5 ms inside the transition frame. NOT_ZEROED + no eviction in this
+      // runtime means physical pages still commit lazily on GPU touch, so VRAM
+      // scales with actual use (the non-tiled fallback below already commits
+      // the full window unconditionally). On failure: warn and keep the
+      // per-range heap path - correctness is unaffected either way.
+      D3D12_HEAP_DESC single_heap_desc = {};
+      single_heap_desc.SizeInBytes = kBufferSize;
+      single_heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+      single_heap_desc.Flags =
+          D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | provider.GetHeapFlagCreateNotZeroed();
+      if (SUCCEEDED(device->CreateHeap(&single_heap_desc, IID_PPV_ARGS(&buffer_single_heap_)))) {
+        REXGPU_INFO("Shared memory: using a single {} MB full-window tile heap",
+                    kBufferSize >> 20);
+      } else {
+        buffer_single_heap_ = nullptr;
+        REXGPU_WARN(
+            "Shared memory: full-window tile heap creation failed - falling back to per-range "
+            "tile heaps");
+      }
+    }
   } else {
     REXGPU_INFO(
         "Direct3D 12 tiled resources are not used for shared memory "
@@ -145,6 +177,16 @@ bool D3D12SharedMemory::Initialize() {
   upload_buffer_pool_ = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(
       provider, rex::align(ui::d3d12::D3D12UploadBufferPool::kDefaultPageSize,
                            size_t(1) << page_size_log2()));
+  // R56 (transition-hitch fix): pre-create 64 MB of staging pages at init
+  // instead of letting a scene-swap burst exhaust the pool and pay ~19
+  // CreateCommittedResource+Map calls (11.7 ms measured) one 2 MB page at a
+  // time mid-frame. Measured scene-swap burst is ~38 MB of first-use uploads
+  // per frame; beyond 64 MB Request() still grows on demand (old behavior).
+  {
+    const size_t pool_page_size = rex::align(
+        ui::d3d12::D3D12UploadBufferPool::kDefaultPageSize, size_t(1) << page_size_log2());
+    upload_buffer_pool_->PreallocatePages((size_t(64) << 20) / pool_page_size);
+  }
 
   return true;
 }
@@ -157,6 +199,10 @@ void D3D12SharedMemory::Shutdown(bool from_destructor) {
   // First free the buffer to detach it from the heaps.
   ui::d3d12::util::ReleaseAndNull(buffer_);
 
+  if (buffer_single_heap_) {
+    buffer_single_heap_->Release();
+    buffer_single_heap_ = nullptr;
+  }
   for (ID3D12Heap* heap : buffer_tiled_heaps_) {
     heap->Release();
   }
@@ -281,16 +327,27 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
   ID3D12Device* device = provider.GetDevice();
   ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
 
-  D3D12_HEAP_DESC heap_desc = {};
-  heap_desc.SizeInBytes = length_bytes;
-  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | provider.GetHeapFlagCreateNotZeroed();
   ID3D12Heap* heap;
-  if (FAILED(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap)))) {
-    REXGPU_ERROR("Shared memory: Failed to create a tile heap");
-    return false;
+  UINT heap_range_start_offset;
+  if (buffer_single_heap_) {
+    // R56: identity-map the range into the full-window heap created at init -
+    // no per-range CreateHeap. Buffer tile X goes to heap tile X.
+    heap = buffer_single_heap_;
+    heap_range_start_offset = offset_bytes / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+  } else {
+    // Legacy: one heap per contiguous invalid range (Xenia upstream design,
+    // kept as the fallback via d3d12_shared_memory_full_window_tile_heap=0).
+    D3D12_HEAP_DESC heap_desc = {};
+    heap_desc.SizeInBytes = length_bytes;
+    heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | provider.GetHeapFlagCreateNotZeroed();
+    if (FAILED(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap)))) {
+      REXGPU_ERROR("Shared memory: Failed to create a tile heap");
+      return false;
+    }
+    buffer_tiled_heaps_.push_back(heap);
+    heap_range_start_offset = 0;
   }
-  buffer_tiled_heaps_.push_back(heap);
 
   D3D12_TILED_RESOURCE_COORDINATE region_start_coordinates;
   region_start_coordinates.X = offset_bytes / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
@@ -301,7 +358,6 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
   region_size.NumTiles = length_bytes / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
   region_size.UseBox = FALSE;
   D3D12_TILE_RANGE_FLAGS range_flags = D3D12_TILE_RANGE_FLAG_NONE;
-  UINT heap_range_start_offset = 0;
   direct_queue->UpdateTileMappings(buffer_, 1, &region_start_coordinates, &region_size, heap, 1,
                                    &range_flags, &heap_range_start_offset, &region_size.NumTiles,
                                    D3D12_TILE_MAPPING_FLAG_NONE);
@@ -323,18 +379,30 @@ bool D3D12SharedMemory::UploadRanges(
     while (upload_range_length != 0) {
       ID3D12Resource* upload_buffer;
       size_t upload_buffer_offset, upload_buffer_size;
+      // TEMP DIAGNOSTIC (retail DOA4 class-A attribution, level 3): upload
+      // pool page request (may create a new staging resource).
+      const int64_t up_pool_t0 = rex::perf::PerfNowUs();
       uint8_t* upload_buffer_mapping = upload_buffer_pool_->RequestPartial(
           command_processor_.GetCurrentSubmission(), upload_range_length << page_size_log2(),
           size_t(1) << page_size_log2(), &upload_buffer, &upload_buffer_offset, &upload_buffer_size,
           nullptr);
+      PERF_counter_add(kGpuTexUpPoolUs, rex::perf::PerfNowUs() - up_pool_t0);
       if (upload_buffer_mapping == nullptr) {
         REXGPU_ERROR("Shared memory: Failed to get an upload buffer");
         return false;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
+      // TEMP DIAGNOSTIC (retail DOA4 class-A attribution, level 3): guest
+      // memory memcpy into the staging mapping.
+      const int64_t up_copy_t0 = rex::perf::PerfNowUs();
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);
+      PERF_counter_add(kGpuTexUpCopyUs, rex::perf::PerfNowUs() - up_copy_t0);
+      // TEMP DIAGNOSTIC (retail DOA4 residency attribution): uploaded guest
+      // bytes - to compare against expected per-frame traffic and detect
+      // invalidation-window amplification.
+      PERF_counter_add(kGpuUpBytes, int64_t(upload_buffer_size));
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                        upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));

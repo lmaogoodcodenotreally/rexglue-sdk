@@ -332,7 +332,13 @@ HeapDiagnostics ReXHeap::GetDiagnosticsLocked() const {
 ReXHeap g_heap;
 
 u32 RtlAllocateHeap_entry(u32 hHeap, u32 dwFlags, u32 dwBytes) {
-  return g_heap.Alloc(dwBytes, dwFlags & HEAP_ZERO_MEMORY);
+  const u32 ptr = g_heap.Alloc(dwBytes, dwFlags & HEAP_ZERO_MEMORY);
+  // TEMP DIAGNOSTIC: low allocations are the ones a block-relative offset table
+  // cannot address, so record who makes them.
+  if (rex::diag::enabled() && ptr && ptr < 0x100000u && dwBytes >= 0x1000u) {
+    REXKRNL_ERROR("MALL RtlAllocateHeap addr={:#x} bytes={:#x}", ptr, dwBytes);
+  }
+  return ptr;
 }
 
 u32 RtlFreeHeap_entry(u32 hHeap, u32 dwFlags, u32 ptr) {

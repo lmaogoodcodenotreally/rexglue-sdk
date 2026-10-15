@@ -26,19 +26,4 @@ target_link_libraries(rexglue
 
 rex_target_pch(rexglue <CLI/CLI.hpp>)
 
-# Delay-load FidelityFX DLLs so rexglue can run in tool mode without them.
-if(WIN32)
-    if(TARGET amd_fidelityfx_vk)
-        target_link_options(rexglue PRIVATE
-            "LINKER:/DELAYLOAD:$<TARGET_FILE_NAME:amd_fidelityfx_vk>")
-    endif()
-    if(TARGET amd_fidelityfx_dx12)
-        target_link_options(rexglue PRIVATE
-            "LINKER:/DELAYLOAD:$<TARGET_FILE_NAME:amd_fidelityfx_dx12>")
-    endif()
-    if(TARGET amd_fidelityfx_vk OR TARGET amd_fidelityfx_dx12)
-        target_link_libraries(rexglue PRIVATE delayimp)
-    endif()
-endif()
-
 add_executable(rex::rexglue ALIAS rexglue)

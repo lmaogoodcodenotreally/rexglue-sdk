@@ -42,6 +42,10 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
     ImGui::Separator();
 
+    // Current state (state/stage attribution, retail DOA4 work): labeled
+    // through the game's formatter when one is registered.
+    ImGui::Text("State: %s", rex::perf::StateLabel(rex::perf::GetStateId()));
+
     // Frame time graph
     auto ft_us = rex::perf::GetSnapshotCounter(rex::perf::CounterId::kFrameTimeUs);
     float ft_ms = static_cast<float>(ft_us) / 1000.0f;

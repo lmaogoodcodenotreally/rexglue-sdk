@@ -986,6 +986,16 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
     parameters.min_linear = min_filter == xenos::TextureFilter::kLinear;
     parameters.mip_linear = mip_filter == xenos::TextureFilter::kLinear;
   }
+  // Point sampling is texel-exact only at 1x; with draw resolution scaling it
+  // magnifies each texel of mip-less 2D art into a visible block. Single-channel
+  // 8-bit images and 1-texel-tall rows stay point-sampled: games use them as
+  // palette indices and palettes (DOA4 UI, R59), where filtering mixes indices.
+  if (REXCVAR_GET(scaled_point_filter_linear) && IsDrawResolutionScaled() && !has_mips &&
+      aniso_filter == xenos::AnisoFilter::kDisabled && fetch.format != xenos::TextureFormat::k_8 &&
+      fetch.size_2d.height != 0) {
+    parameters.mag_linear = 1;
+    parameters.min_linear = 1;
+  }
   parameters.mip_base_map = mip_base_map;
 
   return parameters;
@@ -1412,14 +1422,19 @@ ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW
 
 D3D12TextureCache::D3D12Texture::D3D12Texture(D3D12TextureCache& texture_cache,
                                               const TextureKey& key, ID3D12Resource* resource,
-                                              D3D12_RESOURCE_STATES resource_state,
-                                              bool track_usage)
+                                              D3D12_RESOURCE_STATES resource_state, bool track_usage,
+                                              TexturePlacement placement,
+                                              uint64_t host_memory_usage)
     : Texture(texture_cache, key, track_usage),
       resource_(resource),
-      resource_state_(resource_state) {
-  ID3D12Device* device = texture_cache.command_processor_.GetD3D12Provider().GetDevice();
-  D3D12_RESOURCE_DESC resource_desc = resource_->GetDesc();
-  SetHostMemoryUsage(device->GetResourceAllocationInfo(0, 1, &resource_desc).SizeInBytes);
+      resource_state_(resource_state),
+      placement_(placement) {
+  // Allocation size is passed in by the creation sites: the placement path
+  // already queried GetResourceAllocationInfo to place the resource (and the
+  // committed path queries once after CreateCommittedResource). Querying here
+  // as well was a duplicate driver call per texture - the second half of
+  // kGpuTexMkAllocUs (TEMP DIAGNOSTIC: retail DOA4 texture first-use).
+  SetHostMemoryUsage(host_memory_usage);
 }
 
 D3D12TextureCache::D3D12Texture::~D3D12Texture() {
@@ -1427,6 +1442,8 @@ D3D12TextureCache::D3D12Texture::~D3D12Texture() {
   for (const auto& descriptor_pair : srv_descriptors_) {
     d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
   }
+  // Return the segment space for placed resources (no-op for committed ones).
+  d3d12_texture_cache.ReleaseTexturePlacement(placement_);
 }
 
 bool D3D12TextureCache::IsDecompressionNeeded(xenos::TextureFormat format, uint32_t width,
@@ -1549,12 +1566,181 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   // Assuming untiling will be the next operation.
   D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COPY_DEST;
   Microsoft::WRL::ComPtr<ID3D12Resource> resource;
-  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
-                                             provider.GetHeapFlagCreateNotZeroed(), &desc,
-                                             resource_state, nullptr, IID_PPV_ARGS(&resource)))) {
-    return nullptr;
+  TexturePlacement placement;
+  uint64_t host_memory_usage = 0;
+  if (!CreatePlacedTextureResource(desc, resource_state, resource, placement, host_memory_usage)) {
+    // Fall back to a committed resource when a segment cannot be created or
+    // the resource cannot be placed (placement stays invalid - nothing to
+    // free in ~D3D12Texture).
+    // TEMP DIAGNOSTIC (retail DOA4 texture first-use): committed-fallback
+    // driver call, same kGpuTexMkDrvUs bucket as CreatePlacedResource.
+    const int64_t gpu_tex_mk_drv_t0 = rex::perf::PerfNowUs();
+    const HRESULT committed_hr =
+        device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+                                        provider.GetHeapFlagCreateNotZeroed(), &desc,
+                                        resource_state, nullptr, IID_PPV_ARGS(&resource));
+    PERF_counter_add(kGpuTexMkDrvUs, rex::perf::PerfNowUs() - gpu_tex_mk_drv_t0);
+    if (FAILED(committed_hr)) {
+      return nullptr;
+    }
+    // TEMP DIAGNOSTIC (retail DOA4 texture first-use): the committed path's
+    // single allocation query (the placed path already queried inside
+    // CreatePlacedTextureResource) - kGpuTexMkAllocUs now counts one query
+    // per texture instead of two for placed ones.
+    const int64_t gpu_tex_mk_alloc_t0 = rex::perf::PerfNowUs();
+    host_memory_usage = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+    PERF_counter_add(kGpuTexMkAllocUs, rex::perf::PerfNowUs() - gpu_tex_mk_alloc_t0);
   }
-  return std::unique_ptr<Texture>(new D3D12Texture(*this, key, resource.Get(), resource_state));
+  return std::unique_ptr<Texture>(new D3D12Texture(*this, key, resource.Get(), resource_state,
+                                                   true, placement, host_memory_usage));
+}
+
+bool D3D12TextureCache::CreatePlacedTextureResource(
+    const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES initial_state,
+    Microsoft::WRL::ComPtr<ID3D12Resource>& out_resource, TexturePlacement& out_placement,
+    uint64_t& out_alloc_size) {
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  // TEMP DIAGNOSTIC (retail DOA4 texture first-use): allocation-query time,
+  // summed with the constructor's duplicate query into kGpuTexMkAllocUs.
+  const int64_t gpu_tex_mk_alloc_t0 = rex::perf::PerfNowUs();
+  D3D12_RESOURCE_ALLOCATION_INFO alloc_info = device->GetResourceAllocationInfo(0, 1, &desc);
+  PERF_counter_add(kGpuTexMkAllocUs, rex::perf::PerfNowUs() - gpu_tex_mk_alloc_t0);
+  if (alloc_info.SizeInBytes == 0 || alloc_info.Alignment == 0) {
+    return false;
+  }
+  const uint64_t alignment = alloc_info.Alignment;
+  const uint64_t size = (alloc_info.SizeInBytes + alignment - 1) & ~(alignment - 1);
+
+  // TEMP DIAGNOSTIC (retail DOA4 texture first-use): kGpuTexMkScanUs = this
+  // function's span minus the driver calls (recorded separately and
+  // subtracted through drv_acc so the two never double-count); the destructor
+  // fires at any return.
+  struct MkScanTimer {
+    int64_t t0;
+    int64_t drv_acc;
+    ~MkScanTimer() {
+      PERF_counter_add(kGpuTexMkScanUs, rex::perf::PerfNowUs() - t0 - drv_acc);
+    }
+  };
+  MkScanTimer mk_scan_timer{rex::perf::PerfNowUs(), 0};
+
+  // First pass: first-fit over the free intervals of the existing segments.
+  // Second pass (after growing once): find the placement in the new segment.
+  for (uint32_t attempt = 0; attempt < 2; ++attempt) {
+    for (size_t heap_index = 0; heap_index < texture_heap_segments_.size(); ++heap_index) {
+      std::vector<std::pair<uint64_t, uint64_t>>& intervals =
+          texture_heap_segments_[heap_index].free_intervals;
+      for (size_t interval_index = 0; interval_index < intervals.size(); ++interval_index) {
+        const uint64_t interval_offset = intervals[interval_index].first;
+        const uint64_t interval_end = interval_offset + intervals[interval_index].second;
+        uint64_t offset = (interval_offset + alignment - 1) & ~(alignment - 1);
+        if (offset > interval_end || size > interval_end - offset) {
+          continue;
+        }
+        // Carve the placement out of the interval, keeping the unaligned head
+        // and the tail as free space.
+        const uint64_t head_size = offset - interval_offset;
+        const uint64_t tail_offset = offset + size;
+        const uint64_t tail_size = interval_end - tail_offset;
+        intervals.erase(intervals.begin() + interval_index);
+        if (head_size != 0) {
+          intervals.insert(intervals.begin() + interval_index,
+                           std::make_pair(interval_offset, head_size));
+          ++interval_index;
+        }
+        if (tail_size != 0) {
+          intervals.insert(intervals.begin() + interval_index,
+                           std::make_pair(tail_offset, tail_size));
+        }
+        const TexturePlacement placement{uint32_t(heap_index), 0, offset, size};
+        Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+        // TEMP DIAGNOSTIC (retail DOA4 texture first-use): the per-texture
+        // driver create - the presumed floor of kGpuTexMkResUs.
+        const int64_t gpu_tex_mk_drv_t0 = rex::perf::PerfNowUs();
+        const HRESULT placed_hr =
+            device->CreatePlacedResource(texture_heap_segments_[heap_index].heap.Get(), offset,
+                                         &desc, initial_state, nullptr, IID_PPV_ARGS(&resource));
+        const int64_t gpu_tex_mk_drv_us = rex::perf::PerfNowUs() - gpu_tex_mk_drv_t0;
+        PERF_counter_add(kGpuTexMkDrvUs, gpu_tex_mk_drv_us);
+        mk_scan_timer.drv_acc += gpu_tex_mk_drv_us;
+        if (FAILED(placed_hr)) {
+          // Return the carved space to the free list and let the caller fall
+          // back to a committed resource.
+          ReleaseTexturePlacement(placement);
+          return false;
+        }
+        out_resource = resource;
+        out_placement = placement;
+        out_alloc_size = alloc_info.SizeInBytes;
+        return true;
+      }
+    }
+    if (attempt != 0) {
+      break;
+    }
+    // Nothing fits - grow with a new segment holding one big free interval.
+    uint64_t segment_size =
+        (std::max)(kTextureHeapSegmentSize,
+                   (size + D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT - 1) &
+                       ~uint64_t(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT - 1));
+    TextureHeapSegment segment;
+    segment.size_bytes = segment_size;
+    D3D12_HEAP_DESC heap_desc = {};
+    heap_desc.SizeInBytes = segment_size;
+    heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    // All textures in this cache are created with D3D12_RESOURCE_FLAG_NONE
+    // (no render targets or depth stencils), so the non-RT/DS heap class is
+    // sufficient on any heap tier.
+    heap_desc.Flags =
+        D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | provider.GetHeapFlagCreateNotZeroed();
+    // TEMP DIAGNOSTIC (retail DOA4 texture first-use): segment-growth heap
+    // driver call (a few times per session), same kGpuTexMkDrvUs bucket as
+    // CreatePlacedResource.
+    const int64_t gpu_tex_mk_drv_heap_t0 = rex::perf::PerfNowUs();
+    const HRESULT heap_hr = device->CreateHeap(&heap_desc, IID_PPV_ARGS(&segment.heap));
+    const int64_t gpu_tex_mk_drv_heap_us = rex::perf::PerfNowUs() - gpu_tex_mk_drv_heap_t0;
+    PERF_counter_add(kGpuTexMkDrvUs, gpu_tex_mk_drv_heap_us);
+    mk_scan_timer.drv_acc += gpu_tex_mk_drv_heap_us;
+    if (FAILED(heap_hr)) {
+      return false;
+    }
+    segment.free_intervals.emplace_back(0, segment_size);
+    texture_heap_segments_.emplace_back(std::move(segment));
+    COUNT_profile_set("gpu/texture_cache/placed_heap_segments",
+                      uint32_t(texture_heap_segments_.size()));
+  }
+  return false;
+}
+
+void D3D12TextureCache::ReleaseTexturePlacement(const TexturePlacement& placement) {
+  if (!placement.IsValid() || placement.heap_index >= texture_heap_segments_.size()) {
+    return;
+  }
+  std::vector<std::pair<uint64_t, uint64_t>>& intervals =
+      texture_heap_segments_[placement.heap_index].free_intervals;
+  uint64_t offset = placement.offset;
+  uint64_t size = placement.size;
+  // Find the sorted insert position, merging with touching neighbors so the
+  // interval list does not fragment on its own.
+  size_t insert_index = 0;
+  while (insert_index < intervals.size() && intervals[insert_index].first < offset) {
+    ++insert_index;
+  }
+  if (insert_index > 0) {
+    std::pair<uint64_t, uint64_t>& previous = intervals[insert_index - 1];
+    if (previous.first + previous.second == offset) {
+      offset = previous.first;
+      size += previous.second;
+      intervals.erase(intervals.begin() + (insert_index - 1));
+      --insert_index;
+    }
+  }
+  if (insert_index < intervals.size() && intervals[insert_index].first == offset + size) {
+    size += intervals[insert_index].second;
+    intervals.erase(intervals.begin() + insert_index);
+  }
+  intervals.insert(intervals.begin() + insert_index, std::make_pair(offset, size));
 }
 
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
@@ -2008,18 +2194,28 @@ ID3D12Resource* D3D12TextureCache::D3D12Texture::GetOrCreate3DAs2DResource(
 
   D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COPY_DEST;
   Microsoft::WRL::ComPtr<ID3D12Resource> resource_2d;
-  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
-                                             provider.GetHeapFlagCreateNotZeroed(), &desc,
-                                             initial_state, nullptr, IID_PPV_ARGS(&resource_2d)))) {
-    REXGPU_ERROR("D3D12TextureCache: Failed to create 3D-as-2D wrapper resource");
-    return nullptr;
+  TexturePlacement placement_2d;
+  uint64_t host_memory_usage_2d = 0;
+  if (!d3d12_cache.CreatePlacedTextureResource(desc, initial_state, resource_2d, placement_2d,
+                                               host_memory_usage_2d)) {
+    if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+                                               provider.GetHeapFlagCreateNotZeroed(), &desc,
+                                               initial_state, nullptr, IID_PPV_ARGS(&resource_2d)))) {
+      REXGPU_ERROR("D3D12TextureCache: Failed to create 3D-as-2D wrapper resource");
+      return nullptr;
+    }
+    // TEMP DIAGNOSTIC (retail DOA4 texture first-use): committed-path
+    // allocation query for the wrapper (placed path already queried).
+    const int64_t gpu_tex_mk_alloc_t0 = rex::perf::PerfNowUs();
+    host_memory_usage_2d = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+    PERF_counter_add(kGpuTexMkAllocUs, rex::perf::PerfNowUs() - gpu_tex_mk_alloc_t0);
   }
 
   TextureKey key_2d = key();
   key_2d.depth_or_array_size_minus_1 = 0;
   key_2d.mip_max_level = 0;
-  texture_3d_as_2d_.reset(
-      new D3D12Texture(d3d12_cache, key_2d, resource_2d.Get(), initial_state, false));
+  texture_3d_as_2d_.reset(new D3D12Texture(d3d12_cache, key_2d, resource_2d.Get(), initial_state,
+                                           false, placement_2d, host_memory_usage_2d));
   texture_3d_as_2d_->SetForceLoad3DTiling(true);
 
   if (!d3d12_cache.LoadTextureData(*texture_3d_as_2d_)) {

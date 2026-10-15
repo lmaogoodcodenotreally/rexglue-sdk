@@ -35,6 +35,15 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 }  // namespace
 
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
+  // TEMP DIAGNOSTIC: log guest caller context before the fatal so the caller
+  // (lr = return address, lr_stack = saved lr of the caller's frame) can be
+  // symbolized from the log alone. Remove together with the other temporary
+  // probes once the unregistered-indirect-call class is closed out.
+  REXLOG_ERROR(
+      "GUEST IFUNC target=0x{:08X} lr=0x{:08X} r1=0x{:08X} r3=0x{:08X} "
+      "r11=0x{:08X}",
+      ctx.last_indirect_target, static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
+      ctx.r3.u32, ctx.r11.u32);
   REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
             ctx.last_indirect_target);
 }
@@ -74,6 +83,7 @@ bool FunctionDispatcher::Execute(ThreadState* thread_state, uint32_t address) {
   ThreadState::Bind(thread_state);
 
   // Pad out stack a bit, as some games seem to overwrite the caller by about 16 to 32b.
+  const uint64_t r1_entry = ctx->r1.u64;
   ctx->r1.u64 -= 64 + 112;
 
   uint64_t previous_lr = ctx->lr;
@@ -84,6 +94,15 @@ bool FunctionDispatcher::Execute(ThreadState* thread_state, uint32_t address) {
   ctx->lr = previous_lr;
   ctx->r1.u64 += 64 + 112;
   ThreadState::Bind(previous_thread_state);
+
+  // TEMP DIAGNOSTIC: this pairing is balanced by construction, so any leftover
+  // shift means something inside fn moved r1 and never put it back. That is
+  // exactly how a frame pointer ends up hundreds of bytes off its own frame.
+  if (ctx->r1.u64 != r1_entry) {
+    REXLOG_ERROR("EXECUTE-UNBAL addr=0x{:08X} r1 0x{:08X} -> 0x{:08X} delta={}", address,
+                 static_cast<uint32_t>(r1_entry), static_cast<uint32_t>(ctx->r1.u64),
+                 static_cast<int64_t>(ctx->r1.u64) - static_cast<int64_t>(r1_entry));
+  }
 
   return true;
 }
@@ -133,6 +152,18 @@ uint64_t FunctionDispatcher::ExecuteTrap(ThreadState* thread_state, uint32_t add
   PPCContext saved = *ctx;
 
   uint64_t result = Execute(thread_state, address, args, arg_count);
+
+  // TEMP DIAGNOSTIC: this whole-context restore is the only other writer that
+  // can move r1 without a prologue, so record what it puts back and who it
+  // displaced. Bounded to keep the log from flooding.
+  static uint32_t s_trap_count = 0;
+  const uint32_t n = s_trap_count++;
+  if (n < 400) {
+    REXLOG_ERROR("TRAP n={} addr=0x{:08X} ts={} r1 saved=0x{:08X} now=0x{:08X} lr=0x{:08X}",
+                 n, address, static_cast<const void*>(thread_state),
+                 static_cast<uint32_t>(saved.r1.u64), static_cast<uint32_t>(ctx->r1.u64),
+                 static_cast<uint32_t>(saved.lr));
+  }
 
   *ctx = saved;
   ctx->fpscr.restoreGuestBits(saved.fpscr.csr);

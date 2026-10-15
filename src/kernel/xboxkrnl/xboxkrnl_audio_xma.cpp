@@ -330,15 +330,42 @@ u32 XMAEnableContext_entry(mapped_void context_ptr) {
 u32 XMADisableContext_entry(mapped_void context_ptr, u32 wait) {
   X_HRESULT result = X_E_SUCCESS;
   StoreXmaContextIndexedRegister(REX_KERNEL_STATE(), 0x1A40, context_ptr.guest_address());
-  if (!static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system())
-           ->xma_decoder()
-           ->BlockOnContext(context_ptr.guest_address(), !wait)) {
+  // TEMP DIAGNOSTIC (retail DOA4 R75 stage-select camera-path stall): a guest
+  // thread calling XMADisableContext(wait=1) blocks on the context mutex,
+  // which an in-flight Work() decode may hold for a full output-ring batch.
+  // Bounded: >5ms, first 50 + every 100th.
+  const auto t0 = std::chrono::steady_clock::now();
+  const bool block_ok = static_cast<audio::AudioSystem*>(
+                            REX_KERNEL_STATE()->emulator()->audio_system())
+                            ->xma_decoder()
+                            ->BlockOnContext(context_ptr.guest_address(), !wait);
+  const int64_t dur_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+  if (dur_us > 5000) {
+    static uint32_t s_blk_count = 0;
+    const uint32_t n = s_blk_count++;
+    if (n < 50 || (n % 100) == 0) {
+      const auto* ppc = rex::runtime::current_ppc_context();
+      REXLOG_ERROR("XMAWAIT-DSBL n={} wait={} dur_us={} ctx={:#010x} lr={:#010x}", n, wait, dur_us,
+                   static_cast<uint32_t>(context_ptr.guest_address()),
+                   ppc ? static_cast<uint32_t>(ppc->lr) : 0u);
+    }
+  }
+  if (!block_ok) {
     result = X_E_FALSE;
   }
   return result;
 }
 
 u32 XMABlockWhileInUse_entry(mapped_void context_ptr) {
+  // TEMP DIAGNOSTIC (retail DOA4 R75 stage-select camera-path stall): prime
+  // suspect for the ~20Hz guest-frame grid - the guest polls XMA input-buffer
+  // drain at 1ms sleeps while decode progress is gated by the pipeline
+  // cadence (XACT kick ticks + output-ring drain at 5.33ms backend ticks).
+  // Bounded: >5ms, first 50 + every 100th.
+  const auto t0 = std::chrono::steady_clock::now();
+  uint32_t polls = 0;
   do {
     XMA_CONTEXT_DATA context(context_ptr);
     if (!context.input_buffer_0_valid && !context.input_buffer_1_valid) {
@@ -348,7 +375,21 @@ u32 XMABlockWhileInUse_entry(mapped_void context_ptr) {
       break;
     }
     rex::thread::Sleep(std::chrono::milliseconds(1));
+    ++polls;
   } while (true);
+  const int64_t dur_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+  if (dur_us > 5000) {
+    static uint32_t s_wiu_count = 0;
+    const uint32_t n = s_wiu_count++;
+    if (n < 50 || (n % 100) == 0) {
+      const auto* ppc = rex::runtime::current_ppc_context();
+      REXLOG_ERROR("XMAWAIT-WIU n={} polls={} dur_us={} ctx={:#010x} lr={:#010x}", n, polls, dur_us,
+                   static_cast<uint32_t>(context_ptr.guest_address()),
+                   ppc ? static_cast<uint32_t>(ppc->lr) : 0u);
+    }
+  }
   return 0;
 }
 

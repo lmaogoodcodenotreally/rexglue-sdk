@@ -60,6 +60,26 @@ void GraphicsUploadBufferPool::ChangeSubmissionTimeline() {
   }
 }
 
+void GraphicsUploadBufferPool::PreallocatePages(size_t count) {
+  while (count--) {
+    Page* page = CreatePageImplementation();
+    if (!page) {
+      // Out of memory or the implementation refuses - Request() falls back to
+      // on-demand creation for anything beyond what was pre-allocated here.
+      break;
+    }
+    page->last_submission_index_ = 0;
+    page->next_ = nullptr;
+    if (writable_last_) {
+      writable_last_->next_ = page;
+      writable_last_ = page;
+    } else {
+      writable_first_ = page;
+      writable_last_ = page;
+    }
+  }
+}
+
 void GraphicsUploadBufferPool::ClearCache() {
   // Called from the destructor - must not call virtual functions here.
   current_page_flushed_ = 0;

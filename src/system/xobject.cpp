@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/logging.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
@@ -202,7 +203,20 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
 
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                        uint64_t* opt_timeout) {
+  // TEMP DIAGNOSTIC (retail DOA4 transition-hold hunt): GLOCKW proved the
+  // global-lock lookup is <2.5ms for the anomalous guest zero-timeout polls
+  // (LR 0x829fdf88, 5-9ms blocked at match transitions), so the time is in
+  // this function. Split handle fetch vs the host wait vs the MaybeYield on
+  // the timeout path, with a budget that ONLY counts zero-timeout polls so
+  // the flip thread's real 30ms waits cannot steal it. Log when a
+  // zero-timeout poll exceeds 2ms total. Remove after root cause.
+  const bool zpoll = opt_timeout && *opt_timeout == 0;
+  const bool diag_on = rex::diag::enabled();  // TEMP probe gate (REX_DIAG=0)
+  const auto w_t0 = diag_on ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
   auto wait_handle = GetWaitHandle();
+  const auto w_t1 = diag_on ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
   if (!wait_handle) {
     // Object doesn't support waiting.
     return X_STATUS_SUCCESS;
@@ -214,17 +228,62 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
 
   XThread::CheckTitleTermination();
   auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
+  const auto w_t2 = diag_on ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
   XThread::CheckTitleTermination();
+  auto zlog = [&](int64_t yield_us, int res) {
+    if (!diag_on) {
+      return;
+    }
+    const int64_t total_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(w_t2 - w_t0).count() + yield_us;
+    if (total_us > 2000) {
+      static uint64_t s_zsplit_n = 0;
+      if (++s_zsplit_n <= 100 || (s_zsplit_n % 200) == 0) {
+        REXLOG_ERROR("ZSPLIT n={} handle_us={} wait_us={} yield_us={} res={}", s_zsplit_n,
+                     std::chrono::duration_cast<std::chrono::microseconds>(w_t1 - w_t0).count(),
+                     std::chrono::duration_cast<std::chrono::microseconds>(w_t2 - w_t1).count(),
+                     yield_us, res);
+      }
+    }
+  };
   switch (result) {
     case rex::thread::WaitResult::kSuccess:
       WaitCallback();
+      if (zpoll) {
+        zlog(0, static_cast<int>(result));
+      }
       return X_STATUS_SUCCESS;
     case rex::thread::WaitResult::kUserCallback:
       // Or X_STATUS_ALERTED?
       return X_STATUS_USER_APC;
-    case rex::thread::WaitResult::kTimeout:
-      rex::thread::MaybeYield();
+    case rex::thread::WaitResult::kTimeout: {
+      const auto y0 = std::chrono::steady_clock::now();
+      // FIX (retail DOA4 transition-hold hunt, R89-R92): the game polls its
+      // async-completion events with an exact zero timeout (guest wrapper
+      // 0x829FDF40, async-servicing loops) - a pure poll that on real
+      // hardware returns immediately with no scheduling obligation. We were
+      // still running MaybeYield() (SwitchToThread) on every timed-out wait;
+      // measured in R92 as handle_us=0 / wait_us=1 / yield_us=2541 per poll,
+      // and in R89/R90 as 5-9ms blocked polls (11-19 per survival match
+      // transition) inflating transition frames to 18-41ms - SwitchToThread
+      // parks the thread behind other ready threads' quanta while the
+      // recomp is busy loading. Skipping the yield only for exact
+      // zero-timeout polls restores poll cost to microseconds and matches
+      // console behavior (guest spin-loops pegged a core on real hardware
+      // too); timed and infinite waits keep the yield. Revert = always yield.
+      if (!(opt_timeout && *opt_timeout == 0)) {
+        rex::thread::MaybeYield();
+      }
+      const int64_t yield_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                y0)
+              .count();
+      if (zpoll) {
+        zlog(yield_us, static_cast<int>(result));
+      }
       return X_STATUS_TIMEOUT;
+    }
     default:
     case rex::thread::WaitResult::kAbandoned:
     case rex::thread::WaitResult::kFailed:
@@ -249,9 +308,14 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
     case rex::thread::WaitResult::kUserCallback:
       // Or X_STATUS_ALERTED?
       return X_STATUS_USER_APC;
-    case rex::thread::WaitResult::kTimeout:
-      rex::thread::MaybeYield();
+    case rex::thread::WaitResult::kTimeout: {
+      // FIX: zero-timeout polls skip the yield; full rationale in the
+      // matching block in XObject::Wait (retail DOA4 transition-hold hunt).
+      if (!(opt_timeout && *opt_timeout == 0)) {
+        rex::thread::MaybeYield();
+      }
       return X_STATUS_TIMEOUT;
+    }
     default:
     case rex::thread::WaitResult::kAbandoned:
     case rex::thread::WaitResult::kFailed:
@@ -286,7 +350,10 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
         // Or X_STATUS_ALERTED?
         return X_STATUS_USER_APC;
       case rex::thread::WaitResult::kTimeout:
-        rex::thread::MaybeYield();
+        // FIX: zero-timeout polls skip the yield; rationale in XObject::Wait.
+        if (!(opt_timeout && *opt_timeout == 0)) {
+          rex::thread::MaybeYield();
+        }
         return X_STATUS_TIMEOUT;
       default:
       case rex::thread::WaitResult::kAbandoned:
@@ -309,7 +376,10 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
         // Or X_STATUS_ALERTED?
         return X_STATUS_USER_APC;
       case rex::thread::WaitResult::kTimeout:
-        rex::thread::MaybeYield();
+        // FIX: zero-timeout polls skip the yield; rationale in XObject::Wait.
+        if (!(opt_timeout && *opt_timeout == 0)) {
+          rex::thread::MaybeYield();
+        }
         return X_STATUS_TIMEOUT;
       default:
       case rex::thread::WaitResult::kAbandoned:
@@ -380,7 +450,29 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
   // We identify this by setting wait_list_flink to a magic value. When set,
   // wait_list_blink will hold a handle to our object.
 
+  // TEMP DIAGNOSTIC (retail DOA4 transition-hold hunt, R89+): every guest
+  // kernel-object call funnels through this shared static mutex. Guest
+  // zero-timeout polls at LR 0x829fdf88 measured 5-7ms blocked (they must be
+  // instant), so either this acquire queues behind a long holder elsewhere or
+  // the first-use creation below is slow - this splits the two. Bounded (first
+  // 40 slow ones + every 400th), REXLOG_ERROR. Remove after root cause.
+  const bool diag_on = rex::diag::enabled();  // TEMP probe gate (REX_DIAG=0)
+  const auto glock_t0 = diag_on ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
   auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+  if (diag_on) {
+    const int64_t glock_wait_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                              glock_t0)
+            .count();
+    if (glock_wait_us > 2500) {
+      static uint64_t s_glock_slow_n = 0;
+      if (++s_glock_slow_n <= 40 || (s_glock_slow_n % 400) == 0) {
+        REXLOG_ERROR("GLOCKW n={} wait_us={} ptr={:#x}", s_glock_slow_n, glock_wait_us,
+                     reinterpret_cast<uintptr_t>(native_ptr));
+      }
+    }
+  }
 
   auto header = reinterpret_cast<X_DISPATCH_HEADER*>(native_ptr);
 

@@ -223,6 +223,31 @@ class D3D12TextureCache final : public TextureCache {
     uint32_t swizzle;
   };
 
+  // Placement of a texture resource inside a pre-grown heap segment instead of
+  // a committed resource. CreateCommittedResource creates a new driver heap per
+  // texture (~300 us each on the test GPU - measured as the mkres counter), so
+  // bout transitions creating 200-350 textures in one frame hitch for up to
+  // 110 ms. Placing into pre-grown segments reduces the creation cost to
+  // resource bookkeeping; the default-empty placement means "committed
+  // resource - nothing to free".
+  struct TexturePlacement {
+    uint32_t heap_index = UINT32_MAX;
+    uint32_t reserved = 0;
+    uint64_t offset = 0;
+    uint64_t size = 0;
+    bool IsValid() const { return heap_index != UINT32_MAX; }
+  };
+
+  // One pre-grown DEFAULT heap segment for placed texture resources. Free
+  // [offset, size) intervals are kept sorted by offset for first-fit
+  // allocation; with eviction limits raised the list stays nearly empty, so
+  // allocation effectively behaves like a bump allocator.
+  struct TextureHeapSegment {
+    Microsoft::WRL::ComPtr<ID3D12Heap> heap;
+    uint64_t size_bytes = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> free_intervals;
+  };
+
   class D3D12Texture final : public Texture {
    public:
     union SRVDescriptorKey {
@@ -246,9 +271,14 @@ class D3D12TextureCache final : public TextureCache {
 
     ID3D12Resource* GetOrCreate3DAs2DResource(D3D12_RESOURCE_STATES end_state);
 
+    // Both call sites pass track_usage and placement explicitly - a default
+    // argument here would need TexturePlacement's default member initializers
+    // while the enclosing class definition is still being processed (rejected
+    // by clang).
     explicit D3D12Texture(D3D12TextureCache& texture_cache, const TextureKey& key,
                           ID3D12Resource* resource, D3D12_RESOURCE_STATES resource_state,
-                          bool track_usage = true);
+                          bool track_usage, TexturePlacement placement,
+                          uint64_t host_memory_usage);
     ~D3D12Texture();
 
     ID3D12Resource* resource() const { return resource_.Get(); }
@@ -271,6 +301,9 @@ class D3D12TextureCache final : public TextureCache {
    private:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
+    // Segment space occupied by resource_, returned to the cache free list by
+    // ~D3D12Texture (invalid for committed resources).
+    TexturePlacement placement_;
     std::unique_ptr<D3D12Texture> texture_3d_as_2d_;
 
     // For bindful - indices in the non-shader-visible descriptor cache for
@@ -348,6 +381,23 @@ class D3D12TextureCache final : public TextureCache {
     D3D12_RESOURCE_STATES resource_state_;
     bool uav_barrier_pending_ = false;
   };
+
+  // Creates a texture resource placed inside a pre-grown heap segment instead
+  // of committing a driver heap for it (TexturePlacement - the class-A texture
+  // creation hitch). Returns false when no segment can be created or the
+  // resource cannot be placed - the caller then falls back to
+  // CreateCommittedResource. out_placement and out_alloc_size are only
+  // written on success; out_alloc_size carries the GetResourceAllocationInfo
+  // SizeInBytes already queried here so the D3D12Texture constructor does not
+  // have to query the driver a second time (kGpuTexMkAllocUs duplicate half).
+  bool CreatePlacedTextureResource(const D3D12_RESOURCE_DESC& desc,
+                                   D3D12_RESOURCE_STATES initial_state,
+                                   Microsoft::WRL::ComPtr<ID3D12Resource>& out_resource,
+                                   TexturePlacement& out_placement,
+                                   uint64_t& out_alloc_size);
+  // Returns a placement to its segment free list, merging touching intervals.
+  // No-op for invalid placements (committed resources).
+  void ReleaseTexturePlacement(const TexturePlacement& placement);
 
   explicit D3D12TextureCache(const RegisterFile& register_file, D3D12SharedMemory& shared_memory,
                              uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
@@ -466,6 +516,12 @@ class D3D12TextureCache final : public TextureCache {
   uint32_t srv_descriptor_cache_allocated_;
   // Indices of cached descriptors used by deleted textures, for reuse.
   std::vector<uint32_t> srv_descriptor_cache_free_;
+
+  // Pre-grown heap segments for placed texture resources (TexturePlacement).
+  // A segment only grows, never shrinks - freed placements return to the
+  // per-segment free list.
+  static constexpr uint64_t kTextureHeapSegmentSize = 256ull * 1024 * 1024;
+  std::vector<TextureHeapSegment> texture_heap_segments_;
 
   enum class NullSRVDescriptorIndex {
     k2DArray,

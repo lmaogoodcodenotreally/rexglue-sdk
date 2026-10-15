@@ -638,6 +638,14 @@ void XThread::Execute() {
 
   ctx->fpscr.InitHost();
 
+  // TEMPORARY DIAGNOSTIC (do not commit): host FP state per guest thread right
+  // after InitHost. MXCSR exception masks are bits 7-12; if a thread ever starts
+  // (or is later observed) with them clear, every SSE float op on it can raise.
+  if (rex::diag::enabled())
+    REXSYS_ERROR("XTHINIT thid={} addr={:08X} ctx={:p} csr=0x{:X} mxcsr=0x{:X} masks=0x{:X}",
+               thread_id_, address, static_cast<const void*>(ctx), ctx->fpscr.csr,
+               ctx->fpscr.getcsr(), (ctx->fpscr.getcsr() >> 7) & 0x3F);
+
   // Convert this host thread to a fiber so SwitchTo works bidirectionally.
   // Required on Windows before any CreateFiber; provides the fallback handle
   // when another fiber switches back to the main execution context.
@@ -1446,8 +1454,36 @@ void XHostThread::Execute() {
   REXSYS_DEBUG("XThread::Execute thid {} (handle={:08X}, '{}', native={:08X}, <host>)", thread_id_,
                handle(), thread_name_, thread_->system_id());
 
+  // TEMPORARY DIAGNOSTIC (do not commit): this override bypasses the base
+  // XThread::Execute, so it never runs fpscr.InitHost(). Record the host FP
+  // state of the context it is about to run guest code with. MXCSR exception
+  // masks are bits 7-12; if they are clear, any SSE conversion can raise.
+  {
+    auto* ctx = thread_state_->context();
+    if (rex::diag::enabled())
+      REXSYS_ERROR("XHOSTINIT tid={} name='{}' native={:08X} ctx={:p} csr=0x{:X} mxcsr=0x{:X} masks=0x{:X}",
+                 thread_id_, thread_name_, thread_->system_id(), static_cast<const void*>(ctx),
+                 ctx->fpscr.csr, ctx->fpscr.getcsr(), (ctx->fpscr.getcsr() >> 7) & 0x3F);
+  }
+
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);
+
+  // This override replaces the base XThread::Execute, so it must perform the
+  // same host setup before running guest code. fpscr.InitHost() seeds the
+  // FPSCR->MXCSR shadow with this thread's real MXCSR; without it the shadow
+  // stays at 0, and the first enableFlushModeUnconditional() writes 0x8040 to
+  // MXCSR, clearing all six exception masks. The next SSE op that sets an
+  // inexact/invalid flag then raises a host float exception and kills the
+  // process (observed as STATUS_FLOAT_MULTIPLE_FAULTS/0xC000008F).
+  {
+    auto* ctx = thread_state_->context();
+    ctx->fpscr.InitHost();
+    if (rex::diag::enabled())
+      REXSYS_ERROR("XHOSTINIT-FIX tid={} name='{}' csr=0x{:X} mxcsr=0x{:X} masks=0x{:X}",
+                 thread_id_, thread_name_, ctx->fpscr.csr, ctx->fpscr.getcsr(),
+                 (ctx->fpscr.getcsr() >> 7) & 0x3F);
+  }
 
   int ret = host_fn_();
 

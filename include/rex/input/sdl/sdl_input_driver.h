@@ -12,8 +12,13 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include <rex/input/input_driver.h>
@@ -65,6 +70,25 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     bool state_changed;
     bool is_active;
     DeviceId id;
+    // Captured once at connect: EnumerateDevices runs on every guest XInput
+    // query, and SDL's name/GUID getters take SDL's joystick lock, which SDL
+    // holds for ~80 ms while Windows processes a pad arriving or leaving.
+    std::string name;
+    std::string guid;
+    // Cached for the same reason: matching SDL events through
+    // SDL_GetJoystickID would take the joystick lock on the guest thread.
+    SDL_JoystickID instance_id;
+    // Latest guest vibration, sent to SDL by the worker (rumble can block
+    // ~100 ms while a pad connects or disconnects).
+    uint16_t rumble_left;
+    uint16_t rumble_right;
+    bool rumble_dirty;
+    // What the worker last sent. A pad connects with its motors off, so the
+    // zero-initialized values make the guest's repeated (0,0) a no-op instead
+    // of Bluetooth traffic that can stall the whole system's presents.
+    uint16_t rumble_sent_left;
+    uint16_t rumble_sent_right;
+    uint64_t rumble_sent_ms;
     // Per pad rather than per guest user, so it survives reassignment.
     KeystrokeState keystroke;
   };
@@ -77,8 +101,15 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void HandleEvent(const SDL_Event& event);
   std::unique_lock<std::mutex> DrainAndLock();
   void ProcessEventLocked(const SDL_Event& event);
-  void OnControllerDeviceAddedLocked(const SDL_Event& event);
-  void OnControllerDeviceRemovedLocked(const SDL_Event& event);
+  // Slow SDL calls (open/close, rumble, capability queries) run on a worker
+  // thread so a guest XInput call never waits on SDL's joystick lock.
+  void PostToWorker(std::function<void()> job);
+  void WorkerMain();
+  void StopWorker();
+  void OpenPadOnWorker(SDL_JoystickID instance_id);
+  void ClosePadOnWorker(SDL_JoystickID instance_id);
+  void FlushRumbleOnWorker();
+  void RefreshCapsOnWorker();
   void OnControllerDeviceAxisMotionLocked(const SDL_Event& event);
   void OnControllerDeviceButtonChangedLocked(const SDL_Event& event);
 
@@ -99,8 +130,18 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   // assignment decides how many the guest sees.
   std::vector<ControllerState> controllers_;
   std::mutex controllers_mutex_;
+  // controllers_[0]'s instance id (0 = none), readable without the lock from
+  // the SDL event watch, which may run while SDL holds its joystick lock.
+  std::atomic<SDL_JoystickID> first_pad_instance_id_{0};
   std::mutex event_queue_mutex_;
   std::vector<SDL_Event> pending_events_;
+  std::thread worker_;
+  std::mutex worker_mutex_;
+  std::condition_variable worker_cv_;
+  std::deque<std::function<void()>> worker_jobs_;
+  bool worker_stop_ = false;
+  std::atomic<bool> rumble_queued_{false};
+  std::atomic<bool> caps_queued_{false};
   // Never rewound, so a handle held past a disconnect resolves to nothing.
   uint64_t next_device_id_ = 1;
 };

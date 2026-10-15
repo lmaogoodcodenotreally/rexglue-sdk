@@ -13,6 +13,7 @@
 #include <rex/cvar.h>
 #include <rex/input/input.h>
 #include <rex/logging.h>
+#include <rex/system/movie_skip.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/virtual_key.h>
 #include <rex/ui/window.h>
@@ -343,6 +344,14 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   mouse_dx_ = 0.0f;
   mouse_dy_ = 0.0f;
 
+  // NOTE: the FMV-skip backup trigger that used to live here (Request() when
+  // buttons/trigger/sticks were non-zero) is gone: a key HELD over from the
+  // disclaimer skip still read as "pressed" on the first GetDeviceState poll
+  // after the movie opened, re-setting the flag right after the ctor Reset
+  // (R45: EOF served on the first read, black movie, no press during
+  // playback). SDL key/mouse events keep flowing during a movie and already
+  // cover every genuine press, edge-gated in OnKeyDown/OnMouseDown.
+
   auto clamp16 = [](int32_t v) -> int16_t {
     return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
   };
@@ -485,7 +494,18 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
     return;
   std::lock_guard lock(state_mutex_);
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+  bool was_down = vk < 256 && key_down_[vk];
   SetKeyState(vk, true);
+  // FMV skip trigger (rex/system/movie_skip.h): the primary one - SDL key
+  // events keep flowing while the guest ignores input during a movie, unlike
+  // GetDeviceState which needs guest polls. Edge-gated: only a fresh press
+  // counts, so SDL auto-repeat of a key held over from the disclaimer skip
+  // cannot leak a skip past the Reset at movie open (R45 black screen).
+  // Non-movie reads ignore the flag and opening a movie file clears it, so
+  // pressing keys elsewhere is inert.
+  if (!was_down) {
+    rex::system::movie_skip::Request("keydown");
+  }
 }
 
 void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
@@ -500,18 +520,27 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
   if (!IsEnabled() || !has_focus_)
     return;
   std::lock_guard lock(state_mutex_);
+  uint16_t vk;
   switch (e.button()) {
     case rex::ui::MouseEvent::Button::kLeft:
-      SetKeyState(static_cast<uint16_t>(VirtualKey::kLButton), true);
+      vk = static_cast<uint16_t>(VirtualKey::kLButton);
       break;
     case rex::ui::MouseEvent::Button::kRight:
-      SetKeyState(static_cast<uint16_t>(VirtualKey::kRButton), true);
+      vk = static_cast<uint16_t>(VirtualKey::kRButton);
       break;
     case rex::ui::MouseEvent::Button::kMiddle:
-      SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), true);
+      vk = static_cast<uint16_t>(VirtualKey::kMButton);
       break;
     default:
-      break;
+      return;
+  }
+  bool was_down = vk < 256 && key_down_[vk];
+  SetKeyState(vk, true);
+  // FMV skip trigger (rex/system/movie_skip.h): a fresh mouse click counts as
+  // a skip press during a movie, same as any key. Edge-gated like OnKeyDown
+  // so a button already held when the movie opens cannot leak a skip.
+  if (!was_down) {
+    rex::system::movie_skip::Request("mousedown");
   }
 }
 

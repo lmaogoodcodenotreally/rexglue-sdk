@@ -25,6 +25,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 #include <rex/types.h>
 
 REXCVAR_DEFINE_BOOL(force_convert_line_loops_to_strips, false, "GPU",
@@ -911,6 +912,13 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       cacheable.index_buffer_type == ProcessedIndexBufferType::kHostBuiltinForDMA) {
     // Request the index buffer memory.
     // TODO(Triang3l): Shared memory request cache.
+    // TEMP DIAGNOSTIC (retail DOA4 residency attribution): count the index
+    // request and its requested bytes (traffic, not uploaded bytes).
+    PERF_counter_inc(kGpuUpIndexCalls);
+    PERF_counter_add(kGpuUpIndexBytes, int64_t(guest_index_buffer_needed_bytes));
+    // TEMP DIAGNOSTIC (retail DOA4 residency attribution): time the per-draw
+    // index shared-memory request (failure path untimed).
+    const int64_t up_index_t0 = rex::perf::PerfNowUs();
     if (!shared_memory_.RequestRange(guest_index_base, guest_index_buffer_needed_bytes)) {
       REXGPU_ERROR(
           "PrimitiveProcessor: Failed to request index buffer 0x{:08X}, 0x{:X} "
@@ -918,6 +926,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
           guest_index_base, guest_index_buffer_needed_bytes);
       return false;
     }
+    PERF_counter_add(kGpuUpIndexUs, rex::perf::PerfNowUs() - up_index_t0);
   }
 
   result_out.guest_primitive_type = guest_primitive_type;

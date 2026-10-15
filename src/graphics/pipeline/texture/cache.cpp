@@ -25,18 +25,27 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
     .range(1, 256)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft, 384, "GPU",
+// TEMP DIAGNOSTIC (retail DOA4 class-A perf): stock defaults (soft 384 /
+// hard 768) evicted the game's texture working set at every bout transition.
+// R37 proved the cost: every revisit recreated the evicted textures at
+// ~390us each (CreateCommittedResource), all inside a single frame --
+// 28-107ms hitches, 20 per 10-minute attract run. Same-combo revisit pairs
+// (t=101s: 85 misses/28ms vs t=532s: 82 misses/30ms) confirmed churn rather
+// than first-use. Raised to the cvar maximums on the 24GB test GPU; restore
+// 384/768 if VRAM ever becomes a concern.
+REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft, 4096, "GPU",
                      "Soft texture cache memory limit (MB)")
     .range(64, 4096)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(texture_cache_memory_limit_hard, 768, "GPU",
+REXCVAR_DEFINE_INT32(texture_cache_memory_limit_hard, 8192, "GPU",
                      "Hard texture cache memory limit (MB)")
     .range(128, 8192)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -49,6 +58,10 @@ REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(scaled_point_filter_linear, false, "GPU",
+                    "When drawing above native resolution, sample point-filtered textures "
+                    "without mips (2D/UI art) bilinearly so they are not magnified into "
+                    "blocks.");
 REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
                      "Forces anisotropic filtering for eligible textures.\n"
                      "Higher values keep textures sharper at oblique angles, but increase texture "
@@ -302,6 +315,12 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
   }
   if (destroyed_any) {
     COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
+    // TEMP DIAGNOSTIC (retail DOA4 class-A attribution): fires only when LRU
+    // eviction actually runs under the raised limits -- logs the working-set
+    // size so the limits can be tuned if it still triggers.
+    REXGPU_INFO("[TEXEVICT] host_mem={}MB soft={}MB hard={} limits still evicting",
+                (textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20,
+                limit_soft_mb, limit_hard_mb);
   }
 }
 
@@ -461,6 +480,11 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   }
 
   // Update the texture keys and the textures.
+  // TEMP DIAGNOSTIC (retail DOA4 class-A attribution): time the binding-prep
+  // phase (fetch-constant parsing, FindOrCreateTexture, prepare-load, batched
+  // shared-memory range requests) separately from the data-load and
+  // descriptor-binding phases below.
+  const int64_t gpu_tex_prep_t0 = rex::perf::PerfNowUs();
   uint32_t bindings_changed = 0;
   std::vector<PendingTextureLoad> pending_texture_loads;
   std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges;
@@ -468,8 +492,12 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     if (texture == nullptr) {
       return;
     }
+    // TEMP DIAGNOSTIC (retail DOA4 class-A attribution, level 3): pending-load
+    // queueing (dedup scan + PrepareTextureLoad) per request, all exits timed.
+    const int64_t gpu_tex_mkp_t0 = rex::perf::PerfNowUs();
     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
       if (pending_load.texture == texture) {
+        PERF_counter_add(kGpuTexMkpUs, rex::perf::PerfNowUs() - gpu_tex_mkp_t0);
         return;
       }
     }
@@ -477,15 +505,19 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     PendingSharedMemoryRange pending_ranges[2];
     size_t pending_range_count = 0;
     if (!PrepareTextureLoad(*texture, pending_load, pending_ranges, pending_range_count)) {
+      PERF_counter_add(kGpuTexMkpUs, rex::perf::PerfNowUs() - gpu_tex_mkp_t0);
       return;
     }
     pending_texture_loads.push_back(pending_load);
     for (size_t i = 0; i < pending_range_count; ++i) {
       pending_shared_memory_ranges.push_back(pending_ranges[i]);
     }
+    PERF_counter_add(kGpuTexMkpUs, rex::perf::PerfNowUs() - gpu_tex_mkp_t0);
   };
   uint32_t textures_remaining = used_texture_mask & ~texture_bindings_in_sync_;
   uint32_t index = 0;
+  // TEMP DIAGNOSTIC (retail DOA4 class-A attribution, level 2): binding loop.
+  const int64_t gpu_tex_find_t0 = rex::perf::PerfNowUs();
   while (rex::bit_scan_forward(textures_remaining, &index)) {
     uint32_t index_bit = UINT32_C(1) << index;
     textures_remaining &= ~index_bit;
@@ -561,6 +593,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
   }
 
+  PERF_counter_add(kGpuTexFindUs, rex::perf::PerfNowUs() - gpu_tex_find_t0);
+
   COUNT_profile_set("gpu/texture_cache/request_textures_pending_load_count",
                     uint32_t(pending_texture_loads.size()));
   COUNT_profile_set("gpu/texture_cache/request_textures_pending_range_count",
@@ -573,24 +607,43 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     for (const PendingSharedMemoryRange& pending_range : pending_shared_memory_ranges) {
       pending_shared_memory_range_pairs.emplace_back(pending_range.start, pending_range.length);
     }
+    // TEMP DIAGNOSTIC (retail DOA4 class-A attribution, level 2): batched
+    // shared-memory range request (page upload pipeline).
+    const int64_t gpu_tex_range_t0 = rex::perf::PerfNowUs();
     batched_shared_memory_request_succeeded = shared_memory().RequestRanges(
         pending_shared_memory_range_pairs.data(), pending_shared_memory_range_pairs.size());
+    PERF_counter_add(kGpuTexRangeUs, rex::perf::PerfNowUs() - gpu_tex_range_t0);
   }
+  PERF_counter_add(kGpuTexPrepUs, rex::perf::PerfNowUs() - gpu_tex_prep_t0);
 
+  // TEMP DIAGNOSTIC (retail DOA4 class-A attribution): time the data-load
+  // (commit) loop and count committed loads; this is the GPU untile-dispatch
+  // + copy recording path.
+  const int64_t gpu_tex_load_t0 = rex::perf::PerfNowUs();
+  uint32_t textures_loaded = 0;
   if (batched_shared_memory_request_succeeded) {
     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
-      CommitPreparedTextureLoad(pending_load);
+      if (CommitPreparedTextureLoad(pending_load)) {
+        ++textures_loaded;
+      }
     }
   } else {
     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
-      if (pending_load.texture != nullptr) {
-        LoadTextureData(*pending_load.texture);
+      if (pending_load.texture != nullptr && LoadTextureData(*pending_load.texture)) {
+        ++textures_loaded;
       }
     }
   }
+  PERF_counter_add(kGpuTexLoadUs, rex::perf::PerfNowUs() - gpu_tex_load_t0);
+  PERF_counter_add(kGpuTexLoadCount, textures_loaded);
+
+  // TEMP DIAGNOSTIC (retail DOA4 class-A attribution): time descriptor
+  // binding (FindOrCreateTextureDescriptor / CreateShaderResourceView).
+  const int64_t gpu_tex_bind_t0 = rex::perf::PerfNowUs();
   if (bindings_changed) {
     UpdateTextureBindingsImpl(bindings_changed);
   }
+  PERF_counter_add(kGpuTexBindUs, rex::perf::PerfNowUs() - gpu_tex_bind_t0);
 }
 
 const char* TextureCache::TextureKey::GetLogDimensionName(xenos::DataDimension dimension) {
@@ -864,9 +917,25 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     return found_texture_it->second.get();
   }
 
+  // TEMP DIAGNOSTIC (retail DOA4 texture first-use, measurement only): count
+  // create-misses that have the upstream-TODO predecessor (same key with
+  // base_page 0 - the mip-only texture from an earlier streaming order). One
+  // extra hash probe per miss; no behavior change.
+  if (key.base_page) {
+    TextureKey mip_only_key = key;
+    mip_only_key.base_page = 0;
+    if (textures_.find(mip_only_key) != textures_.end()) {
+      PERF_counter_add(kGpuTexReuseCand, 1);
+    }
+  }
+
   // Create the texture and add it to the map.
   Texture* texture;
   {
+    // TEMP DIAGNOSTIC (retail DOA4 class-A attribution, level 3): texture
+    // creation pipeline (CreateCommittedResource + D3D12Texture + map
+    // emplace + count + trace). Failure path intentionally untimed (rare).
+    const int64_t gpu_tex_mkres_t0 = rex::perf::PerfNowUs();
     std::unique_ptr<Texture> new_texture = CreateTexture(key);
     if (!new_texture) {
       key.LogAction("Failed to create");
@@ -874,6 +943,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     }
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
+    PERF_counter_add(kGpuTexMkResUs, rex::perf::PerfNowUs() - gpu_tex_mkres_t0);
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");

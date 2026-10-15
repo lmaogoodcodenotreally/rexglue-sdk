@@ -35,6 +35,14 @@ class GraphicsUploadBufferPool {
   void ChangeSubmissionTimeline();
   void ClearCache();
 
+  // Creates `count` pages up front (empty, submission index 0) so a burst of
+  // large first-use uploads (scene swap: tens of MB in one frame) doesn't pay
+  // CreatePageImplementation() one small page at a time mid-frame. Pages are
+  // plain backing memory - their payload commits lazily on touch, so idle
+  // pre-allocated pages hold no data. Harmless if a burst needs more pages:
+  // Request() still creates them on demand.
+  void PreallocatePages(size_t count);
+
   // Should be called before submitting anything using this pool, unless the
   // implementation doesn't require explicit flushing.
   void FlushWrites();

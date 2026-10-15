@@ -143,6 +143,11 @@ class CommandProcessor {
   virtual void ShutdownContext() = 0;
 
   virtual void WriteRegister(uint32_t index, uint32_t value);
+  // Returns true when a register write must run its full handling even if the
+  // new value equals the one already stored: scratch writebacks push the value
+  // to guest memory on every write, and gamma ramp LUT writes advance internal
+  // component/index state machines.
+  static bool WriteRegisterHasSideEffects(uint32_t index);
   uint32_t ReadRegisterValue(uint32_t index) const;
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
   virtual void WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,

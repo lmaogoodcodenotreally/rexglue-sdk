@@ -127,6 +127,27 @@ if(TARGET amd_fidelityfx_dx12)
     )
 endif()
 
+# The runtime DLLs' version-info resource (ffx_api_dll.rc) is UTF-16 LE, which
+# clang's resource compiler rejects. It only carries version metadata, so drop
+# .rc sources from the upstream targets instead of patching fetched files.
+foreach(_rexglue_ffx_target amd_fidelityfx_vk amd_fidelityfx_dx12)
+    if(TARGET ${_rexglue_ffx_target})
+        get_target_property(_rexglue_ffx_sources ${_rexglue_ffx_target} SOURCES)
+        list(FILTER _rexglue_ffx_sources EXCLUDE REGEX "\\.rc$")
+        set_property(TARGET ${_rexglue_ffx_target} PROPERTY SOURCES ${_rexglue_ffx_sources})
+        # Upstream outputs to <top-level source>/bin, which build trees of the
+        # same project then share (and overwrite); keep them per build tree.
+        # Per-config variants too: upstream sets CMAKE_*_OUTPUT_DIRECTORY_<CONFIG>.
+        foreach(_rexglue_ffx_kind RUNTIME LIBRARY ARCHIVE PDB)
+            foreach(_rexglue_ffx_cfg "" _DEBUG _RELEASE _RELWITHDEBINFO _MINSIZEREL)
+                set_target_properties(${_rexglue_ffx_target} PROPERTIES
+                    ${_rexglue_ffx_kind}_OUTPUT_DIRECTORY${_rexglue_ffx_cfg}
+                    "${CMAKE_BINARY_DIR}/ffx-bin")
+            endforeach()
+        endforeach()
+    endif()
+endforeach()
+
 # FidelityFX's toolchain.cmake force-sets CMAKE_GENERATOR_PLATFORM (for VS generators).
 # With Ninja this variable is invalid and poisons every subsequent try_compile() call.
 # Clear it from the cache.

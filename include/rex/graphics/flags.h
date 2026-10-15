@@ -15,6 +15,7 @@
 
 // GPU Core
 REXCVAR_DECLARE(bool, vsync);
+REXCVAR_DECLARE(bool, precise_vsync);
 REXCVAR_DECLARE(bool, clear_memory_page_state);
 REXCVAR_DECLARE(bool, half_pixel_offset);
 REXCVAR_DECLARE(bool, async_shader_compilation);
@@ -48,6 +49,7 @@ REXCVAR_DECLARE(bool, direct_host_resolve);
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
 REXCVAR_DECLARE(bool, gpu_3d_to_2d_texture);
 REXCVAR_DECLARE(int32_t, anisotropic_override);
+REXCVAR_DECLARE(bool, scaled_point_filter_linear);
 REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_render_to_texture);
 REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_soft);
 REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_hard);

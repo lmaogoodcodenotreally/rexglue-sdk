@@ -27,6 +27,7 @@
 #include <rex/system/user_module.h>
 #include <rex/system/util/string_utils.h>
 #include <rex/system/xevent.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include <rex/thread/atomic.h>
@@ -402,6 +403,16 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
     xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);
   }
 
+  // TEMP DIAGNOSTIC: companion to the leave-side probe below. A waiter that
+  // wakes with the section still owned means ownership vanished or moved out
+  // of band while it slept; log the full state before the assert fires.
+  if (cs->owning_thread != 0) {
+    REXLOG_ERROR(
+        "RTLE MISMATCH cs={:#010x} owner={:#010x} cur={:#010x} rec={} lock={} lr={:#010x}",
+        static_cast<uint32_t>(cs.guest_address()), static_cast<uint32_t>(cs->owning_thread),
+        cur_thread, static_cast<int32_t>(cs->recursion_count), cs->lock_count,
+        static_cast<uint32_t>(rex::runtime::current_ppc_context()->lr));
+  }
   assert_true(cs->owning_thread == 0);
   cs->owning_thread = cur_thread;
   cs->recursion_count = 1;
@@ -427,7 +438,36 @@ u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 }
 
 void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
-  assert_true(cs->owning_thread == XThread::GetCurrentThread()->guest_object());
+  // ROOT CAUSE (retail DOA4, runs R05/R06 2026-10-07): the game snapshots a
+  // critical section from obj->field64+0x260 onto its own stack and calls
+  // RtlEnter/RtlLeave on that throwaway copy (fn 0x82771138 enters at r1+0x60
+  // and later re-copies to r1+0x80 to leave). The live section is never
+  // touched -- it reads owner=0, rec=0, lock=-1 in every observed sample --
+  // so retail firmware treats these calls as harmless no-ops, while the
+  // assertion below aborted the recompiled run instead. Log every mismatch
+  // (bounded like the other TEMP probes) and treat a leave of a *free*
+  // section as a no-op; a leave against a live foreign owner is still real
+  // corruption and keeps tripping the assert.
+  const uint32_t cs_owner = static_cast<uint32_t>(cs->owning_thread);
+  const uint32_t cs_cur = XThread::GetCurrentThread()->guest_object();
+  if (cs_owner != cs_cur) {
+    static uint32_t s_rtll_count = 0;
+    const uint32_t n = s_rtll_count++;
+    if (rex::diag::enabled() && (n < 200 || (n % 1000) == 0)) {  // TEMP probe gate (REX_DIAG=0)
+      REXLOG_ERROR(
+          "RTLL MISMATCH n={} cs={:#010x} owner={:#010x} cur={:#010x} rec={} lock={} lr={:#010x}",
+          n, static_cast<uint32_t>(cs.guest_address()), cs_owner, cs_cur,
+          static_cast<int32_t>(cs->recursion_count), cs->lock_count,
+          static_cast<uint32_t>(rex::runtime::current_ppc_context()->lr));
+    }
+    if (cs_owner == 0 && !(cs->recursion_count > 0) && cs->lock_count == -1) {
+      // Free section: cosmetic leave on a frame-local copy. Nothing to
+      // release, and mutating the snapshot would corrupt nothing but the
+      // throwaway -- so return without touching any state.
+      return;
+    }
+    assert_true(cs->owning_thread == XThread::GetCurrentThread()->guest_object());
+  }
 
   // Drop recursion count - if it isn't zero we still have the lock.
   assert_true(cs->recursion_count > 0);

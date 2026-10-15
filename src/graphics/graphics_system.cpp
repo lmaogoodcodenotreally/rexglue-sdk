@@ -31,6 +31,8 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+#include "wait_wake.h"
+
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -158,15 +160,42 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        uint64_t vblank_idx = 0;
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
           while (current_time - last_frame_time >= interval_ticks) {
+            const uint64_t late_ticks = current_time - last_frame_time;
             MarkVblank();
             last_frame_time += interval_ticks;
+            // TEMP DIAGNOSTIC (retail DOA4 judder attribution): vblank
+            // generation lateness vs the exact refresh grid. Pre-fix the old
+            // fixed Sleep(1ms) loop fired vblanks up to ~1.5ms late; verify
+            // the deadline-paced loop lands near zero. First 5 + every 300th.
+            if (rex::diag::enabled() && (vblank_idx < 5 || (vblank_idx % 300) == 0)) {
+              REXLOG_ERROR("VBLANK idx={} late_us={}", vblank_idx,
+                           late_ticks * 1000000 / guest_tick_frequency);
+            }
+            ++vblank_idx;
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
+          if (REXCVAR_GET(precise_vsync)) {
+            // Deadline-paced: sleep to just before the next vblank tick, then
+            // cover the remaining tail (Windows timer quantum ~0.5-1.5ms) with
+            // a bounded yield spin so vblanks land on the exact refresh grid
+            // instead of on Sleep() wakeups.
+            const uint64_t remaining_ticks =
+                last_frame_time + interval_ticks - current_time;
+            const int64_t remaining_us =
+                int64_t(remaining_ticks * 1000000 / guest_tick_frequency);
+            if (remaining_us > 1500) {
+              rex::thread::Sleep(std::chrono::microseconds(remaining_us - 1000));
+            } else {
+              rex::thread::MaybeYield();
+            }
+          } else {
+            rex::thread::Sleep(std::chrono::milliseconds(1));
+          }
         }
         return 0;
       }));
@@ -348,6 +377,12 @@ void GraphicsSystem::MarkVblank() {
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
   DispatchInterruptCallback(0, 2);
+
+  // The guest vblank ISR just ran on this thread. Any WAIT_REG_MEM sleeper on
+  // a flag the ISR cleared (flip/vblank completion) can resume immediately
+  // instead of detecting it on its next Sleep(1ms) polling tick; no-op when
+  // nobody is registered (fast path).
+  wait_wake::WakeAll();
 }
 
 void GraphicsSystem::ClearCaches() {

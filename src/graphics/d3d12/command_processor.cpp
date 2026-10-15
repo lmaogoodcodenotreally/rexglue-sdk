@@ -83,6 +83,10 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
 
 namespace rex::graphics::d3d12 {
 
+// TEMP DIAGNOSTIC (retail DOA4 perf work): microsecond scope timers for the
+// draw-path partition counters (see <rex/perf/counter.h>).
+using rex::perf::ScopedUsCounter;
+
 // Generated with `xb buildshaders`.
 namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/apply_gamma_pwl_cs.h"
@@ -186,6 +190,8 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
 
 bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
                                                                uint32_t packet, uint32_t count) {
+  // TEMP DIAGNOSTIC: un-timed Type3 handler bucket.
+  ScopedUsCounter gpu_evt_scope(rex::perf::CounterId::kGpuEvtUs);  // TEMP DIAGNOSTIC
   if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
   }
@@ -1809,6 +1815,14 @@ void D3D12CommandProcessor::ShutdownContext() {
 }
 
 void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  PERF_counter_inc(kGpuRegwCount);  // TEMP DIAGNOSTIC
+  if (index < RegisterFile::kRegisterCount && register_file_->values[index] == value &&
+      !WriteRegisterHasSideEffects(index)) {
+    // State re-emission: identical value, no write side effects. The constant/
+    // fetch invalidation flags below would be no-ops for an unchanged value, so
+    // the whole write can be skipped.
+    return;
+  }
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -2320,12 +2334,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  // TEMP DIAGNOSTIC: IssueDraw entry (device/regs/shader analysis/
+  // BeginSubmission) -- manual split: values declared here are used later.
+  const int64_t gpu_entry_t0 = rex::perf::PerfNowUs();
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   const RegisterFile& regs = *register_file_;
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
+    ScopedUsCounter gpu_copy_scope(rex::perf::CounterId::kGpuCopyUs);  // TEMP DIAGNOSTIC
+    PERF_counter_add(kGpuEntryUs, rex::perf::PerfNowUs() - gpu_entry_t0);  // TEMP DIAGNOSTIC
     return IssueCopy();
   }
 
@@ -2335,6 +2354,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   auto vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
   if (!vertex_shader) {
     // Always need a vertex shader.
+    PERF_counter_add(kGpuEntryUs, rex::perf::PerfNowUs() - gpu_entry_t0);  // TEMP DIAGNOSTIC
     return false;
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
@@ -2346,6 +2366,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (surface_pitch_is_zero && is_rasterization_done) {
     // Doesn't actually draw.
     // Unlikely that zero would even really be legal though.
+    PERF_counter_add(kGpuEntryUs, rex::perf::PerfNowUs() - gpu_entry_t0);  // TEMP DIAGNOSTIC
     return true;
   }
   D3D12Shader* pixel_shader = nullptr;
@@ -2366,6 +2387,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
+      PERF_counter_add(kGpuEntryUs, rex::perf::PerfNowUs() - gpu_entry_t0);  // TEMP DIAGNOSTIC
       return true;
     }
   }
@@ -2375,17 +2397,24 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!BeginSubmission(true)) {
     return false;
   }
+  PERF_counter_add(kGpuEntryUs, rex::perf::PerfNowUs() - gpu_entry_t0);  // TEMP DIAGNOSTIC
 
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
-  if (!primitive_processor_->Process(primitive_processing_result)) {
-    return false;
+  {
+    ScopedUsCounter gpu_prim_scope(rex::perf::CounterId::kGpuPrimUs);  // TEMP DIAGNOSTIC
+    if (!primitive_processor_->Process(primitive_processing_result)) {
+      return false;
+    }
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
     // Nothing to draw.
     return true;
   }
 
+  // TEMP DIAGNOSTIC: depth control + interpolator mask + shader modifications
+  // (declarations used later in the draw -- manual split).
+  const int64_t gpu_mods_t0 = rex::perf::PerfNowUs();
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
 
   // Shader modifications.
@@ -2404,16 +2433,23 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           ? pipeline_cache_->GetCurrentPixelShaderModification(
                 *pixel_shader, interpolator_mask, ps_param_gen_pos, normalized_depth_control)
           : DxbcShaderTranslator::Modification(0);
+  PERF_counter_add(kGpuModsUs, rex::perf::PerfNowUs() - gpu_mods_t0);  // TEMP DIAGNOSTIC
 
   // Set up the render targets - this may perform dispatches and draws.
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
-                                    normalized_color_mask, *vertex_shader)) {
-    return false;
+  {
+    ScopedUsCounter gpu_rt_scope(rex::perf::CounterId::kGpuRtUs);  // TEMP DIAGNOSTIC
+    if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                      normalized_color_mask, *vertex_shader)) {
+      return false;
+    }
   }
 
+  // TEMP DIAGNOSTIC: shader translation lookup (GetOrCreateTranslation) +
+  // bound RT bits (manual split).
+  const int64_t gpu_xlat_t0 = rex::perf::PerfNowUs();
   // Create the pipeline (for this, need the actually used render target formats
   // from the render target cache), translating the shaders - doing this now to
   // obtain the used textures.
@@ -2435,14 +2471,22 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   } else {
     bound_depth_and_color_render_target_bits = 0;
   }
+  PERF_counter_add(kGpuXlatUs, rex::perf::PerfNowUs() - gpu_xlat_t0);  // TEMP DIAGNOSTIC
   void* pipeline_handle;
   ID3D12RootSignature* root_signature;
-  if (!pipeline_cache_->ConfigurePipeline(
-          vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
-          normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
-          bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
-    return false;
+  {
+    ScopedUsCounter gpu_pipe_scope(rex::perf::CounterId::kGpuPipeUs);  // TEMP DIAGNOSTIC
+    if (!pipeline_cache_->ConfigurePipeline(
+            vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
+            normalized_depth_control, normalized_color_mask,
+            bound_depth_and_color_render_target_bits, bound_depth_and_color_render_target_formats,
+            &pipeline_handle, &root_signature)) {
+      return false;
+    }
   }
+  // TEMP DIAGNOSTIC: async check + texture requests + PSO bind + viewport/
+  // scissor (manual split).
+  const int64_t gpu_tex_t0 = rex::perf::PerfNowUs();
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
     return true;
@@ -2504,22 +2548,32 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
 
-  // Update viewport, scissor, blend factor and stencil reference.
-  UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
+  PERF_counter_add(kGpuTexUs, rex::perf::PerfNowUs() - gpu_tex_t0);  // TEMP DIAGNOSTIC
+  {
+    ScopedUsCounter gpu_state_scope(rex::perf::CounterId::kGpuStateUs);  // TEMP DIAGNOSTIC
+    // Update viewport, scissor, blend factor and stencil reference.
+    UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
 
-  // Update system constants before uploading them.
-  // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
-  UpdateSystemConstantValues(memexport_used, primitive_polygonal,
-                             primitive_processing_result.line_loop_closing_index,
-                             primitive_processing_result.host_shader_index_endian, viewport_info,
-                             used_texture_mask, normalized_depth_control, normalized_color_mask);
+    // Update system constants before uploading them.
+    // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
+    UpdateSystemConstantValues(memexport_used, primitive_polygonal,
+                               primitive_processing_result.line_loop_closing_index,
+                               primitive_processing_result.host_shader_index_endian, viewport_info,
+                               used_texture_mask, normalized_depth_control, normalized_color_mask);
+  }
 
   // Update constant buffers, descriptors and root parameters.
-  if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
-    return false;
+  {
+    ScopedUsCounter gpu_bind_scope(rex::perf::CounterId::kGpuBindUs);  // TEMP DIAGNOSTIC
+    if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
+      return false;
+    }
   }
   // Must not call anything that can change the descriptor heap from now on!
 
+  // TEMP DIAGNOSTIC: vertex buffer residency validation + memexport ranges
+  // (manual split).
+  const int64_t gpu_resid_t0 = rex::perf::PerfNowUs();
   // Ensure vertex buffers are resident.
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
@@ -2556,6 +2610,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
+      // TEMP DIAGNOSTIC (retail DOA4 residency attribution): count the
+      // vfetch request and its requested bytes (traffic, not uploaded bytes).
+      PERF_counter_inc(kGpuUpVfetchCalls);
+      PERF_counter_add(kGpuUpVfetchBytes, int64_t(vfetch_constant.size) << 2);
+      // TEMP DIAGNOSTIC (retail DOA4 residency attribution): time the vfetch
+      // shared-memory request (failure path untimed, as with mkres).
+      const int64_t up_vfetch_t0 = rex::perf::PerfNowUs();
       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
@@ -2563,6 +2624,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             vfetch_constant.address << 2, vfetch_constant.size << 2);
         return false;
       }
+      PERF_counter_add(kGpuUpVfetchUs, rex::perf::PerfNowUs() - up_vfetch_t0);
       state.address = vfetch_constant.address;
       state.size = vfetch_constant.size;
       vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
@@ -2580,6 +2642,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
   }
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    // TEMP DIAGNOSTIC (retail DOA4 residency attribution): time the
+    // memexport shared-memory request (failure path untimed).
+    const int64_t up_memexport_t0 = rex::perf::PerfNowUs();
     if (!shared_memory_->RequestRange(memexport_range.base_address_dwords << 2,
                                       memexport_range.size_bytes)) {
       REXGPU_ERROR(
@@ -2588,16 +2653,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
       return false;
     }
+    PERF_counter_add(kGpuUpMemexportUs, rex::perf::PerfNowUs() - up_memexport_t0);
   }
   if (memexport_used && memexport_ranges_.empty()) {
+    // TEMP DIAGNOSTIC (retail DOA4 residency attribution): the full-buffer
+    // fallback request - timed with the other memexport requests.
+    const int64_t up_memexport_t0 = rex::perf::PerfNowUs();
     if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
       REXGPU_ERROR(
           "Failed to request full shared memory residency for unresolved "
           "memexport destinations");
       return false;
     }
+    PERF_counter_add(kGpuUpMemexportUs, rex::perf::PerfNowUs() - up_memexport_t0);
   }
 
+  PERF_counter_add(kGpuResidUs, rex::perf::PerfNowUs() - gpu_resid_t0);  // TEMP DIAGNOSTIC
+  // TEMP DIAGNOSTIC: topology + index/vertex views + deferred recording + draw
+  // dispatch (IssueDraw tail after UpdateBindings, incl. memexport ordering).
+  ScopedUsCounter gpu_record_scope(rex::perf::CounterId::kGpuRecordUs);
   // Primitive topology.
   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
   if (primitive_processing_result.IsTessellated()) {

@@ -14,6 +14,9 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 #include "platform_win.h"
 
 #include <spdlog/spdlog.h>
+#include <timeapi.h>
+
+#pragma comment(lib, "winmm.lib")
 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
@@ -92,6 +95,27 @@ void MaybeYield() {
 void SyncMemory() {
   MemoryBarrier();
 }
+
+// FIX (retail DOA4 perf, R72): guest KeDelayExecutionThread funnels into
+// Sleep()/SleepEx() below, and Windows only wakes those at the system timer
+// resolution - the ~15.6ms default tick unless somebody raises it. A guest
+// 1-2ms delay (audio/event waits, worker pacing) could therefore block the
+// guest thread up to ~31ms: measured in run R72 as ~30.4ms guest blackouts
+// (functions_dispatched collapsing to ~3% of normal while the GPU thread spun
+// ring-empty), 74 frames >20ms in one fight while another fight in the same
+// run had zero - the effective resolution floats with other software, which
+// is why the stalls came and went between sessions. timeBeginPeriod is
+// per-process on Windows 10 2004+ (this machine: 22H2), so only this process
+// is affected; benign for other SDK titles (games universally want sub-2ms
+// sleep granularity). Revert = delete this block.
+namespace {
+struct TimerResolutionKeeper {
+  TimerResolutionKeeper() { timeBeginPeriod(1); }
+  ~TimerResolutionKeeper() { timeEndPeriod(1); }
+};
+// Constructed at DLL load, before any thread can Sleep().
+TimerResolutionKeeper g_timer_resolution_keeper;
+}  // namespace
 
 void Sleep(std::chrono::microseconds duration) {
   if (duration.count() < 100) {

@@ -15,7 +15,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/chrono/clock.h>
@@ -37,11 +41,17 @@
 #include <rex/system/xtimer.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/atomic.h>
+#include <rex/thread/fiber.h>
 #include <rex/thread/mutex.h>
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 using rex::runtime::current_ppc_context;
+
+// TEMP DIAGNOSTIC (retail DOA4 R78): defined next to the wait entries below;
+// forward-declared so KeDelayExecutionThread_entry can log through it too.
+static void LogLongWait(const char* api, uint32_t tid, int64_t dur_us, uint32_t obj_addr,
+                        int64_t timeout_100ns, uint32_t lr);
 
 // r13 + 0x100: pointer to thread local state
 // Thread local state:
@@ -265,18 +275,387 @@ void UpdateGuestStackPointers(X_KTHREAD* kthread, X_KPCR* pcr, PPCContext* ctx, 
   ctx->r1.u64 = sp;
 }
 
+//-----------------------------------------------------------------------------
+// Guest cooperative context switches -> host fibers.
+//
+// The DOA4 kernel scheduler switches contexts inside a single KTHREAD: it
+// saves the outgoing register file into one context object, restores a
+// different one (lr included), adopts that context's stack, then tail branches
+// into KeSetCurrentStackPointers. Recompiled code can only unwind its own C++
+// frames on the way back out of that tail call, so control would return to the
+// *previous* thread's code instead of the restored lr -- and the restored lr is
+// frequently mid-function (the idle thread resumes inside its record sweep),
+// which no function-table lookup can represent either.
+//
+// Mirror the switch onto a host fiber instead. The suspended frame resumes
+// exactly where it parked, so both the mid-function resume and the C++
+// stack discipline come for free -- the same trick SwitchToFiber_entry already
+// uses for XAPI fibers.
+//
+// Keyed by guest stack base: the incoming base is a KSCSP argument, the
+// outgoing base is read from the KTHREAD before the update overwrites it, and
+// both are the same field the context objects carry at +8.
+//
+// A stack base is not a context identity: once the guest frees a kernel stack
+// the address is handed to the next thread, and the new context's sp starts at
+// the fresh stack top while the old chain is still parked below it. So each
+// slot also remembers the r1 its chain yielded with -- that is the value the
+// guest hands back as KSCSP's stack_ptr when it resumes *that* context, and a
+// different sp proves the slot has been adopted by someone else.
+struct GuestContextFiber {
+  rex::thread::Fiber* fiber = nullptr;
+  uint32_t parked_r1 = 0;
+  bool parked = false;
+};
+
+struct GuestContextFibers {
+  std::mutex mutex;
+  std::unordered_map<uint32_t, GuestContextFiber> by_stack_base;
+};
+
+GuestContextFibers& guest_context_fibers() {
+  static GuestContextFibers state;
+  return state;
+}
+
+struct NewContextFiberArgs {
+  uint32_t entry_pc;
+  rex::thread::Fiber* fallback;
+};
+
+void NewContextFiberEntry(void* raw) {
+  const auto args = std::unique_ptr<NewContextFiberArgs>(static_cast<NewContextFiberArgs*>(raw));
+  auto* thread = XThread::GetCurrentThread();
+  auto* ks = REX_KERNEL_STATE();
+  if (!thread || !ks) {
+    REXLOG_ERROR("NewContextFiber: no current thread/kernel state for pc {:#010x}",
+                 args->entry_pc);
+    if (args->fallback) {
+      rex::thread::Fiber::SwitchTo(args->fallback);
+    }
+    return;
+  }
+
+  auto* fn = ks->function_dispatcher()->GetFunction(args->entry_pc);
+  if (!fn) {
+    REXLOG_ERROR("NewContextFiber: no recompiled function at context entry {:#010x}",
+                 args->entry_pc);
+  } else {
+    fn(*thread->thread_state()->context(), ks->memory()->virtual_membase());
+    // A scheduler context is expected to switch away rather than ever return.
+    REXLOG_WARN("NewContextFiber: guest context {:#010x} returned from its entry",
+                args->entry_pc);
+  }
+
+  if (args->fallback) {
+    rex::thread::Fiber::SwitchTo(args->fallback);
+  }
+}
+
+/// Mirror a guest context switch onto host fibers, then suspend the caller.
+/// Must run after UpdateGuestStackPointers so a resuming frame finds the guest
+/// register/stack state that the switcher installed for it.
+/// @param outgoing_r1 r1 as it stood on entry to KSCSP, i.e. the r1 of the
+///   context being suspended (the guest passes the incoming sp as an argument
+///   instead of restoring it, so this still belongs to the outgoing side).
+/// @param incoming_sp the KSCSP stack_ptr argument, which is the r1 the guest
+///   just restored for the incoming context.
+void SwitchHostFiberForGuestContext(uint32_t outgoing_stack_base, uint32_t incoming_stack_base,
+                                    uint32_t entry_lr, uint32_t outgoing_r1,
+                                    uint32_t outgoing_stack_limit, uint32_t incoming_sp) {
+  if (!incoming_stack_base || incoming_stack_base == outgoing_stack_base) {
+    return;  // no stack change: bookkeeping call, not a context switch
+  }
+
+  auto& registry = guest_context_fibers();
+  auto* current = rex::thread::Fiber::Current();
+  if (!current) {
+    current = rex::thread::Fiber::ConvertCurrentThread();
+    if (!current) {
+      REXLOG_ERROR("CTXSW: ConvertCurrentThread failed for guest stack {:#010x}",
+                   incoming_stack_base);
+      return;
+    }
+  }
+
+  rex::thread::Fiber* incoming = nullptr;
+  rex::thread::Fiber* stale = nullptr;
+  uint32_t stale_r1 = 0;
+  bool created = false;
+  bool reused = false;
+  {
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    if (outgoing_stack_base) {
+      GuestContextFiber& parked = registry.by_stack_base[outgoing_stack_base];
+      parked.fiber = current;
+      // Only record a yield r1 that actually lies on the outgoing stack; an
+      // out-of-range value would poison every later resume check for this key.
+      if (outgoing_r1 >= outgoing_stack_limit && outgoing_r1 < outgoing_stack_base) {
+        parked.parked_r1 = outgoing_r1;
+        parked.parked = true;
+      } else {
+        parked.parked = false;
+      }
+    }
+
+    auto it = registry.by_stack_base.find(incoming_stack_base);
+    if (it != registry.by_stack_base.end() && it->second.fiber) {
+      GuestContextFiber& slot = it->second;
+      // The guest can only resume the exact context it suspended, so the sp it
+      // restores has to equal the r1 that chain yielded with. A different sp
+      // means this stack address has been adopted by a fresh context while the
+      // dead chain is still parked on it -- resuming it would run an epilogue
+      // against a frame pointer that no longer matches any frame.
+      if (!slot.parked || slot.parked_r1 == incoming_sp) {
+        incoming = slot.fiber;
+        reused = true;
+      } else {
+        stale = slot.fiber;
+        stale_r1 = slot.parked_r1;
+        slot.fiber = nullptr;
+        slot.parked = false;
+        slot.parked_r1 = 0;
+      }
+    }
+
+    if (!incoming) {
+      // First time this context runs: start it at the lr the guest just
+      // restored. Created under the lock so two threads cannot race a fiber.
+      auto owned = std::make_unique<NewContextFiberArgs>(
+          NewContextFiberArgs{entry_lr, current});
+      incoming = rex::thread::Fiber::Create(512 * 1024, NewContextFiberEntry, owned.get());
+      if (incoming) {
+        owned.release();  // NewContextFiberEntry takes ownership
+        GuestContextFiber& slot = registry.by_stack_base[incoming_stack_base];
+        slot.fiber = incoming;
+        slot.parked = false;
+        slot.parked_r1 = 0;
+        created = true;
+      }
+    }
+  }
+
+  // Drop the abandoned host stack outside the lock. It is suspended, not
+  // running, and its guest stack no longer exists.
+  if (stale && stale != current) {
+    REXLOG_ERROR("CTXSW: discarding parked fiber {} for stack 0x{:08X} (chain yielded r1 0x{:08X}, "
+                 "guest restored sp 0x{:08X})",
+                 static_cast<const void*>(stale), incoming_stack_base, stale_r1, incoming_sp);
+    stale->Destroy();
+  }
+
+  if (incoming_stack_base >= 0x70860000u && incoming_stack_base < 0x70890000u) {
+    REXLOG_ERROR(
+        "CTXSW out=0x{:08X} in=0x{:08X} fiber={} created={} reused={} is_current={} "
+        "entry_lr=0x{:08X} in_sp=0x{:08X}",
+        outgoing_stack_base, incoming_stack_base, static_cast<const void*>(incoming), created,
+        reused, incoming == current, entry_lr, incoming_sp);
+  }
+
+  if (!incoming) {
+    REXLOG_ERROR("CTXSW: failed to create host fiber for guest stack {:#010x}",
+                 incoming_stack_base);
+    return;
+  }
+
+  if (incoming == current) {
+    // TEMP DIAGNOSTIC: the outgoing frame was parked under a different stack
+    // key, so returning here unwinds the import stub into a caller whose guest
+    // r1 has already moved to another stack.
+    REXLOG_ERROR("CTXSW: incoming stack 0x{:08X} resolves to the running fiber (out 0x{:08X})",
+                 incoming_stack_base, outgoing_stack_base);
+    return;  // already running on that fiber; nothing to switch
+  }
+
+  rex::thread::Fiber::SwitchTo(incoming);
+}
+
 }  // namespace
+
+// TEMP DIAGNOSTIC: the fiber registry is keyed by guest stack base and is never
+// pruned, so freeing a stack leaves its fiber behind. Report the registry at the
+// moment a stack is deleted -- a stale key that is later adopted by another
+// context resumes a dead host frame chain.
+void LogGuestFibersForStack(uint32_t stack_base) {
+  // TEMP probe gate (REX_DIAG=0): skip the registry scan entirely.
+  if (!rex::diag::enabled()) {
+    return;
+  }
+  auto& registry = guest_context_fibers();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  char keys[520] = {};
+  size_t kused = 0;
+  int shown = 0;
+  for (const auto& entry : registry.by_stack_base) {
+    if (shown >= 32 || kused + 16 >= sizeof(keys)) {
+      break;
+    }
+    const int n = std::snprintf(keys + kused, sizeof(keys) - kused, " 0x%08X", entry.first);
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(keys) - kused) {
+      break;
+    }
+    kused += static_cast<size_t>(n);
+    ++shown;
+  }
+  const auto it = registry.by_stack_base.find(stack_base);
+  REXLOG_ERROR("MMDKS-FIBER stack=0x{:08X} registry={} keys={} fiber={} parked_r1=0x{:08X} "
+               "parked={}",
+               stack_base, registry.by_stack_base.size(), keys,
+               static_cast<const void*>(it != registry.by_stack_base.end() ? it->second.fiber
+                                                                           : nullptr),
+               it != registry.by_stack_base.end() ? it->second.parked_r1 : 0,
+               it != registry.by_stack_base.end() && it->second.parked);
+}
 
 void KeSetCurrentStackPointers_entry(mapped_void stack_ptr, ppc_ptr_t<X_KTHREAD> thread,
                                      mapped_void stack_alloc_base, mapped_void stack_base,
                                      mapped_void stack_limit) {
   auto current_thread = XThread::GetCurrentThread();
   auto context = current_thread->thread_state()->context();
+
+  // The outgoing stack base is only readable before UpdateGuestStackPointers
+  // overwrites it, and it is the key that maps this switch back onto its host
+  // fiber.
+  const uint32_t outgoing_stack_base = static_cast<uint32_t>(thread->stack_base);
+  const uint32_t outgoing_stack_limit = static_cast<uint32_t>(thread->stack_limit);
+
   auto pcr =
       REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(context->r13.u64));
 
+  // TEMP DIAGNOSTIC: this is the only guest-callable path that writes r1
+  // absolutely, so any r1 that drifts off a live frame has to come through
+  // here (or through ExecuteTrap's whole-context restore). Bounded so a run of
+  // switches cannot flood the log.
+  const uint32_t r1_before = static_cast<uint32_t>(context->r1.u64);
+  const uint32_t incoming_base = stack_base.guest_address();
+
   UpdateGuestStackPointers(thread, pcr, context, stack_ptr.guest_address(),
                            stack_alloc_base.value(), stack_base.value(), stack_limit.value());
+
+  const uint32_t r1_after = static_cast<uint32_t>(context->r1.u64);
+  const uint32_t limit_base = stack_limit.guest_address();
+  const bool same_stack = !incoming_base || incoming_base == outgoing_stack_base;
+  // Normal switches move r1 between two different stacks, so a bare "r1 moved"
+  // test would fire on every one. The interesting case is an sp that lands
+  // outside the stack it claims to belong to.
+  const bool outside =
+      incoming_base && (r1_after < limit_base || r1_after >= incoming_base);
+  static uint32_t s_kscsp_count = 0;
+  const uint32_t n = s_kscsp_count++;
+  // 0x70800000-0x70900000 is the window the faulting frame chain and the two
+  // just-released kernel stacks live in, so every switch touching it is kept
+  // regardless of the cap -- the clobber has to come through one of these.
+  // The stacks the crashing frame chain and the two just-deleted kernel stacks
+  // live in. Kept narrow: a wider window logged >14k context switches and the
+  // resulting slowdown stopped the teardown sequence from ever happening.
+  const bool in_region =
+      (stack_ptr.guest_address() >= 0x70860000u && stack_ptr.guest_address() < 0x70890000u) ||
+      (incoming_base >= 0x70860000u && incoming_base < 0x70890000u) ||
+      (outgoing_stack_base >= 0x70860000u && outgoing_stack_base < 0x70890000u);
+  // Besides the first 400, keep every call that does NOT park: those return
+  // straight back through the import stub, so a sp change on one of them lands
+  // on a caller whose frame still belongs to the old stack.
+  if (rex::diag::enabled() && (n < 400 || outside || same_stack || in_region)) {
+    REXLOG_ERROR("KSCSP n={} sp=0x{:08X} r1 0x{:08X} -> 0x{:08X} out=0x{:08X} in=0x{:08X} "  // NOLINT
+                 "limit=0x{:08X} same_stack={} outside={} lr=0x{:08X}",
+                 n, stack_ptr.guest_address(), r1_before, r1_after, outgoing_stack_base,
+                 incoming_base, limit_base, same_stack, outside,
+                 static_cast<uint32_t>(context->lr));
+  }
+
+  // TEMP DIAGNOSTIC: the walker descriptor rows (0x82CE7058 + slot*48) decide
+  // which file buffer each slot walks. A fault-time dump only freezes the final
+  // state, so log every change as it happens instead: this shows when each
+  // slot's block pointer appeared, what every other slot held at that moment,
+  // and the raw (pre-stamp) block header the fixup pass will later see.
+  // Bounded so a run of switches cannot flood the log.
+  {
+    static uint32_t s_row_snap[4][12] = {};
+    static uint32_t s_row_logs = 0;
+    static bool s_row_init = false;
+    const auto row_ts = rex::runtime::ThreadState::Get();
+    if (row_ts && row_ts->memory()) {
+      auto* const membase = row_ts->memory()->virtual_membase();
+      const auto row_rd = [&](uint32_t addr) -> uint32_t {
+        const uint32_t v = *reinterpret_cast<const uint32_t*>(membase + addr);
+        return (v >> 24) | ((v >> 8) & 0x0000FF00u) | ((v << 8) & 0x00FF0000u) | (v << 24);
+      };
+      const auto heapish = [](uint32_t v) -> bool {
+        return (v >= 0x100000u && v < 0x04000000u) || (v >= 0x82000000u && v < 0x84000000u);
+      };
+      uint32_t cur[4][12];
+      for (uint32_t sid = 0; sid < 4; ++sid) {
+        for (uint32_t k = 0; k < 12; ++k) {
+          cur[sid][k] = row_rd(0x82CE7058u + sid * 48u + k * 4u);
+        }
+      }
+      if (!s_row_init) {
+        // Baseline stays zero so any state that already exists at the very
+        // first switch is reported as a change on this call instead of being
+        // silently adopted as the reference.
+        s_row_init = true;
+      }
+      for (uint32_t sid = 0; sid < 4 && s_row_logs < 64; ++sid) {
+        uint32_t mask = 0;
+        for (uint32_t k = 0; k < 12; ++k) {
+          if (cur[sid][k] != s_row_snap[sid][k]) {
+            mask |= 1u << k;
+          }
+        }
+        if (!mask) {
+          continue;
+        }
+        char rw[176] = {};
+        size_t rused = 0;
+        for (uint32_t k = 0; k < 12; ++k) {
+          const int nw = std::snprintf(rw + rused, sizeof(rw) - rused, " %u=%08X", k,
+                                       cur[sid][k]);
+          if (nw <= 0 || static_cast<size_t>(nw) >= sizeof(rw) - rused) {
+            break;
+          }
+          rused += static_cast<size_t>(nw);
+        }
+        // A new block pointer means the raw header (before the walker stamps
+        // it) is visible right now; a new buffer start identifies the file.
+        char extra[176] = "";
+        if ((mask & 1u) && heapish(cur[sid][0])) {
+          size_t eused = 0;
+          for (uint32_t k = 0; k < 6; ++k) {
+            const int nw = std::snprintf(extra + eused, sizeof(extra) - eused, " blk%u=%08X", k,
+                                         row_rd(cur[sid][0] + k * 4u));
+            if (nw <= 0 || static_cast<size_t>(nw) >= sizeof(extra) - eused) {
+              break;
+            }
+            eused += static_cast<size_t>(nw);
+          }
+        }
+        if (mask & (1u << 9)) {
+          size_t eused = std::strlen(extra);
+          if (heapish(cur[sid][9])) {
+            for (uint32_t k = 0; k < 4 && eused < sizeof(extra); ++k) {
+              const int nw = std::snprintf(extra + eused, sizeof(extra) - eused, " buf%u=%08X", k,
+                                           row_rd(cur[sid][9] + k * 4u));
+              if (nw <= 0 || static_cast<size_t>(nw) >= sizeof(extra) - eused) {
+                break;
+              }
+              eused += static_cast<size_t>(nw);
+            }
+          }
+        }
+        REXLOG_ERROR("GUEST ROWCHG n={} id={} mask=0x{:03X} row={}{}", n, sid, mask, rw, extra);
+        for (uint32_t k = 0; k < 12; ++k) {
+          s_row_snap[sid][k] = cur[sid][k];
+        }
+        ++s_row_logs;
+      }
+    }
+  }
+
+  // Suspend this frame on a host fiber so the restored lr (often mid-function)
+  // resumes the way the guest intended instead of unwinding here.
+  SwitchHostFiberForGuestContext(outgoing_stack_base, stack_base.guest_address(),
+                                 static_cast<uint32_t>(context->lr), r1_before,
+                                 outgoing_stack_limit, stack_ptr.guest_address());
 }
 
 u32 KeSetAffinityThread_entry(mapped_void thread_ptr, u32 affinity,
@@ -380,7 +759,17 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
     thread->DeliverAPCs();
   }
 
+  // TEMP DIAGNOSTIC (retail DOA4 R78): see LogLongWait - delay variant.
+  const auto t0 = std::chrono::steady_clock::now();
   X_STATUS result = thread->Delay(processor_mode, alertable, *interval_ptr);
+  const int64_t dur_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+  if (dur_us > 5000) {
+    const auto* ppc = current_ppc_context();
+    LogLongWait("DELAY", thread->guest_object(), dur_us, 0, static_cast<int64_t>(*interval_ptr),
+                ppc ? static_cast<uint32_t>(ppc->lr) : 0u);
+  }
 
   if (alertable && result == X_STATUS_USER_APC) {
     thread->DeliverAPCs();
@@ -817,9 +1206,73 @@ u32 NtCancelTimer_entry(u32 timer_handle, mapped_u32 current_state_ptr) {
   return result;
 }
 
+// TEMP DIAGNOSTIC (retail DOA4 R78 stage-select camera-path stall): log any
+// guest kernel wait over 5ms with the guest call site (LR) + object + the
+// timeout that was requested, to attribute the ~2s 20Hz guest-starve bursts
+// seen at camera flips (R75/R78: 121 half-rate frames per flip; XMA/audio
+// paths already ruled out by bounded probes that never fired). Per-LR dedup
+// so a site that legitimately waits every frame (the vblank wait, ~16.7ms)
+// cannot flood: first 20 occurrences of each distinct LR + every 1000th
+// after; coarse cap when the small table is full.
+static void LogLongWait(const char* api, uint32_t tid, int64_t dur_us, uint32_t obj_addr,
+                        int64_t timeout_100ns, uint32_t lr) {
+  // TEMP probe gate (REX_DIAG): some call sites (NTWAIT1/WAITN) measure
+  // unconditionally; keep them inert for REX_DIAG=0 runs too.
+  if (!rex::diag::enabled()) {
+    return;
+  }
+  struct Seen {
+    uint32_t lr;
+    uint32_t hits;
+  };
+  static Seen s_seen[128] = {};
+  static uint32_t s_events = 0;
+  const uint32_t ev = s_events++;
+  const uint32_t key = lr ? lr : 1;
+  Seen* entry = nullptr;
+  Seen* free_slot = nullptr;
+  for (auto& s : s_seen) {
+    if (s.lr == key) {
+      entry = &s;
+      break;
+    }
+    if (!free_slot && s.lr == 0) {
+      free_slot = &s;
+    }
+  }
+  if (!entry) {
+    entry = free_slot;
+  }
+  bool log_it;
+  if (entry && entry->lr == 0) {
+    entry->lr = key;
+    entry->hits = 1;
+    log_it = true;
+  } else if (entry) {
+    entry->hits++;
+    log_it = entry->hits <= 20 || (entry->hits % 1000) == 0;
+  } else {
+    log_it = ev < 20 || (ev % 1000) == 0;
+  }
+  if (log_it) {
+    REXLOG_ERROR("KWAIT {} tid={:08X} dur_us={} obj={:#010x} timeout={} lr={:#010x}", api, tid,
+                 dur_us, obj_addr, timeout_100ns, lr);
+  }
+}
+
 uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_t processor_mode,
                                  uint32_t alertable, uint64_t* timeout_ptr) {
+  // TEMP DIAGNOSTIC (retail DOA4 transition-hold hunt, R89+): split the
+  // measured KWAIT duration into object lookup (global critical region
+  // acquire + table lookup, may queue behind another thread's hold) vs the
+  // actual wait (must be instant for guest timeout=0 polls). Bounded (first 40
+  // slow ones + every 400th over 5ms), REXLOG_ERROR. Remove after root cause.
+  const bool diag_on = rex::diag::enabled();  // TEMP probe gate (REX_DIAG=0)
+  const auto sp_t0 = diag_on ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
   auto object = XObject::GetNativeObject<XObject>(REX_KERNEL_STATE(), object_ptr);
+  const auto sp_t1 = diag_on ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
 
   if (!object) {
     // The only kind-of failure code (though this should never happen)
@@ -828,9 +1281,26 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
   }
 
   X_STATUS result = object->Wait(wait_reason, processor_mode, alertable, timeout_ptr);
+  const auto sp_t2 = diag_on ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
 
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
+  }
+
+  if (diag_on) {
+    const int64_t lookup_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(sp_t1 - sp_t0).count();
+    const int64_t wait_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(sp_t2 - sp_t1).count();
+    if (lookup_us + wait_us > 5000) {
+      static uint64_t s_ksplit_n = 0;
+      if (++s_ksplit_n <= 40 || (s_ksplit_n % 400) == 0) {
+        REXLOG_ERROR("KSPLIT n={} lookup_us={} wait_us={} obj={:#x} st={:#x}", s_ksplit_n,
+                     lookup_us, wait_us, reinterpret_cast<uintptr_t>(object_ptr),
+                     static_cast<uint32_t>(result));
+      }
+    }
   }
 
   return result;
@@ -844,8 +1314,24 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
   // object_ptr.guest_address(), (uint32_t)wait_reason,
   //(uint32_t)processor_mode, (uint32_t)alertable,
   // timeout_ptr ? (int64_t)timeout : -1);
+  // TEMP DIAGNOSTIC (retail DOA4 R78): see LogLongWait - wait variant.
+  const int64_t timeout_orig = timeout_ptr ? static_cast<int64_t>(timeout) : -1;
+  const bool diag_on = rex::diag::enabled();  // TEMP probe gate (REX_DIAG=0)
+  const auto t0 = diag_on ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
   auto result = xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
                                         timeout_ptr ? &timeout : nullptr);
+  if (diag_on) {
+    const int64_t dur_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+    if (dur_us > 5000) {
+      const auto* ppc = current_ppc_context();
+      LogLongWait("WAIT1", XThread::GetCurrentThread()->guest_object(), dur_us,
+                  static_cast<uint32_t>(object_ptr.guest_address()), timeout_orig,
+                  ppc ? static_cast<uint32_t>(ppc->lr) : 0u);
+    }
+  }
   // REXKRNL_IMPORT_RESULT("KeWaitForSingleObject", "{:#x}", result);
   return result;
 }
@@ -857,7 +1343,19 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
   if (object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+    // TEMP DIAGNOSTIC (retail DOA4 R78): see LogLongWait - Nt wait variant.
+    const int64_t timeout_orig = timeout_ptr ? static_cast<int64_t>(timeout) : -1;
+    const auto t0 = std::chrono::steady_clock::now();
     result = object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
+    const int64_t dur_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count();
+    if (dur_us > 5000) {
+      const auto* ppc = current_ppc_context();
+      LogLongWait("NTWAIT1", XThread::GetCurrentThread()->guest_object(), dur_us,
+                  static_cast<uint32_t>(object->guest_object()), timeout_orig,
+                  ppc ? static_cast<uint32_t>(ppc->lr) : 0u);
+    }
     if (alertable && result == X_STATUS_USER_APC) {
       XThread::GetCurrentThread()->DeliverAPCs();
     }
@@ -885,9 +1383,21 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
   }
 
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+  // TEMP DIAGNOSTIC (retail DOA4 R78): see LogLongWait - multi-wait variant.
+  const int64_t timeout_orig = timeout_ptr ? static_cast<int64_t>(timeout) : -1;
+  const auto t0 = std::chrono::steady_clock::now();
   X_STATUS result = XObject::WaitMultiple(
       uint32_t(objects.size()), reinterpret_cast<XObject**>(objects.data()), wait_type, wait_reason,
       processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
+  const int64_t dur_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count();
+  if (dur_us > 5000) {
+    const auto* ppc = current_ppc_context();
+    LogLongWait("WAITN", XThread::GetCurrentThread()->guest_object(), dur_us,
+                static_cast<uint32_t>(objects[0]->guest_object()), timeout_orig,
+                ppc ? static_cast<uint32_t>(ppc->lr) : 0u);
+  }
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
   }
