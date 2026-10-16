@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <functional>
 #include <limits>
+#include <optional>
 #include <tuple>
 
 #include <rex/graphics/xenos.h>
@@ -38,6 +40,20 @@ bool Jumped(float c, float p) {
 }
 
 uint32_t Load(const uint32_t* be, size_t i) { return std::byteswap(be[i]); }
+
+// The value segment `s` writes to ALU register `reg`, if it writes it once,
+// finite and among its first 64 constants (all `distance` compares).
+std::optional<float> AxisValue(const uint32_t* be, const ParsedFrame& f,
+                               const ParsedFrame::Segment& s, uint32_t reg) {
+  std::optional<float> v;
+  uint32_t flat = 0;
+  for (uint32_t e = s.alu_begin; e < s.alu_end; flat += f.alu_count[e++]) {
+    if (reg < f.alu_reg[e] || reg >= f.alu_reg[e] + f.alu_count[e]) continue;
+    if (v || flat + (reg - f.alu_reg[e]) >= 64) return std::nullopt;
+    v = std::bit_cast<float>(Load(be, f.alu_offset[e] + (reg - f.alu_reg[e])));
+  }
+  return v && std::isfinite(*v) ? v : std::nullopt;
+}
 
 uint64_t Mix(uint64_t h, uint64_t v) {
   h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
@@ -233,24 +249,6 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
         sure[cur_order[a].second] = sure_key;
         continue;
       }
-      // The nearest unused copy to cur draw `at` (or to all copies, for
-      // `any`), ties going to the nearest in stream order.
-      auto nearest = [&](int64_t at, bool any, float& best_distance) {
-        auto best = pb;
-        int64_t best_tie = 0;
-        best_distance = std::numeric_limits<float>::infinity();
-        for (auto q = pa; q != pb && best_distance != 0; ++q) {  // equal: the same draw
-          if (!any && used[q->second]) continue;
-          const float dq = distance(cur.segments[at], prev.segments[q->second], best_distance);
-          const int64_t tie = std::abs(q->second - at);
-          if (best == pb || dq < best_distance || (dq == best_distance && tie < best_tie)) {
-            best = q;
-            best_distance = dq;
-            best_tie = tie;
-          }
-        }
-        return best;
-      };
       auto take = [&](int64_t at, uint32_t q, bool is_sure) {
         match[at] = q;
         used[q] = true;
@@ -259,38 +257,127 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
       };
       // First every copy that its own occurrence fits within the margin of its
       // nearest, so that a copy that moved toward another's place does not
-      // take that one's pair; then the rest, nearest among those left.
-      if (same_count) {  // a few copies: the quadratic searches are fine
+      // take that one's pair; then the rest, nearest among those left. Only
+      // a copy nearer than that is searched for: instanced meshes (floor
+      // tiles, hundreds of copies) mostly keep their order and constants.
+      if (same_count) {
         for (size_t c = a; c < b; ++c) {
           const int64_t at = cur_order[c].second;
           const auto occurrence = pa + (c - a);
-          float best_distance;
-          nearest(at, true, best_distance);
-          if (distance(cur.segments[at], prev.segments[occurrence->second],
-                       std::numeric_limits<float>::infinity()) <= best_distance + kCopyMargin) {
+          const float bound =
+              distance(cur.segments[at], prev.segments[occurrence->second],
+                       std::numeric_limits<float>::infinity()) - kCopyMargin;
+          bool nearer = false;
+          for (auto q = pa; q != pb && bound > 0 && !nearer; ++q) {
+            nearer = distance(cur.segments[at], prev.segments[q->second], bound) < bound;
+          }
+          if (!nearer) {
             take(at, occurrence->second, sure_key);
           }
         }
       }
-      std::vector<std::tuple<float, int64_t, uint32_t, uint32_t>> options;  // nearest first
-      for (size_t c = a; c < b; ++c) {
-        const uint32_t at = cur_order[c].second;
-        if (match[at] != kNone) continue;
-        for (auto q = pa; q != pb; ++q) {
-          if (!used[q->second]) {
-            options.emplace_back(distance(cur.segments[at], prev.segments[q->second],
-                                          std::numeric_limits<float>::infinity()),
-                                 std::abs(int64_t(q->second) - at), at, q->second);
-          }
-        }
-      }
-      std::sort(options.begin(), options.end());
       // Guesses: with copies re-sorted or the count changed, the copy left
       // over is as likely another object (one that came into view at one
-      // end of a row while another left at the other).
-      for (const auto& [d, tie, at, q] : options) {
-        if (match[at] == kNone && !used[q]) {
+      // end of a row while another left at the other). Globally nearest pair
+      // first, ties to the nearest in stream order: each copy left keeps its
+      // nearest unused candidate in a min-heap, searched again once taken.
+      using Option = std::tuple<float, int64_t, uint32_t, uint32_t>;  // distance, tie, at, q
+      auto consider = [&](uint32_t at, uint32_t q, bool& found, Option& best) {
+        const float limit = found ? std::get<0>(best) : std::numeric_limits<float>::infinity();
+        const Option o{distance(cur.segments[at], prev.segments[q], limit),
+                       std::abs(int64_t(q) - at), at, q};
+        if (!found || o < best) {
+          best = o;
+          found = true;
+        }
+      };
+      // Many copies left (instanced meshes: hundreds): candidates are searched
+      // outward along the constant that spreads the copies most (an instance
+      // position), as |its difference| bounds `distance` from below.
+      std::vector<std::pair<float, uint32_t>> axis;  // unused prev copies by its value
+      std::vector<uint32_t> left_cur, left_prev;
+      for (size_t c = a; c < b; ++c) {
+        if (match[cur_order[c].second] == kNone) left_cur.push_back(cur_order[c].second);
+      }
+      for (auto q = pa; q != pb; ++q) {
+        if (!used[q->second]) left_prev.push_back(q->second);
+      }
+      uint32_t axis_reg = 0;
+      if (left_cur.size() * left_prev.size() >= 1024) {
+        // Ranked on a sample, then checked on every copy left.
+        auto spread = [&](uint32_t reg, size_t step) {
+          float lo = std::numeric_limits<float>::infinity(), hi = -lo;
+          for (int f = 0; f < 2; ++f) {
+            const auto& left = f ? left_prev : left_cur;
+            for (size_t k = 0; k < left.size(); k += step) {
+              const auto v = f ? AxisValue(prev_be, prev, prev.segments[left[k]], reg)
+                               : AxisValue(cur_be, cur, cur.segments[left[k]], reg);
+              if (!v) return -1.0f;
+              lo = std::min(lo, *v);
+              hi = std::max(hi, *v);
+            }
+          }
+          return hi - lo;
+        };
+        const auto& first = cur.segments[left_cur[0]];
+        std::vector<std::pair<float, uint32_t>> ranked;
+        for (uint32_t e = first.alu_begin, flat = 0; e < first.alu_end && flat < 64;
+             flat += cur.alu_count[e++]) {
+          for (uint32_t d = 0; d < cur.alu_count[e] && flat + d < 64; ++d) {
+            const size_t step = std::max<size_t>(1, (left_cur.size() + left_prev.size()) / 32);
+            if (const float s = spread(cur.alu_reg[e] + d, step); s > 0) {
+              ranked.emplace_back(s, cur.alu_reg[e] + d);
+            }
+          }
+        }
+        std::sort(ranked.rbegin(), ranked.rend());
+        for (size_t r = 0; r < std::min<size_t>(ranked.size(), 4) && !axis_reg; ++r) {
+          axis_reg = spread(ranked[r].second, 1) > 0 ? ranked[r].second : 0;
+        }
+      }
+      if (axis_reg) {
+        for (const uint32_t q : left_prev) {
+          axis.emplace_back(*AxisValue(prev_be, prev, prev.segments[q], axis_reg), q);
+        }
+        std::sort(axis.begin(), axis.end());
+      }
+      auto best_for = [&](uint32_t at, Option& best) {
+        bool found = false;
+        if (axis.empty()) {
+          for (auto q = pa; q != pb; ++q) {
+            if (!used[q->second]) consider(at, q->second, found, best);
+          }
+          return found;
+        }
+        const float x = *AxisValue(cur_be, cur, cur.segments[at], axis_reg);
+        auto hi = std::lower_bound(axis.begin(), axis.end(), std::make_pair(x, 0u));
+        auto lo = hi;
+        while (lo != axis.begin() || hi != axis.end()) {
+          const float below = lo != axis.begin() ? x - (lo - 1)->first : std::numeric_limits<float>::infinity();
+          const float above = hi != axis.end() ? hi->first - x : std::numeric_limits<float>::infinity();
+          if (found && std::min(below, above) > std::get<0>(best)) break;
+          const uint32_t q = below <= above ? (--lo)->second : (hi++)->second;
+          if (!used[q]) consider(at, q, found, best);
+        }
+        return found;
+      };
+      std::vector<Option> heap;
+      for (size_t c = a; c < b; ++c) {
+        Option o;
+        if (match[cur_order[c].second] == kNone && best_for(cur_order[c].second, o)) {
+          heap.push_back(o);
+        }
+      }
+      std::make_heap(heap.begin(), heap.end(), std::greater<>());
+      while (!heap.empty()) {
+        std::pop_heap(heap.begin(), heap.end(), std::greater<>());
+        const auto [d, tie, at, q] = heap.back();
+        heap.pop_back();
+        if (!used[q]) {
           take(at, q, false);
+        } else if (Option o; best_for(at, o)) {
+          heap.push_back(o);
+          std::push_heap(heap.begin(), heap.end(), std::greater<>());
         }
       }
     }
@@ -338,35 +425,79 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
     return !needed;
   };
 
+  // A draw left as is (new this frame: a prop come into view or swapped LOD;
+  // or a guess that jumped) still writes the camera and lights the lerped
+  // draws wrote, so it would sit half a tick ahead of the scene: every whole
+  // vec4 it writes that is bit-equal to what the last cleanly lerped draw
+  // wrote to that register takes that draw's lerped value. So does a sure
+  // pairing that jumped, as a per-pass light or eye vector the game switched
+  // to another source (draws that carried that source last frame lerp it
+  // cleanly) must not blend two sources. Per ALU register: that draw's value
+  // as recorded << 32 | as lerped (all ones, a NaN never borrowed: unset).
+  std::vector<uint64_t> lerped(kAluEnd - kAluFirst, ~0ull);
+  std::vector<uint32_t> saved;  // a jumped draw's constants before its lerp
+  auto borrow = [&](const ParsedFrame::Segment& seg, const uint32_t* own) {
+    auto trivial = [](uint32_t v) { return !(v & 0x7FFFFFFF) || (v & 0x7FFFFFFF) == 0x3F800000; };
+    for (uint32_t e = seg.alu_begin, at = 0; e < seg.alu_end; at += cur.alu_count[e++]) {
+      const uint32_t reg = cur.alu_reg[e], count = cur.alu_count[e];
+      for (uint32_t d = (4 - reg % 4) % 4; d + 4 <= count; d += 4) {
+        const uint64_t* rec = &lerped[reg + d - kAluFirst];
+        const uint32_t co = cur.alu_offset[e] + d;
+        bool equal = true, plain = true;  // plain: all 0 / +-1, as likely a coincidence
+        for (uint32_t k = 0; k < 4 && equal; ++k) {
+          const uint32_t cb = own ? own[at + d + k] : Load(cur_be, co + k);
+          equal = uint32_t(rec[k] >> 32) == cb;
+          plain &= trivial(cb);
+        }
+        if (!equal || plain) continue;
+        for (uint32_t k = 0; k < 4; ++k) {
+          cur_be[co + k] = std::byteswap(uint32_t(rec[k]));
+        }
+      }
+    }
+  };
+
   for (uint32_t i = 0; i < cur.segments.size(); ++i) {
-    if (match[i] == kNone) continue;  // new draw this frame: drawn as is
     const auto& seg = cur.segments[i];
+    if (match[i] == kNone) {  // new draw this frame
+      borrow(seg, nullptr);
+      continue;
+    }
     const auto& pseg = prev.segments[match[i]];
     ++stats.matched;
     const bool same_layout =
         pseg.layout == seg.layout && pseg.alu_end - pseg.alu_begin == seg.alu_end - seg.alu_begin;
     if (!same_layout && !resolve(seg, match[i])) {
+      borrow(seg, nullptr);
       continue;
     }
-    // lerp == false: the jump check pass; lerp == true: the write pass.
-    auto visit = [&](bool lerp) {
+    // pass 0: the jump check; 1: the write pass, recorded for borrowing; 2: not recorded.
+    auto visit = [&](int pass) {
       for (uint32_t e = 0; e < seg.alu_end - seg.alu_begin; ++e) {
         const uint32_t co = cur.alu_offset[seg.alu_begin + e];
+        uint64_t* rec = &lerped[cur.alu_reg[seg.alu_begin + e] - kAluFirst];
         for (uint32_t d = 0; d < cur.alu_count[seg.alu_begin + e]; ++d) {
           const uint32_t po =
               same_layout ? prev.alu_offset[pseg.alu_begin + e] + d
                           : prev_at[cur.alu_reg[seg.alu_begin + e] + d - kAluFirst];
           const uint32_t cb = Load(cur_be, co + d), pb = Load(prev_be, po);
+          if (pass == 1) {
+            rec[d] = uint64_t(cb) << 32 | cb;
+          }
           if (cb == pb) continue;
           const float c = std::bit_cast<float>(cb), p = std::bit_cast<float>(pb);
           if (!std::isfinite(c) || !std::isfinite(p)) continue;
-          if (!lerp) {
+          if (!pass) {
             if (Jumped(c, p)) {
               return false;
             }
             continue;
           }
-          cur_be[co + d] = std::byteswap(std::bit_cast<uint32_t>(p + (c - p) * t));
+          const uint32_t value = std::bit_cast<uint32_t>(p + (c - p) * t);
+          if (pass == 1) {
+            rec[d] = uint64_t(cb) << 32 | value;
+          }
+          cur_be[co + d] = std::byteswap(value);
         }
       }
       return true;
@@ -374,13 +505,26 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
     // A sure pairing is the same draw, so a jump there is fast motion (a
     // strike, a spin) and lerping keeps the model whole; a guessed pairing
     // that jumped is likely another draw: drawn as is.
-    if (!visit(false)) {
+    const bool jumped = !visit(0);
+    if (jumped) {
       ++stats.jumped;
       stats.suspect += copies[i] > 2;  // TEMP DIAGNOSTIC
-      if (!sure[i]) continue;
+      if (!sure[i]) {
+        borrow(seg, nullptr);
+        continue;
+      }
+      saved.clear();
+      for (uint32_t e = seg.alu_begin; e < seg.alu_end; ++e) {
+        for (uint32_t d = 0; d < cur.alu_count[e]; ++d) {
+          saved.push_back(Load(cur_be, cur.alu_offset[e] + d));
+        }
+      }
     }
     ++stats.lerped;
-    visit(true);
+    visit(jumped ? 2 : 1);
+    if (jumped) {
+      borrow(seg, saved.data());
+    }
     if (lerped_pairs) {
       lerped_pairs->emplace_back(seg.packet, pseg.packet);
     }

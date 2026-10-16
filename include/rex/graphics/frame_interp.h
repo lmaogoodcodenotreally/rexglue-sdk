@@ -57,6 +57,10 @@ void Parse(const uint32_t* stream_be, size_t dword_count, ParsedFrame& out);
 // more than half its magnitude (floor 2) counts the segment as jumped (camera
 // cuts are told by those); where the pairing was a guess - the signature's
 // count changed - the segment then keeps `cur`, as two different draws.
+// A segment kept as `cur` (unpaired, or such a guess), or a sure pairing that
+// jumped, takes the lerped value of each whole vec4 it writes bit-equal to
+// what the last cleanly lerped segment wrote to that register (the shared
+// camera, a light switched to another source), unless it is all 0 / +-1.
 // `lerped_pairs`, if given, receives (cur packet, prev packet) of every lerped
 // segment, in stream order.
 Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cur_be,

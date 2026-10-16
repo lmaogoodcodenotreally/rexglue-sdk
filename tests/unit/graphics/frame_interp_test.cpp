@@ -237,6 +237,81 @@ TEST_CASE("frame_interp leaves a guessed pairing whose constants jumped") {
   CHECK(cur.Float(x) == 100.0f);
 }
 
+TEST_CASE("frame_interp gives a new draw the lerped camera it shares") {
+  Stream prev, cur;
+  prev.Shaders(0x1000, 0x2000);
+  prev.Constants(0x4000, {10, 20, 30, 40});  // camera row
+  prev.Draw(0x11);
+  cur.Shaders(0x1000, 0x2000);
+  cur.Constants(0x4000, {12, 22, 32, 42});
+  cur.Draw(0x11);
+  cur.Shaders(0x5000, 0x6000);  // a prop come into view: no pair
+  cur.Constants(0x4000, {12, 22, 32, 42, 5, 6, 7, 8, 1, 0, 0, 0});  // camera, own, plain
+  size_t x = cur.be.size() - 12;
+  cur.Draw(0x33);
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  CHECK(cur.Float(x + 0) == 11.0f);
+  CHECK(cur.Float(x + 3) == 41.0f);
+  CHECK(cur.Float(x + 4) == 5.0f);  // its own constants stay
+  CHECK(cur.Float(x + 8) == 1.0f);
+}
+
+TEST_CASE("frame_interp pairs many re-sorted copies by their nearest constants") {
+  // 40 tiles of one mesh, re-sorted, plus one come into view: the searched
+  // path for many copies left must still find each tile's own.
+  Stream prev, cur;
+  for (int k = 0; k < 40; ++k) {
+    prev.Shaders(0x1000, 0x2000);
+    prev.Constants(0x4000, {float(k * 8), 5, 1});
+    prev.Draw(0x11);
+  }
+  std::vector<size_t> at(41);
+  for (int i = 0; i < 41; ++i) {
+    const int k = i == 40 ? 100 : (i * 7) % 40;
+    cur.Shaders(0x1000, 0x2000);
+    cur.Constants(0x4000, {float(k * 8) + 0.5f, 5, 1});
+    at[i] = cur.be.size() - 3;
+    cur.Draw(0x11);
+  }
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  for (int i = 0; i < 40; ++i) {
+    CHECK(cur.Float(at[i]) == float((i * 7) % 40 * 8) + 0.25f);
+  }
+  CHECK(cur.Float(at[40]) == 800.5f);  // no copy left for it
+}
+
+TEST_CASE("frame_interp follows a light switched to another source") {
+  Stream prev, cur;
+  prev.Shaders(0x1000, 0x2000);
+  prev.Constants(0x4000, {2, 0.9f, -2.9f, 1});  // light B
+  prev.Draw(0x11);
+  prev.Shaders(0x3000, 0x4000);
+  prev.Constants(0x4000, {2, 0.8f, -0.2f, 1});  // light A
+  prev.Draw(0x22);
+  cur.Shaders(0x1000, 0x2000);
+  cur.Constants(0x4000, {2, 0.9f, -3.0f, 1});
+  cur.Draw(0x11);
+  cur.Shaders(0x3000, 0x4000);
+  cur.Constants(0x4000, {2, 0.9f, -3.0f, 1});  // now lit by B: a jump, not motion
+  size_t x = cur.be.size() - 4;
+  cur.Draw(0x22);
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Stats s = Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  CHECK(s.jumped == 1);
+  CHECK(cur.Float(x + 1) == 0.9f);  // B's in-between, not halfway from A
+  CHECK(cur.Float(x + 2) == -2.95f);
+}
+
 TEST_CASE("frame_interp lerps a sure pairing through fast motion") {
   Stream prev, cur;
   prev.Shaders(0x1000, 0x2000);
