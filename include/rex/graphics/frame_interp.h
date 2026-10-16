@@ -43,18 +43,19 @@ struct Stats {
   uint32_t segments = 0;
   uint32_t matched = 0;  // paired with a previous-frame segment of the same signature
   uint32_t lerped = 0;   // ...and its constants were lerped
-  uint32_t jumped = 0;   // ...but a constant jumped (a mispairing or a wrap): drawn as is
+  uint32_t jumped = 0;   // ...where a constant jumped (fast motion, a cut or a mispairing)
 };
 
 void Parse(const uint32_t* stream_be, size_t dword_count, ParsedFrame& out);
 
 // Moves every ALU constant written by a paired segment of `cur` from its value
 // toward the previous frame's value: result = prev + (cur - prev) * t. t = 1
-// leaves `cur` as is, t = 0.5 is the midpoint. Non-finite values are kept. A
-// segment where any constant moved by more than half its magnitude (floor 2)
-// is not motion - two different draws paired, or a wrapping value - and keeps
-// `cur`. Draws pair by signature, then by draw alone; constants by position
-// when both frames wrote the same layout, else by register.
+// leaves `cur` as is, t = 0.5 is the midpoint. Non-finite values are kept.
+// Draws pair by signature, then by draw alone; constants by position when both
+// frames wrote the same layout, else by register. A constant that moved by
+// more than half its magnitude (floor 2) counts the segment as jumped (camera
+// cuts are told by those); where the pairing was a guess - the signature's
+// count changed - the segment then keeps `cur`, as two different draws.
 // `lerped_pairs`, if given, receives (cur packet, prev packet) of every lerped
 // segment, in stream order.
 Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cur_be,

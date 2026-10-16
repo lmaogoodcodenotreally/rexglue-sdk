@@ -14,6 +14,7 @@
 #include <optional>
 #include <cinttypes>
 #include <cstring>
+#include <cmath>
 #include <cstdio>
 #include <string_view>
 
@@ -1544,10 +1545,26 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
                                           s->stride_words, s->float_words, s->endian, 0.5f)) {
         ++interp_vs_stat_[4];
         if (shared_memory->interp_dump_) {  // TEMP DIAGNOSTIC
+          // The first word that failed: outside the float mask, or a jump.
+          const uint32_t* pw = prev + begin;
+          const uint32_t* cw = cur + begin;
+          uint32_t bad = 0;
+          for (; bad < end - begin; ++bad) {
+            if (pw[bad] == cw[bad]) continue;
+            if (!((s->float_words >> (bad % s->stride_words)) & 1)) break;
+            const float c = std::bit_cast<float>(xenos::GpuSwap(cw[bad], xenos::Endian(s->endian)));
+            const float q = std::bit_cast<float>(xenos::GpuSwap(pw[bad], xenos::Endian(s->endian)));
+            if (std::isfinite(c) && std::isfinite(q) &&
+                std::abs(c - q) > std::max(2.0f, 0.5f * std::max(std::abs(c), std::abs(q)))) {
+              break;
+            }
+          }
           REXGPU_INFO("IDUMP vjumped pkt={} b={} at {:08X} prev at {:08X} bytes {} stride {} "
-                      "mask {:X}",
+                      "mask {:X} verts {}..{} word {} (vertex {} word {}) {:08X} -> {:08X}",
                       packet, s->binding, s->start, p->start, s->bytes, s->stride_words,
-                      s->float_words);
+                      s->float_words, first, last, bad, (begin + bad) / s->stride_words,
+                      (begin + bad) % s->stride_words, bad < end - begin ? pw[bad] : 0,
+                      bad < end - begin ? cw[bad] : 0);
         }
         continue;
       }

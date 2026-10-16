@@ -169,13 +169,16 @@ TEST_CASE("frame_interp pairs the k-th draw of a signature with the k-th") {
   CHECK(cur.Float(second) == 105.0f);
 }
 
-TEST_CASE("frame_interp leaves a pairing whose constants jumped") {
+TEST_CASE("frame_interp leaves a guessed pairing whose constants jumped") {
   Stream prev, cur;
   prev.Shaders(0x1000, 0x2000);
   prev.Constants(0x4000, {0, 5});  // light A
   prev.Draw(0x11);
+  prev.Shaders(0x1000, 0x2000);
+  prev.Constants(0x4000, {50, 5});  // light C, gone this frame
+  prev.Draw(0x11);
   cur.Shaders(0x1000, 0x2000);
-  cur.Constants(0x4000, {100, 5});  // light B took A's slot: not motion
+  cur.Constants(0x4000, {100, 5});  // light B: not motion
   size_t x = cur.be.size() - 2;
   cur.Draw(0x11);
 
@@ -185,6 +188,25 @@ TEST_CASE("frame_interp leaves a pairing whose constants jumped") {
   Stats s = Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
   CHECK(s.jumped == 1);
   CHECK(cur.Float(x) == 100.0f);
+}
+
+TEST_CASE("frame_interp lerps a sure pairing through fast motion") {
+  Stream prev, cur;
+  prev.Shaders(0x1000, 0x2000);
+  prev.Constants(0x4000, {0.9f, -0.4f});  // a rotation row spinning fast
+  prev.Draw(0x11);
+  cur.Shaders(0x1000, 0x2000);
+  cur.Constants(0x4000, {-0.9f, 3.0f});
+  size_t x = cur.be.size() - 2;
+  cur.Draw(0x11);
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Stats s = Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  CHECK(s.jumped == 1);  // still counted, for cut detection
+  CHECK(s.lerped == 2);
+  CHECK(cur.Float(x) == 0.0f);
 }
 
 TEST_CASE("frame_interp lerps the float words of vertex data in guest byte order") {

@@ -145,6 +145,7 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
   constexpr uint32_t kNone = UINT32_MAX;
   std::vector<uint32_t> match(cur.segments.size(), kNone);
   std::vector<bool> used(prev.segments.size());
+  std::vector<bool> sure(cur.segments.size());  // its signature's count did not change
   auto pair_by = [&](uint64_t ParsedFrame::Segment::*key) {
     auto order = [&](const ParsedFrame& frame, auto skip) {
       std::vector<std::pair<uint64_t, uint32_t>> v;
@@ -167,6 +168,7 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
         for (size_t c = a; c < b; ++c, ++pa) {
           match[cur_order[c].second] = pa->second;
           used[pa->second] = true;
+          sure[cur_order[c].second] = true;
         }
         continue;
       }
@@ -260,9 +262,12 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
       }
       return true;
     };
+    // A sure pairing is the same draw, so a jump there is fast motion (a
+    // strike, a spin) and lerping keeps the model whole; a guessed pairing
+    // that jumped is likely another draw: drawn as is.
     if (!visit(false)) {
       ++stats.jumped;
-      continue;
+      if (!sure[i]) continue;
     }
     ++stats.lerped;
     visit(true);
