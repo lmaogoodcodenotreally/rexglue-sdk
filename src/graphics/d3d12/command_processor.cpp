@@ -2840,8 +2840,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // be unknown. Keep invalidation conservative in this case.
       shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
     }
+    // Not from the interpolated replay: its exports must not reach guest memory.
     if (IsReadbackMemexportEnabled(REXCVAR_GET(d3d12_readback_memexport)) &&
-        !memexport_ranges_.empty()) {
+        !memexport_ranges_.empty() && !shared_memory_->interp_replay_) {
       uint32_t memexport_total_size = 0;
       for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
         memexport_total_size += memexport_range.size_bytes;
@@ -3007,7 +3008,9 @@ bool D3D12CommandProcessor::IssueCopy() {
   }
   ++shared_memory_->interp_diag_[shared_memory_->interp_replay_];  // TEMP DIAGNOSTIC
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
+  // The interpolated replay never reads back: that would write the in-between
+  // frame's pixels into guest memory (and stall on the copy twice a tick).
+  if (readback_mode == ReadbackResolveMode::kDisabled || shared_memory_->interp_replay_) {
     uint32_t written_address, written_length;
     const bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_,
                                                         *texture_cache_, written_address,

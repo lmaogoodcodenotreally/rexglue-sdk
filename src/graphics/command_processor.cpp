@@ -1030,6 +1030,20 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     SwapWithInterpolation(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   } else {
     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+    // TEMP DIAGNOSTIC: the same pacing line as frame_interp's, for comparison.
+    static uint64_t last = 0, sum = 0, slow = 0, frames = 0;
+    const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+    const uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
+    if (last && now - last < freq) {
+      sum += now - last;
+      slow += (now - last) * 2000 > freq * 35;
+      if (++frames == 600) {
+        REXGPU_INFO("swap pacing (no interp): 600 real frames in {} ms, {} over 17.5 ms",
+                    sum * 1000 / freq, slow);
+        sum = slow = frames = 0;
+      }
+    }
+    last = now;
   }
 
   ++counter_;

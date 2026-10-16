@@ -288,8 +288,14 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
            interp_results_[interp_result_next_].first < packet) {
       ++interp_result_next_;
     }
+    // A converted index buffer lived in the real frame's per-frame buffers,
+    // released at its end: converted again (shortcut: from the guest's
+    // indices as they are now; keep a copy of the conversion if the guest
+    // turns out to rewrite converted indices between frames).
     if (interp_result_next_ < interp_results_.size() &&
-        interp_results_[interp_result_next_].first == packet) {
+        interp_results_[interp_result_next_].first == packet &&
+        interp_results_[interp_result_next_].second.index_buffer_type !=
+            ProcessedIndexBufferType::kHostConverted) {
       result_out = interp_results_[interp_result_next_].second;
       return true;
     }
