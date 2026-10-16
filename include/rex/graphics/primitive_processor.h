@@ -20,6 +20,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -626,6 +627,13 @@ class PrimitiveProcessor {
   const RegisterFile& register_file_;
   memory::Memory& memory_;
   SharedMemory& shared_memory_;
+
+  // Frame interpolation: each draw's result in the real frame, keyed by its
+  // recorded-stream packet, reused by the replay (conversions read guest
+  // memory the guest has rewritten since).
+  std::vector<std::pair<uint32_t, ProcessingResult>> interp_results_;
+  size_t interp_result_next_ = 0;
+  uint32_t interp_results_frame_ = 0;
 
   bool full_32bit_vertex_indices_used_ = false;
   bool convert_triangle_fans_to_lists_ = false;

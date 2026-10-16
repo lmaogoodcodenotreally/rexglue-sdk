@@ -22,6 +22,8 @@ constexpr uint32_t kFetchEnd = kAluEnd + 32 * 6;
 // How far ahead in the previous frame a draw may be searched for when draws
 // were added or culled in between.
 constexpr size_t kResyncWindow = 48;
+// Relative change of one constant between frames beyond which it is no motion.
+constexpr float kJump = 0.5f;
 
 uint32_t Load(const uint32_t* be, size_t i) { return std::byteswap(be[i]); }
 
@@ -38,9 +40,9 @@ void Parse(const uint32_t* be, size_t n, ParsedFrame& out) {
   out.alu_count.clear();
   uint64_t vs = 0, ps = 0, layout = 0, textures = 0;
   uint32_t alu_begin = 0;
-  auto close = [&](uint64_t signature) {
-    out.segments.push_back(
-        {Mix(signature, textures), layout, alu_begin, uint32_t(out.alu_offset.size())});
+  auto close = [&](uint64_t signature, size_t packet) {
+    out.segments.push_back({Mix(signature, textures), layout, alu_begin,
+                            uint32_t(out.alu_offset.size()), uint32_t(packet)});
     layout = 0;
     textures = 0;
     alu_begin = uint32_t(out.alu_offset.size());
@@ -104,10 +106,10 @@ void Parse(const uint32_t* be, size_t n, ParsedFrame& out) {
             break;
           }
           case xenos::PM4_DRAW_INDX:  // viz query, initiator, [index base, size]
-            close(Mix(Mix(Mix(vs, ps), Load(be, i + 2)), count >= 4 ? Load(be, i + 3) : 0));
+            close(Mix(Mix(Mix(vs, ps), Load(be, i + 2)), count >= 4 ? Load(be, i + 3) : 0), i);
             break;
           case xenos::PM4_DRAW_INDX_2:  // initiator, inline indices
-            close(Mix(Mix(vs, ps), Load(be, i + 1)));
+            close(Mix(Mix(vs, ps), Load(be, i + 1)), i);
             break;
         }
         i += 1 + count;
@@ -115,12 +117,16 @@ void Parse(const uint32_t* be, size_t n, ParsedFrame& out) {
       }
     }
   }
-  close(0x7A11);  // packets after the last draw (the swap resolve setup)
+  close(0x7A11, n);  // packets after the last draw (the swap resolve setup)
 }
 
 Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cur_be,
-                  const ParsedFrame& cur, float t) {
+                  const ParsedFrame& cur, float t,
+                  std::vector<std::pair<uint32_t, uint32_t>>* lerped_pairs) {
   Stats stats;
+  if (lerped_pairs) {
+    lerped_pairs->clear();
+  }
   stats.segments = uint32_t(cur.segments.size());
   size_t j = 0;
   for (const auto& seg : cur.segments) {
@@ -139,22 +145,70 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
     if (pseg.layout != seg.layout || pseg.alu_end - pseg.alu_begin != seg.alu_end - seg.alu_begin) {
       continue;
     }
-    ++stats.lerped;
-    for (uint32_t e = 0; e < seg.alu_end - seg.alu_begin; ++e) {
-      const uint32_t co = cur.alu_offset[seg.alu_begin + e];
-      const uint32_t po = prev.alu_offset[pseg.alu_begin + e];
-      const uint32_t dwords = std::min(cur.alu_count[seg.alu_begin + e],
-                                       prev.alu_count[pseg.alu_begin + e]);
-      for (uint32_t d = 0; d < dwords; ++d) {
-        const uint32_t cb = Load(cur_be, co + d), pb = Load(prev_be, po + d);
-        if (cb == pb) continue;
-        const float c = std::bit_cast<float>(cb), p = std::bit_cast<float>(pb);
-        if (!std::isfinite(c) || !std::isfinite(p)) continue;
-        cur_be[co + d] = std::byteswap(std::bit_cast<uint32_t>(p + (c - p) * t));
+    // lerp == false: the jump check pass; lerp == true: the write pass.
+    auto visit = [&](bool lerp) {
+      for (uint32_t e = 0; e < seg.alu_end - seg.alu_begin; ++e) {
+        const uint32_t co = cur.alu_offset[seg.alu_begin + e];
+        const uint32_t po = prev.alu_offset[pseg.alu_begin + e];
+        const uint32_t dwords = std::min(cur.alu_count[seg.alu_begin + e],
+                                         prev.alu_count[pseg.alu_begin + e]);
+        for (uint32_t d = 0; d < dwords; ++d) {
+          const uint32_t cb = Load(cur_be, co + d), pb = Load(prev_be, po + d);
+          if (cb == pb) continue;
+          const float c = std::bit_cast<float>(cb), p = std::bit_cast<float>(pb);
+          if (!std::isfinite(c) || !std::isfinite(p)) continue;
+          if (!lerp) {
+            if (std::abs(c - p) > kJump * std::max({1.0f, std::abs(c), std::abs(p)})) {
+              return false;
+            }
+            continue;
+          }
+          cur_be[co + d] = std::byteswap(std::bit_cast<uint32_t>(p + (c - p) * t));
+        }
       }
+      return true;
+    };
+    if (!visit(false)) {
+      ++stats.jumped;
+      continue;
+    }
+    ++stats.lerped;
+    visit(true);
+    if (lerped_pairs) {
+      lerped_pairs->emplace_back(seg.packet, pseg.packet);
     }
   }
   return stats;
+}
+
+bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
+                      uint32_t stride_words, uint64_t float_words, uint32_t endian, float t) {
+  const auto e = xenos::Endian(endian);
+  for (uint32_t i = 0; i < vertices * stride_words; ++i) {
+    if (prev[i] == cur[i]) continue;
+    if (!((float_words >> (i % stride_words)) & 1)) {
+      return false;
+    }
+    const float c = std::bit_cast<float>(xenos::GpuSwap(cur[i], e));
+    const float p = std::bit_cast<float>(xenos::GpuSwap(prev[i], e));
+    // Unlike constants, vertices carry unit normals, whose components turn by
+    // up to 2 in one frame of fast rotation: the floor is 2, not 1.
+    if (std::isfinite(c) && std::isfinite(p) &&
+        std::abs(c - p) > std::max(2.0f, kJump * std::max(std::abs(c), std::abs(p)))) {
+      return false;
+    }
+  }
+  for (uint32_t v = 0; v < vertices; ++v, prev += stride_words, cur += stride_words) {
+    for (uint64_t m = float_words; m; m &= m - 1) {
+      const uint32_t w = uint32_t(std::countr_zero(m));
+      if (prev[w] == cur[w]) continue;
+      const float c = std::bit_cast<float>(xenos::GpuSwap(cur[w], e));
+      const float p = std::bit_cast<float>(xenos::GpuSwap(prev[w], e));
+      if (!std::isfinite(c) || !std::isfinite(p)) continue;
+      cur[w] = xenos::GpuSwap(std::bit_cast<uint32_t>(p + (c - p) * t), e);
+    }
+  }
+  return true;
 }
 
 }  // namespace rex::graphics::frame_interp

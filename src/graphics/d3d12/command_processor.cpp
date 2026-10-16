@@ -2712,6 +2712,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  InterpVertexDraw(*vertex_shader);
+  InterpCheckDrawState();  // TEMP DIAGNOSTIC
+
   // Gather memexport ranges and ensure the heaps for them are resident, and
   // also load the data surrounding the export and to fill the regions that
   // won't be modified by the shaders.
@@ -3076,11 +3079,18 @@ bool D3D12CommandProcessor::IssueCopy() {
   if (!BeginSubmission(true)) {
     return false;
   }
+  ++shared_memory_->interp_diag_[shared_memory_->interp_replay_];  // TEMP DIAGNOSTIC
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    const bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_,
+                                                        *texture_cache_, written_address,
+                                                        written_length);
+    if (shared_memory_->interp_dump_) {  // TEMP DIAGNOSTIC
+      REXGPU_INFO("IDUMP resolve rp={} pkt={} at {:08X} len {}", shared_memory_->interp_replay_,
+                  shared_memory_->interp_packet_, written_address, written_length);
+    }
+    return resolved;
   }
   return IssueCopy_ReadbackResolvePath();
 }

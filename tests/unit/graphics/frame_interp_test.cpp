@@ -34,7 +34,7 @@ struct Stream {
 TEST_CASE("frame_interp lerps paired constants and resyncs past an added draw") {
   Stream prev, cur;
   prev.Shaders(0x1000, 0x2000);
-  prev.Constants(0x4000, {0, 0, 0, 0});
+  prev.Constants(0x4000, {10, 10, 10, 10});
   prev.Draw(0x11);
   prev.Shaders(0x3000, 0x4000);
   prev.Constants(0x4010, {10, 10});
@@ -45,11 +45,11 @@ TEST_CASE("frame_interp lerps paired constants and resyncs past an added draw") 
   size_t added = cur.be.size() - 1;
   cur.Draw(0x33);
   cur.Shaders(0x1000, 0x2000);
-  cur.Constants(0x4000, {2, 4, 6, 8});
+  cur.Constants(0x4000, {12, 14, 16, 18});
   size_t first = cur.be.size() - 4;
   cur.Draw(0x11);
   cur.Shaders(0x3000, 0x4000);
-  cur.Constants(0x4010, {20, 30});
+  cur.Constants(0x4010, {12, 14});
   size_t second = cur.be.size() - 2;
   cur.Draw(0x22);
 
@@ -61,10 +61,10 @@ TEST_CASE("frame_interp lerps paired constants and resyncs past an added draw") 
   Stats s = Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
   CHECK(s.matched == 3);  // both old draws + tail; the new draw stays unpaired
   CHECK(s.lerped == 3);
-  CHECK(cur.Float(first + 0) == 1.0f);
-  CHECK(cur.Float(first + 3) == 4.0f);
-  CHECK(cur.Float(second + 0) == 15.0f);
-  CHECK(cur.Float(second + 1) == 20.0f);
+  CHECK(cur.Float(first + 0) == 11.0f);
+  CHECK(cur.Float(first + 3) == 14.0f);
+  CHECK(cur.Float(second + 0) == 11.0f);
+  CHECK(cur.Float(second + 1) == 12.0f);
   CHECK(cur.Float(added) == 7.0f);  // the new draw's constant is untouched
 }
 
@@ -109,4 +109,44 @@ TEST_CASE("frame_interp pairs same-shader draws by their textures") {
   Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
   CHECK(cur.Float(b) == 105.0f);  // B lerps with B, not with A
   CHECK(cur.Float(a) == 10.0f);   // A sits behind the resync point: drawn as is
+}
+
+TEST_CASE("frame_interp leaves a pairing whose constants jumped") {
+  Stream prev, cur;
+  prev.Shaders(0x1000, 0x2000);
+  prev.Constants(0x4000, {0, 5});  // light A
+  prev.Draw(0x11);
+  cur.Shaders(0x1000, 0x2000);
+  cur.Constants(0x4000, {100, 5});  // light B took A's slot: not motion
+  size_t x = cur.be.size() - 2;
+  cur.Draw(0x11);
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Stats s = Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  CHECK(s.jumped == 1);
+  CHECK(cur.Float(x) == 100.0f);
+}
+
+TEST_CASE("frame_interp lerps the float words of vertex data in guest byte order") {
+  // Two 3-word vertices: a big-endian (k8in32 = 2) float pair and an unlisted
+  // word (a packed color) that must match between the frames.
+  auto be = [](float f) { return std::byteswap(std::bit_cast<uint32_t>(f)); };
+  auto f = [](uint32_t w) { return std::bit_cast<float>(std::byteswap(w)); };
+  const uint32_t prev[] = {be(1.5f), be(10), 0x33333333, be(4), be(1.5f), 0x44444444};
+  uint32_t cur[] = {be(2), be(20), 0x33333333, be(4), be(2), 0x44444444};
+  REQUIRE(LerpVertexFloats(prev, cur, 2, 3, 0b011, 2, 0.5f));
+  REQUIRE(f(cur[0]) == 1.75f);
+  REQUIRE(f(cur[1]) == 15.0f);
+  REQUIRE(cur[2] == 0x33333333);
+  REQUIRE(f(cur[3]) == 4.0f);
+  REQUIRE(f(cur[4]) == 1.75f);
+
+  uint32_t recolored[] = {be(2), be(20), 0x55555555, be(4), be(2), 0x44444444};
+  REQUIRE(!LerpVertexFloats(prev, recolored, 2, 3, 0b011, 2, 0.5f));  // another vertex
+  REQUIRE(f(recolored[0]) == 2.0f);
+  uint32_t jumped[] = {be(100), be(20), 0x33333333, be(4), be(2), 0x44444444};
+  REQUIRE(!LerpVertexFloats(prev, jumped, 2, 3, 0b011, 2, 0.5f));  // 1.5 -> 100
+  REQUIRE(f(jumped[0]) == 100.0f);
 }

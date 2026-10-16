@@ -508,7 +508,27 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       PERF_counter_add(kGpuTexMkpUs, rex::perf::PerfNowUs() - gpu_tex_mkp_t0);
       return;
     }
+    if (shared_memory().interp_dump_) {  // TEMP DIAGNOSTIC
+      REXGPU_INFO("IDUMP tex rp={} pkt={} at {:08X} len {} ranges {} can {}",
+                  shared_memory().interp_replay_, shared_memory().interp_packet_,
+                  pending_range_count ? pending_ranges[0].start : 0,
+                  pending_range_count ? pending_ranges[0].length : 0, pending_range_count,
+                  !shared_memory().interp_replay_ ||
+                      !pending_range_count ||
+                      shared_memory().InterpReplayCanLoad(pending_ranges[0].start,
+                                                          pending_ranges[0].length));
+    }
+    // Interpolation replay uploads nothing, so the GPU copy still holds the
+    // data the real frame loaded this texture from (resolved, uploaded or
+    // restored): load it, and have it reloaded after the replay where the CPU
+    // has rewritten its pages since.
+    if (shared_memory().interp_replay_) {
+      for (size_t i = 0; i < pending_range_count; ++i) {
+        shared_memory().InterpNoteReplayLoad(pending_ranges[i].start, pending_ranges[i].length);
+      }
+    }
     pending_texture_loads.push_back(pending_load);
+    ++shared_memory().interp_diag_[2 + shared_memory().interp_replay_];  // TEMP DIAGNOSTIC
     for (size_t i = 0; i < pending_range_count; ++i) {
       pending_shared_memory_ranges.push_back(pending_ranges[i]);
     }

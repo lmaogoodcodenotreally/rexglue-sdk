@@ -308,9 +308,13 @@ class Profiler {
 // another). Pair with PERF_counter_add (a no-op when counters are disabled).
 // Remove after a confirmed pass.
 inline int64_t PerfNowUs() {
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
   return std::chrono::duration_cast<std::chrono::microseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+#else
+  return 0;  // every reading feeds a no-op PERF_counter_add (lean: was ~5% of the GPU thread)
+#endif
 }
 
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS

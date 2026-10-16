@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace rex::graphics::frame_interp {
@@ -29,6 +30,7 @@ struct ParsedFrame {
     uint64_t signature;  // shaders + draw initiator (+ index base) of the closing draw
     uint64_t layout;     // the headers of the ALU-constant packets in the segment
     uint32_t alu_begin, alu_end;  // range in alu_offset / alu_count
+    uint32_t packet;     // dword offset of the closing draw packet (the stream size for the tail)
   };
   std::vector<Segment> segments;  // one per draw, plus the tail after the last draw
   std::vector<uint32_t> alu_offset;  // dword offset of the first ALU constant written
@@ -39,14 +41,32 @@ struct Stats {
   uint32_t segments = 0;
   uint32_t matched = 0;  // paired with a previous-frame segment of the same signature
   uint32_t lerped = 0;   // ...and the same constant layout, so its constants were lerped
+  uint32_t jumped = 0;   // ...but a constant jumped (a mispairing or a wrap): drawn as is
 };
 
 void Parse(const uint32_t* stream_be, size_t dword_count, ParsedFrame& out);
 
 // Moves every ALU constant written by a paired segment of `cur` from its value
 // toward the previous frame's value: result = prev + (cur - prev) * t. t = 1
-// leaves `cur` as is, t = 0.5 is the midpoint. Non-finite values are kept.
+// leaves `cur` as is, t = 0.5 is the midpoint. Non-finite values are kept. A
+// segment where any constant moved by more than half its magnitude (floor 1)
+// is not motion - two different draws paired, or a wrapping value - and keeps
+// `cur`.
+// `lerped_pairs`, if given, receives (cur packet, prev packet) of every lerped
+// segment, in stream order.
 Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cur_be,
-                  const ParsedFrame& cur, float t);
+                  const ParsedFrame& cur, float t,
+                  std::vector<std::pair<uint32_t, uint32_t>>* lerped_pairs = nullptr);
+
+// Vertex data the CPU rewrites every frame (CPU-skinned meshes) moves with the
+// constants: lerps, in place in `cur`, the float32 words of each vertex (bit k
+// of `float_words` = word k of the `stride_words`-word vertex) from `prev`, as
+// Interpolate does. Words are as stored in guest memory, `endian` is the vertex
+// fetch constant's xenos::Endian. Non-finite values are kept. Returns false,
+// leaving `cur` as is, when the data does not correspond: a word outside
+// `float_words` (a packed color, say) differs, or a float jumped as
+// Interpolate's constants would (with a floor of 2 instead of 1 - normals).
+bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
+                      uint32_t stride_words, uint64_t float_words, uint32_t endian, float t);
 
 }  // namespace rex::graphics::frame_interp

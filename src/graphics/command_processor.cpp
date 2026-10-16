@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <bit>
+#include <optional>
 #include <cinttypes>
 #include <cstring>
 #include <string_view>
@@ -23,8 +25,10 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
+#include <rex/graphics/shared_memory.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -234,6 +238,7 @@ void CommandProcessor::WorkerThreadMain() {
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
       PrepareForWait();
+      const uint64_t wait_start = rex::chrono::Clock::QueryHostTickCount();  // TEMP DIAGNOSTIC
       uint32_t loop_count = 0;
       do {
         // If we spin around too much, revert to a "low-power" state.
@@ -249,6 +254,7 @@ void CommandProcessor::WorkerThreadMain() {
         ServiceHeldSwap(false);
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+      interp_wait_ticks_ += rex::chrono::Clock::QueryHostTickCount() - wait_start;
       ReturnFromWait();
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
@@ -716,6 +722,9 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   // to compute per-packet overhead for the retail perf partition.
   PERF_counter_inc(kGpuPackets);
   if (interp_recording_ && !interp_replaying_) {
+    if (SharedMemory* shared_memory = InterpSharedMemory()) {
+      shared_memory->interp_packet_ = uint32_t(interp_cur_.size());
+    }
     RecordPacket(*reader);
   }
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
@@ -1114,6 +1123,58 @@ void CommandProcessor::RecordPacket(const memory::RingBuffer& reader) {
         opcode == PM4_XE_SWAP) {
       return;
     }
+    // Constant loads record as the plain register writes they perform, with
+    // the values of this moment: a replay must not read guest memory the guest
+    // has rewritten since, and Interpolate lerps / pairs register writes only.
+    static constexpr uint32_t kConstantBase[] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
+    const uint32_t count = dwords - 1;
+    // Flattened packets lose their predicate: keep only those the real frame
+    // executes (predicated tiling sets each tile's state this way).
+    const bool executes = !(header & 1) || (bin_select_ & bin_mask_) != 0;
+    auto record_writes = [&](uint32_t reg, const uint32_t* be_values, uint32_t n) {
+      if (!n || reg + n > RegisterFile::kRegisterCount || n > 0x4000) {
+        return false;
+      }
+      interp_cur_.push_back(std::byteswap(((n - 1) << 16) | reg));
+      interp_cur_.insert(interp_cur_.end(), be_values, be_values + n);
+      return true;
+    };
+    if (opcode == PM4_LOAD_ALU_CONSTANT && count >= 3) {
+      const uint32_t address = peek.ReadAndSwap<uint32_t>() & 0x3FFFFFFF;
+      const uint32_t offset_type = peek.ReadAndSwap<uint32_t>();
+      const uint32_t size = peek.ReadAndSwap<uint32_t>() & 0xFFF;
+      const uint32_t type = (offset_type >> 16) & 0xFF;
+      const auto* values = memory_->TranslatePhysical<const uint32_t*>(address);
+      ++interp_pk_stat_[0];
+      if (!executes) {
+        return;
+      }
+      if (type < 5 && values &&
+          record_writes(kConstantBase[type] + (offset_type & 0x7FF), values, size)) {
+        return;
+      }
+    } else if ((opcode == PM4_SET_CONSTANT || opcode == PM4_SET_CONSTANT2 ||
+                opcode == PM4_SET_SHADER_CONSTANTS) &&
+               count >= 2 && peek.read_count() >= count * sizeof(uint32_t)) {
+      const uint32_t offset_type = peek.ReadAndSwap<uint32_t>();
+      uint32_t reg = offset_type & 0xFFFF;
+      if (opcode == PM4_SET_CONSTANT) {
+        const uint32_t type = (offset_type >> 16) & 0xFF;
+        reg = type < 5 ? kConstantBase[type] + (offset_type & 0x7FF) : UINT32_MAX;
+      }
+      ++interp_pk_stat_[1];
+      if (!executes) {
+        return;
+      }
+      std::vector<uint32_t>& be_values = interp_vs_scratch_;
+      be_values.resize(count - 1);
+      peek.Read(reinterpret_cast<uint8_t*>(be_values.data()), (count - 1) * sizeof(uint32_t));
+      if (reg != UINT32_MAX && record_writes(reg, be_values.data(), count - 1)) {
+        return;
+      }
+    }
+    peek = reader;  // not recorded as writes: copied as is below
+    peek.ReadAndSwap<uint32_t>();
   }
   if (peek.read_count() + sizeof(uint32_t) < dwords * sizeof(uint32_t)) {
     return;  // malformed; ExecutePacket reports it
@@ -1134,22 +1195,52 @@ void CommandProcessor::ServiceHeldSwap(bool force) {
 }
 
 void CommandProcessor::ReplayInterpolatedFrame() {
+  InterpBudgetScope budget(interp_budget_[2]);  // TEMP DIAGNOSTIC
   // The replay ends in the real frame's register state except for the lerped
   // constants; put every register it changed back.
   RegisterFile& regs = *register_file_;
   interp_regs_.assign(regs.values, regs.values + RegisterFile::kRegisterCount);
   const uint64_t bin_select = bin_select_, bin_mask = bin_mask_;
+  // ...and starts in its starting state: registers set before the first
+  // recorded packet (the swap sequence, writes from outside the ring) hold
+  // the values the real frame's first draws saw.
+  if (interp_start_regs_.size() == RegisterFile::kRegisterCount) {
+    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
+      if (regs.values[i] != interp_start_regs_[i] && !IsReplaySkippedRegister(i)) {
+        WriteRegister(i, interp_start_regs_[i]);
+      }
+    }
+    bin_select_ = interp_start_bin_select_;
+    bin_mask_ = interp_start_bin_mask_;
+  }
 
+  SharedMemory* shared_memory = InterpSharedMemory();
   interp_replaying_ = true;
+  if (shared_memory) {
+    shared_memory->interp_replay_ = true;
+    if (shared_memory->interp_dump_) {  // TEMP DIAGNOSTIC
+      REXGPU_INFO("IDUMP replay");
+    }
+  }
   memory::RingBuffer reader(reinterpret_cast<uint8_t*>(interp_work_.data()),
                             interp_work_.size() * sizeof(uint32_t));
   reader.set_write_offset(interp_work_.size() * sizeof(uint32_t));
   do {
+    if (shared_memory) {
+      shared_memory->interp_packet_ = uint32_t(reader.read_offset() / sizeof(uint32_t));
+      shared_memory->InterpApplyUploads(shared_memory->interp_packet_);
+    }
     if (!ExecutePacket(&reader)) {
       REXGPU_ERROR("frame_interp: replay stopped on a bad packet");
       break;
     }
   } while (reader.read_count());
+  if (shared_memory) {
+    shared_memory->InterpApplyUploads(UINT32_MAX);  // the frame ends on its last data
+    shared_memory->InterpEndReplay();
+    shared_memory->interp_replay_ = false;
+    interp_vs_written_.clear();
+  }
   interp_replaying_ = false;
 
   bin_select_ = bin_select;
@@ -1170,40 +1261,368 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
   const bool enabled = REXCVAR_GET(frame_interp);
   const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
   const uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
-  const uint64_t period = std::clamp<uint64_t>(now - interp_last_swap_, freq / 60, freq / 30);
+  const uint64_t interval = now - interp_last_swap_;
+  const uint64_t period = std::clamp<uint64_t>(interval, freq / 60, freq / 30);
   interp_last_swap_ = now;
 
+  const uint64_t parse_start = rex::chrono::Clock::QueryHostTickCount();  // TEMP DIAGNOSTIC
   frame_interp::Parse(interp_cur_.data(), interp_cur_.size(), interp_parsed_cur_);
-  if (enabled && interp_have_prev_ && !interp_cur_.empty() && HoldSwapTexture()) {
+  bool interpolate = enabled && interp_have_prev_ && !interp_cur_.empty();
+  frame_interp::Stats stats;
+  struct ParseBudget {  // TEMP DIAGNOSTIC: Parse + Interpolate
+    uint64_t& sum;
+    uint64_t start;
+    ~ParseBudget() { sum += rex::chrono::Clock::QueryHostTickCount() - start; }
+  };
+  std::optional<ParseBudget> parse_budget(std::in_place, interp_budget_[3], parse_start);
+  if (interpolate) {
     interp_work_ = interp_cur_;
-    const frame_interp::Stats stats = frame_interp::Interpolate(
-        interp_prev_.data(), interp_parsed_prev_, interp_work_.data(), interp_parsed_cur_, 0.5f);
+    stats = frame_interp::Interpolate(interp_prev_.data(), interp_parsed_prev_,
+                                      interp_work_.data(), interp_parsed_cur_, 0.5f,
+                                      &interp_pairs_);
+    // Most paired draws jumped: a camera cut or scene change, nothing to blend.
+    const bool cut = stats.jumped * 4 > stats.matched;
+    if (SharedMemory* sm = InterpSharedMemory(); sm && sm->interp_dump_) {  // TEMP DIAGNOSTIC
+      REXGPU_INFO("IDUMP swap segments {} matched {} lerped {} jumped {} cut {}", stats.segments,
+                  stats.matched, stats.lerped, stats.jumped, cut);
+    }
+    interp_stat_cuts_ += cut;
+    interpolate = !cut && HoldSwapTexture();
+  }
+  parse_budget.reset();
+  if (interpolate) {
     ReplayInterpolatedFrame();
     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
     interp_held_width_ = frontbuffer_width;
     interp_held_height_ = frontbuffer_height;
     interp_held_deadline_ = rex::chrono::Clock::QueryHostTickCount() + period / 2;
     interp_held_pending_ = true;
+  } else {
+    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  }
 
+  if (enabled) {
     interp_stats_.segments += stats.segments;
     interp_stats_.matched += stats.matched;
     interp_stats_.lerped += stats.lerped;
+    interp_stats_.jumped += stats.jumped;
+    interp_stat_ticks_ += interval < freq ? interval : freq / 60;  // the first swap has no previous
+    interp_stat_slow_ += interval * 2000 > freq * 35;
     if (++interp_stat_frames_ == 600) {
-      REXGPU_INFO("frame_interp: per frame {} draws, {} paired, {} lerped",
-                  interp_stats_.segments / 600, interp_stats_.matched / 600,
-                  interp_stats_.lerped / 600);
+      if (SharedMemory* shared_memory = InterpSharedMemory()) {
+        REXGPU_INFO("frame_interp: per frame {} uploads kept, {} pages re-uploaded, {} KB restored",
+                    std::exchange(shared_memory->interp_noted_, 0) / 600,
+                    std::exchange(shared_memory->interp_reupload_pages_, 0) / 600,
+                    std::exchange(shared_memory->interp_restored_bytes_, 0) / 600 / 1024);
+        uint64_t* d = shared_memory->interp_diag_;  // TEMP DIAGNOSTIC
+        REXGPU_INFO("frame_interp: diag x100/frame resolves {}/{}, tex loads {}/{}, blocked {}, "
+                    "restores {}",
+                    d[0] / 6, d[1] / 6, d[2] / 6, d[3] / 6, d[4] / 6, d[5] / 6);
+        std::fill(d, d + 6, 0);
+        REXGPU_INFO("frame_interp: vertex streams x100/frame {} float, {} non-float dynamic, "
+                    "{} unpaired, {} jumped; {} KB lerped per frame; constant loads x100/frame "
+                    "{} from memory, {} inline",
+                    interp_vs_stat_[0] / 6, interp_vs_stat_[1] / 6, interp_vs_stat_[3] / 6,
+                    interp_vs_stat_[4] / 6, interp_vs_stat_[2] / 600, interp_pk_stat_[0] / 6,
+                    interp_pk_stat_[1] / 6);
+        std::fill(std::begin(interp_vs_stat_), std::end(interp_vs_stat_), 0);
+        std::fill(std::begin(interp_pk_stat_), std::end(interp_pk_stat_), 0);
+        REXGPU_INFO("frame_interp: replay state check: {} draws, {} with other fetch constants, "
+                    "{} with other render state (dump frames only)",
+                    interp_state_stat_[0], interp_state_stat_[1], interp_state_stat_[2]);
+        std::fill(std::begin(interp_state_stat_), std::end(interp_state_stat_), 0);
+        // TEMP DIAGNOSTIC: GPU thread budget, us per real frame (16667 = all of a 60 Hz tick).
+        auto us = [&](uint64_t ticks) { return ticks * 1000000 / freq / 600; };
+        REXGPU_INFO("frame_interp: budget us/frame: vertex record {}, vertex replay {}, replay {}, "
+                    "parse {}, restores {}, busy {}",
+                    us(interp_budget_[0]), us(interp_budget_[1]), us(interp_budget_[2]),
+                    us(interp_budget_[3]), us(shared_memory->interp_restore_ticks_),
+                    us(interp_stat_ticks_ - std::min(interp_stat_ticks_, interp_wait_ticks_)));
+        std::fill(std::begin(interp_budget_), std::end(interp_budget_), 0);
+        shared_memory->interp_restore_ticks_ = 0;
+        interp_wait_ticks_ = 0;
+      }
+      REXGPU_INFO(
+          "frame_interp: per frame {} draws, {} paired, {} lerped, {} jumped; {} cut frames; 600 "
+          "real frames in {} ms (10000 = 60 Hz), {} over 17.5 ms",
+          interp_stats_.segments / 600, interp_stats_.matched / 600, interp_stats_.lerped / 600,
+          interp_stats_.jumped / 600, interp_stat_cuts_, interp_stat_ticks_ * 1000 / freq,
+          interp_stat_slow_);
       interp_stats_ = {};
       interp_stat_frames_ = 0;
+      interp_stat_ticks_ = 0;
+      interp_stat_slow_ = 0;
+      interp_stat_cuts_ = 0;
     }
-  } else {
-    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   }
 
   std::swap(interp_prev_, interp_cur_);
   std::swap(interp_parsed_prev_, interp_parsed_cur_);
   interp_cur_.clear();
+  interp_states_.clear();
+  interp_state_values_.clear();
+  interp_state_next_ = 0;
+  std::swap(interp_vs_prev_, interp_vs_cur_);
+  std::swap(interp_vs_data_prev_, interp_vs_data_cur_);
+  interp_vs_cur_.clear();
+  interp_vs_data_cur_.clear();
+  std::swap(interp_vs_copies_prev_, interp_vs_copies_);
+  interp_vs_copies_.clear();
   interp_have_prev_ = enabled;
   interp_recording_ = enabled;
+  if (enabled) {  // the state the next frame's recording starts from
+    interp_start_regs_.assign(register_file_->values,
+                              register_file_->values + RegisterFile::kRegisterCount);
+    interp_start_bin_select_ = bin_select_;
+    interp_start_bin_mask_ = bin_mask_;
+  }
+  if (SharedMemory* shared_memory = InterpSharedMemory()) {
+    shared_memory->InterpEndFrame();
+    shared_memory->interp_recording_ = enabled;
+    // TEMP DIAGNOSTIC: the next frame and its replay, once per stats window.
+    shared_memory->interp_dump_ = enabled && interp_stat_frames_ == 300;
+  if (shared_memory->interp_dump_) {
+      REXGPU_INFO("IDUMP begin");
+    }
+  }
+}
+
+CommandProcessor::InterpBudgetScope::InterpBudgetScope(uint64_t& s)
+    : sum(s), start(rex::chrono::Clock::QueryHostTickCount()) {}
+CommandProcessor::InterpBudgetScope::~InterpBudgetScope() {
+  sum += rex::chrono::Clock::QueryHostTickCount() - start;
+}
+
+void CommandProcessor::InterpCheckDrawState() {
+  SharedMemory* shared_memory = InterpSharedMemory();
+  if (!interp_recording_ || !shared_memory) {
+    return;
+  }
+  constexpr uint32_t kFetchFirst = 0x4800, kFetchCount = 32 * 6;
+  constexpr uint32_t kStateFirst = 0x2000, kStateCount = 0x400;
+  const bool dump = shared_memory->interp_dump_;
+  const uint32_t* regs = register_file_->values;
+  const uint32_t packet = shared_memory->interp_packet_;
+
+  if (!interp_replaying_) {
+    interp_states_.push_back({packet, interp_state_values_.size()});
+    interp_state_values_.insert(interp_state_values_.end(), regs + kFetchFirst,
+                                regs + kFetchFirst + kFetchCount);
+    if (dump) {
+      interp_state_values_.insert(interp_state_values_.end(), regs + kStateFirst,
+                                  regs + kStateFirst + kStateCount);
+    }
+    return;
+  }
+  while (interp_state_next_ < interp_states_.size() &&
+         interp_states_[interp_state_next_].packet < packet) {
+    ++interp_state_next_;
+  }
+  if (interp_state_next_ >= interp_states_.size() ||
+      interp_states_[interp_state_next_].packet != packet) {
+    return;
+  }
+  ++interp_state_stat_[0];
+  const uint32_t* real = interp_state_values_.data() + interp_states_[interp_state_next_].at;
+  uint32_t logged = 0;
+  auto compare = [&](uint32_t first, const uint32_t* real_values, uint32_t count) {
+    bool differ = false;
+    for (uint32_t i = 0; i < count; ++i) {
+      if (regs[first + i] != real_values[i]) {
+        differ = true;
+        if (dump && logged++ < 8) {
+          REXGPU_INFO("IDUMP state pkt={} reg {:04X} replay {:08X} real {:08X}", packet,
+                      first + i, regs[first + i], real_values[i]);
+        }
+      }
+    }
+    return differ;
+  };
+  interp_state_stat_[1] += compare(kFetchFirst, real, kFetchCount);
+  if (dump) {
+    interp_state_stat_[2] += compare(kStateFirst, real + kFetchCount, kStateCount);
+  }
+}
+
+void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
+  SharedMemory* shared_memory = InterpSharedMemory();
+  if (!interp_recording_ || !shared_memory) {
+    return;
+  }
+  InterpBudgetScope budget(interp_budget_[interp_replaying_ ? 1 : 0]);  // TEMP DIAGNOSTIC
+  const uint32_t packet = shared_memory->interp_packet_;
+  auto streams_at = [](const std::vector<InterpVertexStream>& streams, uint32_t at) {
+    return std::lower_bound(streams.begin(), streams.end(), at,
+                            [](const InterpVertexStream& s, uint32_t p) { return s.packet < p; });
+  };
+
+  if (shared_memory->interp_dump_) {
+    // TEMP DIAGNOSTIC: per draw, texture bases of fetch slots 0-2 and each
+    // vertex binding with a hash of its first 64 guest bytes (the real
+    // frame's data) and whether the replay has it valid or restored.
+    for (const Shader::VertexBinding& binding : vertex_shader.vertex_bindings()) {
+      const xenos::xe_gpu_vertex_fetch_t vf = register_file_->GetVertexFetch(binding.fetch_constant);
+      const uint32_t start = uint32_t(vf.address) << 2, bytes = uint32_t(vf.size) << 2;
+      uint64_t hash = 0;
+      if (const auto* guest = memory_->TranslatePhysical<const uint32_t*>(start)) {
+        for (uint32_t i = 0; i < std::min(16u, bytes / 4); ++i) {
+          hash = hash * 0x100000001B3ull ^ guest[i];
+        }
+      }
+      REXGPU_INFO("IDUMP draw rp={} pkt={} tex {:08X} {:08X} {:08X} vb {:08X}+{} guest {:016X} "
+                  "valid {}",
+                  interp_replaying_, packet, register_file_->values[0x4801] & ~0xFFFu,
+                  register_file_->values[0x4807] & ~0xFFFu, register_file_->values[0x480D] & ~0xFFFu, start, bytes,
+                  hash, shared_memory->InterpReplayCanLoad(start, std::min(bytes, 64u)));
+    }
+  }
+
+  if (interp_replaying_) {
+    auto pair = std::lower_bound(interp_pairs_.begin(), interp_pairs_.end(),
+                                 std::make_pair(packet, uint32_t(0)));
+    const bool paired = pair != interp_pairs_.end() && pair->first == packet;
+    for (auto s = streams_at(interp_vs_cur_, packet);
+         s != interp_vs_cur_.end() && s->packet == packet; ++s) {
+      const InterpVertexStream* p = nullptr;
+      if (paired) {
+        for (auto q = streams_at(interp_vs_prev_, pair->second);
+             q != interp_vs_prev_.end() && q->packet == pair->second; ++q) {
+          if (q->binding == s->binding && q->bytes == s->bytes &&
+              q->stride_words == s->stride_words && q->float_words == s->float_words &&
+              q->endian == s->endian) {
+            p = &*q;
+            break;
+          }
+        }
+      }
+      if (!p) {
+        ++interp_vs_stat_[3];
+        if (shared_memory->interp_dump_) {  // TEMP DIAGNOSTIC
+          REXGPU_INFO("IDUMP vunpaired pkt={} paired {} b={} at {:08X} bytes {} stride {}", packet,
+                      paired, s->binding, s->start, s->bytes, s->stride_words);
+        }
+        continue;
+      }
+      if (std::find(interp_vs_written_.begin(), interp_vs_written_.end(), s->start) !=
+          interp_vs_written_.end()) {
+        continue;  // drawn again (another pass): already lerped
+      }
+      // Most "CPU-written" streams are static data sharing pages with dynamic
+      // data: only the vertices that changed are lerped and uploaded.
+      const uint32_t* cur = interp_vs_data_cur_.data() + s->data;
+      const uint32_t* prev = interp_vs_data_prev_.data() + p->data;
+      const uint32_t words = s->bytes / 4, vertices = words / s->stride_words;
+      const uint32_t first_word = uint32_t(std::mismatch(cur, cur + words, prev).first - cur);
+      if (first_word == words) {
+        continue;
+      }
+      const auto rcur = std::make_reverse_iterator(cur + words);
+      const uint32_t last_word =
+          words - uint32_t(std::mismatch(rcur, std::make_reverse_iterator(cur + first_word),
+                                         std::make_reverse_iterator(prev + words))
+                               .first -
+                           rcur);
+      const uint32_t first = first_word / s->stride_words;
+      const uint32_t last = std::min(vertices, (last_word + s->stride_words - 1) / s->stride_words);
+      const uint32_t begin = first * s->stride_words, end = last * s->stride_words;
+      interp_vs_scratch_.assign(cur + begin, cur + end);
+      if (!frame_interp::LerpVertexFloats(prev + begin, interp_vs_scratch_.data(), last - first,
+                                          s->stride_words, s->float_words, s->endian, 0.5f)) {
+        ++interp_vs_stat_[4];
+        if (shared_memory->interp_dump_) {  // TEMP DIAGNOSTIC
+          REXGPU_INFO("IDUMP vjumped pkt={} b={} at {:08X} prev at {:08X} bytes {} stride {} "
+                      "mask {:X}",
+                      packet, s->binding, s->start, p->start, s->bytes, s->stride_words,
+                      s->float_words);
+        }
+        continue;
+      }
+      shared_memory->InterpWrite(s->start + begin * 4, interp_vs_scratch_.data(),
+                                 (end - begin) * 4);
+      interp_vs_written_.push_back(s->start);
+      interp_vs_stat_[2] += ((end - begin) * 4) >> 10;
+      if (shared_memory->interp_dump_) {  // TEMP DIAGNOSTIC
+        REXGPU_INFO("IDUMP vlerp pkt={} prev={} b={} at {:08X} prev at {:08X} bytes {} stride {} "
+                    "mask {:X} verts {}..{} of {}",
+                    packet, pair->second, s->binding, s->start, p->start, s->bytes,
+                    s->stride_words, s->float_words, first, last, vertices);
+      }
+    }
+    return;
+  }
+
+  const RegisterFile& regs = *register_file_;
+  for (const Shader::VertexBinding& binding : vertex_shader.vertex_bindings()) {
+    if (!binding.stride_words || binding.stride_words > 64) {
+      continue;
+    }
+    uint64_t float_words = 0;
+    for (const Shader::VertexBinding::Attribute& attribute : binding.attributes) {
+      const auto& a = attribute.fetch_instr.attributes;
+      uint32_t count = 0;
+      switch (a.data_format) {
+        case xenos::VertexFormat::k_32_FLOAT:
+          count = 1;
+          break;
+        case xenos::VertexFormat::k_32_32_FLOAT:
+          count = 2;
+          break;
+        case xenos::VertexFormat::k_32_32_32_FLOAT:
+          count = 3;
+          break;
+        case xenos::VertexFormat::k_32_32_32_32_FLOAT:
+          count = 4;
+          break;
+        default:
+          break;
+      }
+      for (uint32_t k = 0; k < count; ++k) {
+        const int32_t w = a.offset + int32_t(k);
+        if (w >= 0 && uint32_t(w) < binding.stride_words) {
+          float_words |= uint64_t(1) << w;
+        }
+      }
+    }
+    const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(binding.fetch_constant);
+    const uint32_t start = fetch.address << 2, bytes = fetch.size << 2;
+    // Only data the CPU wrote this frame can differ from the previous frame's.
+    if (!bytes || !shared_memory->InterpUploadedThisFrame(start, bytes)) {
+      continue;
+    }
+    if (!float_words) {
+      ++interp_vs_stat_[1];
+      continue;
+    }
+    ++interp_vs_stat_[0];
+    const uint32_t vertex_bytes = binding.stride_words * 4;
+    const uint32_t lerp_bytes = bytes / vertex_bytes * vertex_bytes;
+    const uint8_t* guest = memory_->TranslatePhysical<const uint8_t*>(start);
+    if (!lerp_bytes || !guest) {
+      continue;
+    }
+    const uint64_t key = (uint64_t(start) << 32) | lerp_bytes;
+    // The same buffer drawn last frame too: static data on pages the CPU
+    // rewrote around it (dynamic meshes are double-buffered or ring-allocated).
+    if (interp_vs_copies_prev_.count(key)) {
+      interp_vs_copies_[key] = SIZE_MAX;
+      continue;
+    }
+    auto [copy, added] = interp_vs_copies_.try_emplace(key, interp_vs_data_cur_.size());
+    if (copy->second == SIZE_MAX) {
+      continue;
+    }
+    if (added) {
+      interp_vs_data_cur_.resize(interp_vs_data_cur_.size() + lerp_bytes / 4);
+      std::memcpy(interp_vs_data_cur_.data() + copy->second, guest, lerp_bytes);
+    }
+    if (shared_memory->interp_dump_) {  // TEMP DIAGNOSTIC
+      REXGPU_INFO("IDUMP vstream pkt={} b={} at {:08X} bytes {} stride {} mask {:X}", packet,
+                  binding.binding_index, start, lerp_bytes, binding.stride_words, float_words);
+    }
+    interp_vs_cur_.push_back({packet, uint32_t(binding.binding_index), start, lerp_bytes,
+                              binding.stride_words, uint32_t(fetch.endian), float_words,
+                              copy->second});
+  }
 }
 
 bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,
@@ -1309,6 +1728,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
+        const uint64_t wait_start = rex::chrono::Clock::QueryHostTickCount();  // TEMP DIAGNOSTIC
         if (!REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
@@ -1323,6 +1743,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
         }
         rex::thread::SyncMemory();
+        interp_wait_ticks_ += rex::chrono::Clock::QueryHostTickCount() - wait_start;
         ReturnFromWait();
 
         if (!worker_running_) {

@@ -211,6 +211,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
   bool HoldSwapTexture() override;
+  SharedMemory* InterpSharedMemory() override { return shared_memory_.get(); }
   void PresentHeldSwapTexture(uint32_t frontbuffer_width, uint32_t frontbuffer_height) override;
 
   void OnPrimaryBufferEnd() override;

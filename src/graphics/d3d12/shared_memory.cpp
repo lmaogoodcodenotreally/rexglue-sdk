@@ -193,6 +193,7 @@ bool D3D12SharedMemory::Initialize() {
 
 void D3D12SharedMemory::Shutdown(bool from_destructor) {
   upload_buffer_pool_.reset();
+  ui::d3d12::util::ReleaseAndNull(interp_version_buffer_);
 
   ui::d3d12::util::ReleaseAndNull(buffer_descriptor_heap_);
 
@@ -371,6 +372,27 @@ bool D3D12SharedMemory::UploadRanges(
     return true;
   }
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+  bool keep_versions = interp_recording_ && !interp_replay_;
+  if (keep_versions) {
+    if (!interp_version_buffer_) {
+      D3D12_RESOURCE_DESC desc;
+      ui::d3d12::util::FillBufferResourceDesc(desc, kInterpVersionBufferSize,
+                                              D3D12_RESOURCE_FLAG_NONE);
+      const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+      if (FAILED(provider.GetDevice()->CreateCommittedResource(
+              &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(),
+              &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+              IID_PPV_ARGS(&interp_version_buffer_)))) {
+        REXGPU_ERROR("frame_interp: failed to create the upload version buffer");
+      }
+      interp_version_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    if (interp_version_buffer_) {
+      TransitionInterpVersionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+    } else {
+      keep_versions = false;
+    }
+  }
   command_processor_.SubmitBarriers();
   auto& command_list = command_processor_.GetDeferredCommandList();
   for (auto upload_range : upload_page_ranges) {
@@ -399,6 +421,20 @@ bool D3D12SharedMemory::UploadRanges(
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);
       PERF_counter_add(kGpuTexUpCopyUs, rex::perf::PerfNowUs() - up_copy_t0);
+      if (keep_versions) {
+        if (interp_version_frame_ != interp_frame_) {
+          interp_version_frame_ = interp_frame_;
+          interp_version_used_ = 0;
+        }
+        if (interp_version_used_ + upload_buffer_size <= kInterpVersionBufferSize) {
+          command_list.D3DCopyBufferRegion(interp_version_buffer_, interp_version_used_,
+                                           upload_buffer, UINT64(upload_buffer_offset),
+                                           UINT64(upload_buffer_size));
+          InterpNoteUpload(upload_range_start, uint32_t(upload_buffer_size >> page_size_log2()),
+                           interp_version_used_);
+          interp_version_used_ += upload_buffer_size;
+        }
+      }
       // TEMP DIAGNOSTIC (retail DOA4 residency attribution): uploaded guest
       // bytes - to compare against expected per-frame traffic and detect
       // invalidation-window amplification.
@@ -412,6 +448,46 @@ bool D3D12SharedMemory::UploadRanges(
     }
   }
   return true;
+}
+
+void D3D12SharedMemory::TransitionInterpVersionBuffer(D3D12_RESOURCE_STATES new_state) {
+  if (interp_version_state_ != new_state) {
+    command_processor_.PushTransitionBarrier(interp_version_buffer_, interp_version_state_,
+                                             new_state);
+    interp_version_state_ = new_state;
+  }
+}
+
+bool D3D12SharedMemory::InterpUpload(uint32_t start, const uint8_t* data, uint32_t length) {
+  CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.SubmitBarriers();
+  auto& command_list = command_processor_.GetDeferredCommandList();
+  while (length) {
+    ID3D12Resource* upload_buffer;
+    size_t upload_buffer_offset, upload_buffer_size;
+    uint8_t* mapping = upload_buffer_pool_->RequestPartial(
+        command_processor_.GetCurrentSubmission(), length, 4, &upload_buffer,
+        &upload_buffer_offset, &upload_buffer_size, nullptr);
+    if (!mapping) {
+      return false;
+    }
+    std::memcpy(mapping, data, upload_buffer_size);
+    command_list.D3DCopyBufferRegion(buffer_, start, upload_buffer, UINT64(upload_buffer_offset),
+                                     UINT64(upload_buffer_size));
+    start += uint32_t(upload_buffer_size);
+    data += upload_buffer_size;
+    length -= uint32_t(upload_buffer_size);
+  }
+  return true;
+}
+
+void D3D12SharedMemory::InterpRestore(uint32_t start, uint32_t length, uint64_t version) {
+  CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+  TransitionInterpVersionBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  command_processor_.GetDeferredCommandList().D3DCopyBufferRegion(buffer_, start,
+                                                                  interp_version_buffer_,
+                                                                  version, length);
 }
 
 }  // namespace rex::graphics::d3d12

@@ -39,6 +39,7 @@ namespace rex::graphics {
 
 class GraphicsSystem;
 class Shader;
+class SharedMemory;
 
 enum class ReadbackResolveMode {
   kDisabled,
@@ -182,6 +183,7 @@ class CommandProcessor {
   // copies the current swap source aside (HoldSwapTexture) and later presents
   // that copy (PresentHeldSwapTexture) as the real frame.
   virtual bool HoldSwapTexture() { return false; }
+  virtual SharedMemory* InterpSharedMemory() { return nullptr; }
   virtual void PresentHeldSwapTexture(uint32_t frontbuffer_width, uint32_t frontbuffer_height) {}
   void SwapWithInterpolation(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                              uint32_t frontbuffer_height);
@@ -291,9 +293,54 @@ class CommandProcessor {
   uint64_t interp_last_swap_ = 0;      // host ticks of the previous real swap
   uint32_t interp_held_width_ = 0, interp_held_height_ = 0;
   std::vector<uint32_t> interp_cur_, interp_prev_, interp_work_, interp_regs_;
+  std::vector<uint32_t> interp_start_regs_;  // registers when the frame's recording began
+  uint64_t interp_start_bin_select_ = 0, interp_start_bin_mask_ = 0;
   frame_interp::ParsedFrame interp_parsed_cur_, interp_parsed_prev_;
   frame_interp::Stats interp_stats_;
   uint32_t interp_stat_frames_ = 0;
+  uint64_t interp_stat_ticks_ = 0;     // real swap intervals summed, the guest tick check
+  uint32_t interp_stat_slow_ = 0;      // real swap intervals over 17.5 ms
+  uint32_t interp_stat_cuts_ = 0;      // frames not interpolated: most draws jumped
+  // CPU-written float vertex streams of each draw (CPU-skinned meshes), by
+  // recorded-stream packet, with a copy of their data, for this and the
+  // previous frame; the replay draws them lerped like the constants.
+  struct InterpVertexStream {
+    uint32_t packet, binding, start, bytes, stride_words, endian;
+    uint64_t float_words;
+    size_t data;  // dword offset in the frame's data
+  };
+  std::vector<InterpVertexStream> interp_vs_cur_, interp_vs_prev_;
+  std::vector<uint32_t> interp_vs_data_cur_, interp_vs_data_prev_, interp_vs_scratch_;
+  // (start, bytes) -> data (SIZE_MAX: static, not copied), this and the previous frame.
+  std::unordered_map<uint64_t, size_t> interp_vs_copies_, interp_vs_copies_prev_;
+  std::vector<std::pair<uint32_t, uint32_t>> interp_pairs_;  // lerped (cur, prev) packets
+  std::vector<uint32_t> interp_vs_written_;  // starts lerped by the replay in progress
+  // TEMP DIAGNOSTIC: streams, non-float dynamic, lerped KB, unpaired, jumped.
+  uint64_t interp_vs_stat_[5] = {};
+  uint64_t interp_pk_stat_[2] = {};  // TEMP DIAGNOSTIC: constant loads from memory, inline
+  // TEMP DIAGNOSTIC: host ticks spent in vertex record, vertex replay, the
+  // replay, Parse + Interpolate; and the CP thread's non-waiting time.
+  uint64_t interp_budget_[4] = {};
+  uint64_t interp_wait_ticks_ = 0;
+  struct InterpBudgetScope {
+    uint64_t& sum;
+    uint64_t start;
+    explicit InterpBudgetScope(uint64_t& s);
+    ~InterpBudgetScope();
+  };
+  // Called by IssueDraw once the vertex buffers are resident.
+  void InterpVertexDraw(const Shader& vertex_shader);
+  // TEMP DIAGNOSTIC: each replayed draw must see the real draw's fetch
+  // constants (and, in dump frames, render state 0x2000-0x2400).
+  struct InterpDrawState {
+    uint32_t packet;
+    size_t at;  // in interp_state_values_
+  };
+  std::vector<InterpDrawState> interp_states_;
+  std::vector<uint32_t> interp_state_values_;
+  size_t interp_state_next_ = 0;
+  uint64_t interp_state_stat_[3] = {};  // draws checked, fetch mismatches, render state mismatches
+  void InterpCheckDrawState();
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;

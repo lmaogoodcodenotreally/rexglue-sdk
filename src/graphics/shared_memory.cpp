@@ -15,6 +15,7 @@
 
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/chrono/clock.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
@@ -339,7 +340,7 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
 }
 
 bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
-  if (ranges == nullptr || !count) {
+  if (ranges == nullptr || !count || interp_replay_) {
     return true;
   }
 
@@ -457,6 +458,181 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   return UploadRanges(upload_ranges_);
+}
+
+void SharedMemory::InterpNoteUpload(uint32_t page_start, uint32_t page_count, uint64_t version) {
+  if (interp_uploaded_.empty()) {
+    const size_t words = ((kBufferSize >> page_size_log2_) + 63) / 64;
+    interp_uploaded_.assign(words, 0);
+    interp_reuploaded_.assign(words, 0);
+    interp_restored_.assign(words, 0);
+  }
+  ++interp_noted_;
+  if (interp_dump_) {  // TEMP DIAGNOSTIC
+    REXGPU_INFO("IDUMP upload pkt={} at {:08X} len {}", interp_packet_,
+                page_start << page_size_log2_, page_count << page_size_log2_);
+  }
+  for (uint32_t p = page_start; p < page_start + page_count; ++p) {
+    const uint64_t bit = uint64_t(1) << (p & 63);
+    uint64_t& uploaded = interp_uploaded_[p >> 6];
+    if (uploaded & bit) {
+      interp_reupload_pages_ += !(interp_reuploaded_[p >> 6] & bit);
+      interp_reuploaded_[p >> 6] |= bit;
+    }
+    uploaded |= bit;
+  }
+  interp_uploads_.push_back({interp_packet_, page_start << page_size_log2_,
+                             page_count << page_size_log2_, version});
+}
+
+bool SharedMemory::InterpTouchesReuploaded(const InterpUploadEvent& e) const {
+  for (uint32_t p = e.start >> page_size_log2_; p < (e.start + e.length) >> page_size_log2_; ++p) {
+    if (interp_reuploaded_[p >> 6] & (uint64_t(1) << (p & 63))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SharedMemory::InterpReplayCanLoad(uint32_t start, uint32_t length) {
+  if (!length) {
+    return true;
+  }
+  if (start > kBufferSize || (kBufferSize - start) < length) {
+    return false;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  upload_ranges_.clear();
+  CollectInvalidUploadRange(start, length);
+  for (const auto& [page_start, page_count] : upload_ranges_) {
+    for (uint32_t p = page_start; p < page_start + page_count; ++p) {
+      if (interp_restored_.empty() || !(interp_restored_[p >> 6] & (uint64_t(1) << (p & 63)))) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void SharedMemory::InterpApplyUploads(uint32_t packet) {
+  if (interp_upload_next_ >= interp_uploads_.size() ||
+      interp_uploads_[interp_upload_next_].packet > packet) {
+    return;
+  }
+  const uint64_t restore_start = rex::chrono::Clock::QueryHostTickCount();  // TEMP DIAGNOSTIC
+  for (; interp_upload_next_ < interp_uploads_.size() &&
+         interp_uploads_[interp_upload_next_].packet <= packet;
+       ++interp_upload_next_) {
+    const InterpUploadEvent& e = interp_uploads_[interp_upload_next_];
+    if (!InterpTouchesReuploaded(e)) {
+      continue;  // uploaded once: the buffer still holds this version
+    }
+    InterpRestore(e.start, e.length, e.version);
+    // The pages now hold data the CPU no longer has: mark them for upload and
+    // let textures over them reload from the restored version.
+    MemoryInvalidationCallback(e.start, e.length, true);
+    for (uint32_t p = e.start >> page_size_log2_; p < (e.start + e.length) >> page_size_log2_;
+         ++p) {
+      interp_restored_[p >> 6] |= uint64_t(1) << (p & 63);
+    }
+    interp_restored_bytes_ += e.length;
+    ++interp_diag_[5];  // TEMP DIAGNOSTIC
+    if (interp_dump_) {
+      REXGPU_INFO("IDUMP restore pkt={} at {:08X} len {}", e.packet, e.start, e.length);
+    }
+  }
+  interp_restore_ticks_ += rex::chrono::Clock::QueryHostTickCount() - restore_start;
+}
+
+void SharedMemory::InterpWrite(uint32_t start, const void* data, uint32_t length) {
+  if (InterpUpload(start, static_cast<const uint8_t*>(data), length)) {
+    interp_written_.emplace_back(start, length);
+  }
+}
+
+bool SharedMemory::InterpUploadedThisFrame(uint32_t start, uint32_t length) const {
+  if (interp_uploaded_.empty() || !length || start >= kBufferSize) {
+    return false;
+  }
+  const uint32_t last = (std::min(start + (length - 1), kBufferSize - 1)) >> page_size_log2_;
+  for (uint32_t p = start >> page_size_log2_; p <= last; ++p) {
+    if (interp_uploaded_[p >> 6] & (uint64_t(1) << (p & 63))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void SharedMemory::InterpNoteReplayLoad(uint32_t start, uint32_t length) {
+  interp_replay_loads_.emplace_back(start, length);
+}
+
+void SharedMemory::InterpEndReplay() {
+  // Textures the replay loaded over pages the CPU has rewritten since the real
+  // frame hold stale data now: fire their watches. Valid pages (current data,
+  // or written by the GPU) are left alone.
+  for (const auto& [start, length] : interp_replay_loads_) {
+    if (!length || start >= kBufferSize) {
+      continue;
+    }
+    const uint32_t last = std::min(start + (length - 1), kBufferSize - 1) >> page_size_log2_;
+    uint32_t p = start >> page_size_log2_;
+    while (p <= last) {
+      if (system_page_flags_valid_[p >> 6] & (uint64_t(1) << (p & 63))) {
+        ++p;
+        continue;
+      }
+      const uint32_t run_start = p;
+      while (p <= last && !(system_page_flags_valid_[p >> 6] & (uint64_t(1) << (p & 63)))) {
+        ++p;
+      }
+      MemoryInvalidationCallback(run_start << page_size_log2_, (p - run_start) << page_size_log2_,
+                                 true);
+    }
+  }
+  interp_replay_loads_.clear();
+  // Lerped data the next real frame must not draw with.
+  for (const auto& [start, length] : interp_written_) {
+    MemoryInvalidationCallback(start, length, true);
+  }
+  interp_written_.clear();
+  // Textures loaded from a restored version during the replay watch pages the
+  // CPU had already rewritten: outdate them so the next frame reloads.
+  for (const InterpUploadEvent& e : interp_uploads_) {
+    if (InterpTouchesReuploaded(e)) {
+      MemoryInvalidationCallback(e.start, e.length, true);
+    }
+  }
+  std::fill(interp_restored_.begin(), interp_restored_.end(), 0);
+}
+
+const uint32_t* SharedMemory::InterpResolveRect(uint32_t address) {
+  if (!interp_recording_) {
+    return nullptr;
+  }
+  if (interp_replay_) {
+    for (const auto& [packet, rect] : interp_resolve_rects_) {
+      if (packet == interp_packet_) {
+        return rect.data();
+      }
+    }
+    return nullptr;
+  }
+  const auto* guest = memory().TranslatePhysical<const uint32_t*>(address);
+  if (guest) {
+    auto& kept = interp_resolve_rects_.emplace_back(interp_packet_, std::array<uint32_t, 6>{});
+    std::copy(guest, guest + 6, kept.second.begin());
+  }
+  return nullptr;
+}
+
+void SharedMemory::InterpEndFrame() {
+  interp_resolve_rects_.clear();
+  std::fill(interp_reuploaded_.begin(), interp_reuploaded_.end(), 0);
+  std::fill(interp_uploaded_.begin(), interp_uploaded_.end(), 0);
+  interp_uploads_.clear();
+  interp_upload_next_ = 0;
+  ++interp_frame_;
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
