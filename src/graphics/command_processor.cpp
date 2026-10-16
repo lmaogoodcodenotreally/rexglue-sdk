@@ -38,6 +38,11 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_BOOL(frame_interp, false, "GPU",
+                    "Frame interpolation: replay each guest frame's commands with the shader "
+                    "constants halfway to the previous frame and present that between real "
+                    "frames (2x the displayed frame rate; the guest's own tick is unchanged).");
+
 REXCVAR_DEFINE_BOOL(precise_vsync, true, "GPU",
                     "Precise frame pacing: deadline-paced vblank generation + event-driven "
                     "wake (WaitOnAddress) for WAIT_REG_MEM memory polls. Off = legacy "
@@ -233,7 +238,7 @@ void CommandProcessor::WorkerThreadMain() {
       do {
         // If we spin around too much, revert to a "low-power" state.
         if (loop_count > 500) {
-          const int wait_time_ms = 5;
+          const int wait_time_ms = interp_held_pending_ ? 1 : 5;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
         }
@@ -241,6 +246,7 @@ void CommandProcessor::WorkerThreadMain() {
         rex::thread::MaybeYield();
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
+        ServiceHeldSwap(false);
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
@@ -709,6 +715,9 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   // TEMP DIAGNOSTIC: one count per packet dispatch (incl. zero-padded words),
   // to compute per-packet overhead for the retail perf partition.
   PERF_counter_inc(kGpuPackets);
+  if (interp_recording_ && !interp_replaying_) {
+    RecordPacket(*reader);
+  }
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
@@ -752,6 +761,9 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
+    if (interp_replaying_ && IsReplaySkippedRegister(target_index)) {
+      continue;
+    }
     if (target_index < RegisterFile::kRegisterCount &&
         register_file_->values[target_index] == reg_data &&
         !WriteRegisterHasSideEffects(target_index)) {
@@ -773,6 +785,10 @@ bool CommandProcessor::ExecutePacketType1(memory::RingBuffer* reader, uint32_t p
   uint32_t reg_index_2 = (packet >> 11) & 0x7FF;
   uint32_t reg_data_1 = reader->ReadAndSwap<uint32_t>();
   uint32_t reg_data_2 = reader->ReadAndSwap<uint32_t>();
+  if (interp_replaying_ &&
+      (IsReplaySkippedRegister(reg_index_1) || IsReplaySkippedRegister(reg_index_2))) {
+    return true;  // never seen in practice; both halves go with the real frame
+  }
   if (register_file_->values[reg_index_1] != reg_data_1 ||
       WriteRegisterHasSideEffects(reg_index_1)) {
     WriteRegister(reg_index_1, reg_data_1);
@@ -811,6 +827,28 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     if (!any_pass || opcode == PM4_XE_SWAP) {
       reader->AdvanceRead(count * sizeof(uint32_t));
       return true;
+    }
+  }
+
+  if (interp_replaying_) {
+    switch (opcode) {
+      // Fences, interrupts, waits, memory writes and queries belong to the
+      // real frame: the guest must see each exactly once.
+      case PM4_XE_SWAP:
+      case PM4_INTERRUPT:
+      case PM4_WAIT_REG_MEM:
+      case PM4_REG_TO_MEM:
+      case PM4_MEM_WRITE:
+      case PM4_COND_WRITE:
+      case PM4_EVENT_WRITE_SHD:
+      case PM4_EVENT_WRITE_EXT:
+      case PM4_EVENT_WRITE_ZPD:
+      case PM4_VIZ_QUERY:
+      case PM4_ME_INIT:
+        reader->AdvanceRead(count * sizeof(uint32_t));
+        return true;
+      default:
+        break;
     }
   }
 
@@ -1036,11 +1074,136 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   {
     ScopedUsCounter gpu_present_scope(rex::perf::CounterId::kGpuPresentUs);  // TEMP DIAGNOSTIC
-    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+    if (REXCVAR_GET(frame_interp) || interp_recording_) {
+      SwapWithInterpolation(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+    } else {
+      IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+    }
   }
 
   ++counter_;
   return true;
+}
+
+bool CommandProcessor::IsReplaySkippedRegister(uint32_t index) {
+  return WriteRegisterHasSideEffects(index) || index == XE_GPU_REG_SCRATCH_ADDR ||
+         index == XE_GPU_REG_SCRATCH_UMSK || index == XE_GPU_REG_COHER_STATUS_HOST ||
+         index == XE_GPU_REG_COHER_BASE_HOST || index == XE_GPU_REG_COHER_SIZE_HOST;
+}
+
+void CommandProcessor::RecordPacket(const memory::RingBuffer& reader) {
+  memory::RingBuffer peek = reader;
+  const uint32_t header = peek.ReadAndSwap<uint32_t>();
+  if (!header) {
+    return;
+  }
+  uint32_t dwords = 1;
+  switch (header >> 30) {
+    case 0:
+    case 3:
+      dwords += ((header >> 16) & 0x3FFF) + 1;
+      break;
+    case 1:
+      dwords = 3;
+      break;
+  }
+  if (header >> 30 == 3) {
+    const uint32_t opcode = (header >> 8) & 0x7F;
+    // Indirect buffers record as their contents; the swap ends the recording.
+    if (opcode == PM4_INDIRECT_BUFFER || opcode == PM4_INDIRECT_BUFFER_PFD ||
+        opcode == PM4_XE_SWAP) {
+      return;
+    }
+  }
+  if (peek.read_count() + sizeof(uint32_t) < dwords * sizeof(uint32_t)) {
+    return;  // malformed; ExecutePacket reports it
+  }
+  const size_t at = interp_cur_.size();
+  interp_cur_.resize(at + dwords);
+  memory::RingBuffer copy = reader;
+  copy.Read(reinterpret_cast<uint8_t*>(interp_cur_.data() + at), dwords * sizeof(uint32_t));
+}
+
+void CommandProcessor::ServiceHeldSwap(bool force) {
+  if (!interp_held_pending_ ||
+      (!force && rex::chrono::Clock::QueryHostTickCount() < interp_held_deadline_)) {
+    return;
+  }
+  interp_held_pending_ = false;
+  PresentHeldSwapTexture(interp_held_width_, interp_held_height_);
+}
+
+void CommandProcessor::ReplayInterpolatedFrame() {
+  // The replay ends in the real frame's register state except for the lerped
+  // constants; put every register it changed back.
+  RegisterFile& regs = *register_file_;
+  interp_regs_.assign(regs.values, regs.values + RegisterFile::kRegisterCount);
+  const uint64_t bin_select = bin_select_, bin_mask = bin_mask_;
+
+  interp_replaying_ = true;
+  memory::RingBuffer reader(reinterpret_cast<uint8_t*>(interp_work_.data()),
+                            interp_work_.size() * sizeof(uint32_t));
+  reader.set_write_offset(interp_work_.size() * sizeof(uint32_t));
+  do {
+    if (!ExecutePacket(&reader)) {
+      REXGPU_ERROR("frame_interp: replay stopped on a bad packet");
+      break;
+    }
+  } while (reader.read_count());
+  interp_replaying_ = false;
+
+  bin_select_ = bin_select;
+  bin_mask_ = bin_mask;
+  for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
+    if (regs.values[i] != interp_regs_[i] && !IsReplaySkippedRegister(i)) {
+      WriteRegister(i, interp_regs_[i]);
+    }
+  }
+}
+
+void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
+                                             uint32_t frontbuffer_width,
+                                             uint32_t frontbuffer_height) {
+  // A held frame the CP had no idle moment for still goes out first.
+  ServiceHeldSwap(true);
+
+  const bool enabled = REXCVAR_GET(frame_interp);
+  const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  const uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
+  const uint64_t period = std::clamp<uint64_t>(now - interp_last_swap_, freq / 60, freq / 30);
+  interp_last_swap_ = now;
+
+  frame_interp::Parse(interp_cur_.data(), interp_cur_.size(), interp_parsed_cur_);
+  if (enabled && interp_have_prev_ && !interp_cur_.empty() && HoldSwapTexture()) {
+    interp_work_ = interp_cur_;
+    const frame_interp::Stats stats = frame_interp::Interpolate(
+        interp_prev_.data(), interp_parsed_prev_, interp_work_.data(), interp_parsed_cur_, 0.5f);
+    ReplayInterpolatedFrame();
+    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+    interp_held_width_ = frontbuffer_width;
+    interp_held_height_ = frontbuffer_height;
+    interp_held_deadline_ = rex::chrono::Clock::QueryHostTickCount() + period / 2;
+    interp_held_pending_ = true;
+
+    interp_stats_.segments += stats.segments;
+    interp_stats_.matched += stats.matched;
+    interp_stats_.lerped += stats.lerped;
+    if (++interp_stat_frames_ == 600) {
+      REXGPU_INFO("frame_interp: per frame {} draws, {} paired, {} lerped",
+                  interp_stats_.segments / 600, interp_stats_.matched / 600,
+                  interp_stats_.lerped / 600);
+      interp_stats_ = {};
+      interp_stat_frames_ = 0;
+    }
+  } else {
+    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  }
+
+  std::swap(interp_prev_, interp_cur_);
+  std::swap(interp_parsed_prev_, interp_parsed_cur_);
+  interp_cur_.clear();
+  interp_have_prev_ = enabled;
+  interp_recording_ = enabled;
 }
 
 bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,
@@ -1142,6 +1305,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      ServiceHeldSwap(false);
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();

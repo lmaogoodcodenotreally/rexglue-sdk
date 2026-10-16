@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <rex/graphics/frame_interp.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
@@ -176,6 +177,19 @@ class CommandProcessor {
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
+
+  // Frame interpolation (frame_interp cvar, see frame_interp.h). The backend
+  // copies the current swap source aside (HoldSwapTexture) and later presents
+  // that copy (PresentHeldSwapTexture) as the real frame.
+  virtual bool HoldSwapTexture() { return false; }
+  virtual void PresentHeldSwapTexture(uint32_t frontbuffer_width, uint32_t frontbuffer_height) {}
+  void SwapWithInterpolation(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                             uint32_t frontbuffer_height);
+  void ReplayInterpolatedFrame();
+  // Presents the held real frame once its time has come (or now if `force`).
+  void ServiceHeldSwap(bool force);
+  void RecordPacket(const memory::RingBuffer& reader);
+  bool IsReplaySkippedRegister(uint32_t index);
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
@@ -267,6 +281,19 @@ class CommandProcessor {
 
   uint64_t bin_select_ = 0xFFFFFFFFull;
   uint64_t bin_mask_ = 0xFFFFFFFFull;
+
+  // Frame interpolation state (CP thread only).
+  bool interp_recording_ = false;  // frame_interp, sampled at each swap
+  bool interp_replaying_ = false;
+  bool interp_have_prev_ = false;
+  bool interp_held_pending_ = false;
+  uint64_t interp_held_deadline_ = 0;  // host ticks
+  uint64_t interp_last_swap_ = 0;      // host ticks of the previous real swap
+  uint32_t interp_held_width_ = 0, interp_held_height_ = 0;
+  std::vector<uint32_t> interp_cur_, interp_prev_, interp_work_, interp_regs_;
+  frame_interp::ParsedFrame interp_parsed_cur_, interp_parsed_prev_;
+  frame_interp::Stats interp_stats_;
+  uint32_t interp_stat_frames_ = 0;
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
