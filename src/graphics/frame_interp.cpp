@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <limits>
 
 #include <rex/graphics/xenos.h>
 
@@ -137,15 +138,70 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
     lerped_pairs->clear();
   }
   stats.segments = uint32_t(cur.segments.size());
-  // Draws pair by signature occurrence: the k-th draw of a signature this
-  // frame with the k-th of the previous frame. Meshes draw once per pass with
-  // the same signature in each, and draws in between are added, culled and
-  // re-sorted, so a search ahead pairs across passes and loses what it skips.
-  // Where a signature's count changed, the nearest unused one in stream order.
+  // Draws pair within their signature, not by stream position: meshes draw
+  // once per pass with the same signature in each, and draws in between are
+  // added, culled and re-sorted, so a search ahead pairs across passes and
+  // loses what it skips. Copies of one mesh (props, floor sections) share a
+  // signature and get re-sorted by depth as the camera moves, so within a
+  // signature a draw pairs with the unused one whose constants are nearest -
+  // a static prop's are equal - ties going to the same occurrence (the same
+  // pass), else to the nearest in stream order.
   constexpr uint32_t kNone = UINT32_MAX;
   std::vector<uint32_t> match(cur.segments.size(), kNone);
   std::vector<bool> used(prev.segments.size());
   std::vector<bool> sure(cur.segments.size());  // its signature's count did not change
+  std::vector<uint32_t> mark(kAluEnd - kAluFirst), mark_at(kAluEnd - kAluFirst);
+  uint32_t mark_stamp = 0;
+  // The cur draw's ALU constants, by register, for `distance` to a draw with
+  // another constant layout.
+  const ParsedFrame::Segment* marked = nullptr;
+  auto mark_cur = [&](const ParsedFrame::Segment& cs) {
+    if (marked == &cs) return;
+    marked = &cs;
+    ++mark_stamp;
+    for (uint32_t e = cs.alu_begin; e < cs.alu_end; ++e) {
+      for (uint32_t d = 0; d < cur.alu_count[e]; ++d) {
+        const uint32_t r = cur.alu_reg[e] + d - kAluFirst;
+        mark[r] = mark_stamp;
+        mark_at[r] = cur.alu_offset[e] + d;
+      }
+    }
+  };
+  // Sum of |cur - prev| over the ALU constants both draws write, given up
+  // past `limit`. shortcut: only the first 64 shared dwords (copies differ in
+  // their world matrix, written first); compare more if copies still mispair.
+  auto distance = [&](const ParsedFrame::Segment& cs, const ParsedFrame::Segment& ps,
+                      float limit) {
+    float sum = 0;
+    uint32_t common = 0;
+    if (cs.layout == ps.layout && cs.alu_end - cs.alu_begin == ps.alu_end - ps.alu_begin) {
+      for (uint32_t e = 0; e < cs.alu_end - cs.alu_begin && common < 64; ++e) {
+        const uint32_t co = cur.alu_offset[cs.alu_begin + e], po = prev.alu_offset[ps.alu_begin + e];
+        for (uint32_t d = 0; d < cur.alu_count[cs.alu_begin + e] && common < 64; ++d, ++common) {
+          const float c = std::bit_cast<float>(Load(cur_be, co + d));
+          const float p = std::bit_cast<float>(Load(prev_be, po + d));
+          if (std::isfinite(c) && std::isfinite(p) && (sum += std::abs(c - p)) > limit) {
+            return sum;
+          }
+        }
+      }
+      return common ? sum : std::numeric_limits<float>::infinity();
+    }
+    mark_cur(cs);
+    for (uint32_t e = ps.alu_begin; e < ps.alu_end && common < 64; ++e) {
+      for (uint32_t d = 0; d < prev.alu_count[e] && common < 64; ++d) {
+        const uint32_t r = prev.alu_reg[e] + d - kAluFirst;
+        if (mark[r] != mark_stamp) continue;
+        ++common;
+        const float c = std::bit_cast<float>(Load(cur_be, mark_at[r]));
+        const float p = std::bit_cast<float>(Load(prev_be, prev.alu_offset[e] + d));
+        if (std::isfinite(c) && std::isfinite(p) && (sum += std::abs(c - p)) > limit) {
+          return sum;
+        }
+      }
+    }
+    return common ? sum : std::numeric_limits<float>::infinity();
+  };
   auto pair_by = [&](uint64_t ParsedFrame::Segment::*key) {
     auto order = [&](const ParsedFrame& frame, auto skip) {
       std::vector<std::pair<uint64_t, uint32_t>> v;
@@ -164,26 +220,39 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
       auto [pa, pb] =
           std::equal_range(prev_order.begin(), prev_order.end(), std::make_pair(k, 0u),
                            [](const auto& x, const auto& y) { return x.first < y.first; });
-      if (size_t(pb - pa) == b - a) {
-        for (size_t c = a; c < b; ++c, ++pa) {
-          match[cur_order[c].second] = pa->second;
-          used[pa->second] = true;
-          sure[cur_order[c].second] = true;
-        }
+      const bool same_count = size_t(pb - pa) == b - a;
+      if (same_count && b - a == 1) {
+        match[cur_order[a].second] = pa->second;
+        used[pa->second] = true;
+        sure[cur_order[a].second] = true;
         continue;
       }
-      for (size_t c = a; c < b; ++c) {  // a few draws: the quadratic search is fine
+      for (size_t c = a; c < b; ++c) {  // a few copies: the quadratic search is fine
         const int64_t at = cur_order[c].second;
         auto best = pb;
-        for (auto q = pa; q != pb; ++q) {
-          if (!used[q->second] &&
-              (best == pb || std::abs(q->second - at) < std::abs(best->second - at))) {
+        float best_distance = std::numeric_limits<float>::infinity();
+        int64_t best_tie = 0;
+        auto consider = [&](decltype(pa) q, int64_t tie) {
+          const float dq = distance(cur.segments[at], prev.segments[q->second], best_distance);
+          if (best == pb || dq < best_distance || (dq == best_distance && tie < best_tie)) {
             best = q;
+            best_distance = dq;
+            best_tie = tie;
+          }
+        };
+        const auto occurrence = same_count ? pa + (c - a) : pb;
+        if (occurrence != pb && !used[occurrence->second]) {
+          consider(occurrence, -1);
+        }
+        for (auto q = pa; q != pb && best_distance != 0; ++q) {  // equal: the same draw
+          if (q != occurrence && !used[q->second]) {
+            consider(q, std::abs(q->second - at));
           }
         }
         if (best != pb) {
           match[at] = best->second;
           used[best->second] = true;
+          sure[at] = same_count;
         }
       }
     }

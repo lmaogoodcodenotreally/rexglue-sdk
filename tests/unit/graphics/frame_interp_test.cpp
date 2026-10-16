@@ -169,13 +169,36 @@ TEST_CASE("frame_interp pairs the k-th draw of a signature with the k-th") {
   CHECK(cur.Float(second) == 105.0f);
 }
 
+TEST_CASE("frame_interp pairs copies of one mesh by their constants") {
+  // Two static props of one mesh, re-sorted by depth: each keeps its place.
+  auto prop = [](Stream& s, float x) {
+    s.Shaders(0x1000, 0x2000);
+    s.Constants(0x4000, {x, 1});
+    s.Draw(0x11);
+  };
+  Stream prev, cur;
+  prop(prev, 10);
+  prop(prev, 20);
+  prop(cur, 20);
+  size_t first = cur.be.size() - 4;
+  prop(cur, 10);
+  size_t second = cur.be.size() - 4;
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  CHECK(cur.Float(first) == 20.0f);  // not 15: halfway to the other prop
+  CHECK(cur.Float(second) == 10.0f);
+}
+
 TEST_CASE("frame_interp leaves a guessed pairing whose constants jumped") {
   Stream prev, cur;
   prev.Shaders(0x1000, 0x2000);
   prev.Constants(0x4000, {0, 5});  // light A
   prev.Draw(0x11);
   prev.Shaders(0x1000, 0x2000);
-  prev.Constants(0x4000, {50, 5});  // light C, gone this frame
+  prev.Constants(0x4000, {300, 5});  // light C, gone this frame
   prev.Draw(0x11);
   cur.Shaders(0x1000, 0x2000);
   cur.Constants(0x4000, {100, 5});  // light B: not motion

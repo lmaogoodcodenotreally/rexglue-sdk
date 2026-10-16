@@ -1565,6 +1565,22 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
                       s->float_words, first, last, bad, (begin + bad) / s->stride_words,
                       (begin + bad) % s->stride_words, bad < end - begin ? pw[bad] : 0,
                       bad < end - begin ? cw[bad] : 0);
+          // TEMP DIAGNOSTIC: the whole failing vertex and the one before, as floats.
+          if (bad < end - begin) {
+            const uint32_t v0 = bad / s->stride_words;
+            for (uint32_t v = v0 ? v0 - 1 : 0; v <= v0; ++v) {
+              std::string line;
+              for (int which = 0; which < 2; ++which) {
+                line += which ? " | cur" : "prev";
+                for (uint32_t w = 0; w < s->stride_words; ++w) {
+                  const uint32_t word = (which ? cw : pw)[v * s->stride_words + w];
+                  line += fmt::format(" {:.3f}", std::bit_cast<float>(
+                                                     xenos::GpuSwap(word, xenos::Endian(s->endian))));
+                }
+              }
+              REXGPU_INFO("IDUMP vjvert at {:08X} vertex {} {}", s->start, first + v, line);
+            }
+          }
         }
         continue;
       }
