@@ -7,6 +7,7 @@
 #include <rex/graphics/frame_interp.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <functional>
@@ -545,6 +546,37 @@ bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
     if (std::isfinite(c) && std::isfinite(p) && Jumped(c, p)) {
       return false;
     }
+  }
+  // A sprite switched, not moved: every float word that changed (a texture
+  // coordinate picking another atlas cell - a stage name, a digit) moved at
+  // least its own extent over the vertices while the others (the position)
+  // stayed put. In between would show the cell in between: kept as is.
+  std::array<float, 64> lo, hi, moved;
+  uint64_t still = float_words;
+  lo.fill(std::numeric_limits<float>::infinity());
+  hi.fill(-std::numeric_limits<float>::infinity());
+  moved.fill(0);
+  for (uint32_t v = 0; v < vertices; ++v) {
+    for (uint64_t m = float_words; m; m &= m - 1) {
+      const uint32_t w = uint32_t(std::countr_zero(m)), i = v * stride_words + w;
+      const float c = std::bit_cast<float>(xenos::GpuSwap(cur[i], e));
+      const float p = std::bit_cast<float>(xenos::GpuSwap(prev[i], e));
+      if (!std::isfinite(c) || !std::isfinite(p)) continue;
+      lo[w] = std::min(lo[w], c);
+      hi[w] = std::max(hi[w], c);
+      if (prev[i] != cur[i]) {
+        still &= ~(uint64_t(1) << w);
+        moved[w] = std::max(moved[w], std::abs(c - p));
+      }
+    }
+  }
+  bool switched = still != 0;
+  for (uint64_t m = float_words & ~still; switched && m; m &= m - 1) {
+    const uint32_t w = uint32_t(std::countr_zero(m));
+    switched = hi[w] > lo[w] && moved[w] >= hi[w] - lo[w];
+  }
+  if (switched) {
+    return false;
   }
   for (uint32_t v = 0; v < vertices; ++v, prev += stride_words, cur += stride_words) {
     for (uint64_t m = float_words; m; m &= m - 1) {

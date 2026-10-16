@@ -74,7 +74,9 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
 // fetch constant's xenos::Endian. Non-finite values are kept. Returns false,
 // leaving `cur` as is, when the data does not correspond: a word outside
 // `float_words` (a packed color, say) differs, or a float jumped as
-// Interpolate's constants would.
+// Interpolate's constants would, or a sprite switched rather than moved (every
+// float that changed jumped by its own whole extent while another word stayed:
+// a texture coordinate picking another atlas cell under a quad standing still).
 bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
                       uint32_t stride_words, uint64_t float_words, uint32_t endian, float t);
 

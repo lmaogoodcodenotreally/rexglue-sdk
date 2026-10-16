@@ -352,3 +352,41 @@ TEST_CASE("frame_interp lerps the float words of vertex data in guest byte order
   REQUIRE(!LerpVertexFloats(prev, jumped, 2, 3, 0b011, 2, 0.5f));  // 1.5 -> 100
   REQUIRE(f(jumped[0]) == 100.0f);
 }
+
+TEST_CASE("frame_interp keeps a sprite that switched atlas cells") {
+  // A quad (x, y, u, v) standing still while v picks another stage name: the
+  // in-between would sample the name between the two. A scroll by less than
+  // the quad's own extent is motion and lerps.
+  auto be = [](float f) { return std::byteswap(std::bit_cast<uint32_t>(f)); };
+  auto f = [](uint32_t w) { return std::bit_cast<float>(std::byteswap(w)); };
+  auto quad = [&](float v0, std::vector<uint32_t>& out) {
+    const float xy[4][2] = {{0, 0}, {100, 0}, {100, 20}, {0, 20}};
+    for (int k = 0; k < 4; ++k) {
+      out.insert(out.end(), {be(xy[k][0]), be(xy[k][1]), be(k == 1 || k == 2 ? 1.0f : 0.0f),
+                             be(v0 + (k >= 2 ? 0.1f : 0.0f))});
+    }
+  };
+  std::vector<uint32_t> prev, name, scroll;
+  quad(0.0f, prev);
+  quad(0.2f, name);
+  REQUIRE(!LerpVertexFloats(prev.data(), name.data(), 4, 4, 0b1111, 2, 0.5f));
+  CHECK(f(name[3]) == 0.2f);
+  quad(0.02f, scroll);
+  REQUIRE(LerpVertexFloats(prev.data(), scroll.data(), 4, 4, 0b1111, 2, 0.5f));
+  CHECK(f(scroll[3]) == 0.01f);
+}
+
+TEST_CASE("frame_interp lerps a particle that outran its own size") {
+  // One quad of a particle buffer moved by more than its width while its
+  // texture coordinate stayed: motion, not a sprite switch.
+  auto be = [](float f) { return std::byteswap(std::bit_cast<uint32_t>(f)); };
+  auto f = [](uint32_t w) { return std::bit_cast<float>(std::byteswap(w)); };
+  std::vector<uint32_t> prev, cur;
+  for (int k = 0; k < 4; ++k) {
+    const float x = k == 1 || k == 2 ? 1.0f : 0.0f, y = k >= 2 ? 1.0f : 0.0f;
+    prev.insert(prev.end(), {be(x), be(y), be(0.5f + x * 0.1f)});
+    cur.insert(cur.end(), {be(x + 1.5f), be(y + 0.25f), be(0.5f + x * 0.1f)});
+  }
+  REQUIRE(LerpVertexFloats(prev.data(), cur.data(), 4, 3, 0b111, 2, 0.5f));
+  CHECK(f(cur[0]) == 0.75f);
+}
