@@ -1968,6 +1968,87 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
     return;
   }
+  PresentSwapSource(swap_texture_resource, swap_texture_srv_desc, frontbuffer_format,
+                    frontbuffer_width_unscaled, frontbuffer_height_unscaled, frontbuffer_width,
+                    frontbuffer_height);
+}
+
+bool D3D12CommandProcessor::HoldSwapTexture() {
+  if (!BeginSubmission(true)) {
+    return false;
+  }
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
+  xenos::TextureFormat format;
+  uint32_t width_unscaled = 0, height_unscaled = 0;
+  ID3D12Resource* source =
+      texture_cache_->RequestSwapTexture(srv_desc, format, &width_unscaled, &height_unscaled);
+  if (!source) {
+    return false;
+  }
+  D3D12_RESOURCE_DESC desc = source->GetDesc();
+  if (held_swap_texture_) {
+    D3D12_RESOURCE_DESC held_desc = held_swap_texture_->GetDesc();
+    if (held_desc.Width != desc.Width || held_desc.Height != desc.Height ||
+        held_desc.Format != desc.Format) {
+      if (submission_completed_ < held_swap_texture_submission_ &&
+          EnqueueResourceDeletion(held_swap_texture_submission_, held_swap_texture_.Get())) {
+        held_swap_texture_->AddRef();
+      }
+      held_swap_texture_.Reset();
+    }
+  }
+  if (!held_swap_texture_) {
+    desc.Alignment = 0;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+    if (FAILED(provider.GetDevice()->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(), &desc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+            IID_PPV_ARGS(&held_swap_texture_)))) {
+      REXGPU_ERROR("frame_interp: failed to create the held swap texture");
+      return false;
+    }
+  }
+  // RequestSwapTexture left the source in NON_PIXEL_SHADER_RESOURCE.
+  PushTransitionBarrier(source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+  PushTransitionBarrier(held_swap_texture_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+  SubmitBarriers();
+  deferred_command_list_.D3DCopyResource(held_swap_texture_.Get(), source);
+  PushTransitionBarrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  PushTransitionBarrier(held_swap_texture_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  held_swap_texture_submission_ = submission_current_;
+  held_swap_srv_desc_ = srv_desc;
+  held_swap_format_ = format;
+  held_swap_width_unscaled_ = width_unscaled;
+  held_swap_height_unscaled_ = height_unscaled;
+  return true;
+}
+
+void D3D12CommandProcessor::PresentHeldSwapTexture(uint32_t frontbuffer_width,
+                                                   uint32_t frontbuffer_height) {
+  vertex_buffers_in_sync_[0] = 0;
+  vertex_buffers_in_sync_[1] = 0;
+  if (!held_swap_texture_ || !graphics_system_ || !graphics_system_->presenter() ||
+      !BeginSubmission(true)) {
+    return;
+  }
+  held_swap_texture_submission_ = submission_current_;
+  PresentSwapSource(held_swap_texture_.Get(), held_swap_srv_desc_, held_swap_format_,
+                    held_swap_width_unscaled_, held_swap_height_unscaled_, frontbuffer_width,
+                    frontbuffer_height);
+}
+
+void D3D12CommandProcessor::PresentSwapSource(
+    ID3D12Resource* swap_texture_resource,
+    const D3D12_SHADER_RESOURCE_VIEW_DESC& swap_texture_srv_desc,
+    xenos::TextureFormat frontbuffer_format, uint32_t frontbuffer_width_unscaled,
+    uint32_t frontbuffer_height_unscaled, uint32_t frontbuffer_width,
+    uint32_t frontbuffer_height) {
+  ui::Presenter* presenter = graphics_system_->presenter();
   D3D12_RESOURCE_DESC swap_texture_desc = swap_texture_resource->GetDesc();
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
   // textures may be allocation-padded. Prefer the active frontbuffer region
@@ -2569,6 +2650,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  InterpVertexDraw(*vertex_shader);
+  InterpCheckDrawState();  // TEMP DIAGNOSTIC
+
   // Gather memexport ranges and ensure the heaps for them are resident, and
   // also load the data surrounding the export and to fill the regions that
   // won't be modified by the shaders.
@@ -2921,11 +3005,18 @@ bool D3D12CommandProcessor::IssueCopy() {
   if (!BeginSubmission(true)) {
     return false;
   }
+  ++shared_memory_->interp_diag_[shared_memory_->interp_replay_];  // TEMP DIAGNOSTIC
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    const bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_,
+                                                        *texture_cache_, written_address,
+                                                        written_length);
+    if (shared_memory_->interp_dump_) {  // TEMP DIAGNOSTIC
+      REXGPU_INFO("IDUMP resolve rp={} pkt={} at {:08X} len {}", shared_memory_->interp_replay_,
+                  shared_memory_->interp_packet_, written_address, written_length);
+    }
+    return resolved;
   }
   return IssueCopy_ReadbackResolvePath();
 }

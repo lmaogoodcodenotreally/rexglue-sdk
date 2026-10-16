@@ -765,7 +765,8 @@ const ResolveCopyShaderInfo resolve_copy_shader_info[size_t(ResolveCopyShaderInd
 bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
-                    bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out) {
+                    bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out,
+                    const uint32_t* vertices_guest_override) {
   // Don't pass uninitialized values to shaders, not to leak data to frame
   // captures. Also initialize an invalid resolve to empty.
   info_out.coordinate_info.packed = 0;
@@ -794,7 +795,9 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     return false;
   }
   const float* vertices_guest =
-      reinterpret_cast<const float*>(memory.TranslatePhysical(fetch.address * sizeof(uint32_t)));
+      vertices_guest_override
+          ? reinterpret_cast<const float*>(vertices_guest_override)
+          : reinterpret_cast<const float*>(memory.TranslatePhysical(fetch.address * sizeof(uint32_t)));
   // Most vertices have a negative half-pixel offset applied, which we reverse.
   float half_pixel_offset =
       regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;

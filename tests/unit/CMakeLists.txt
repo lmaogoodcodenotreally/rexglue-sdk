@@ -19,6 +19,8 @@ add_executable(unit_tests
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
+    graphics/frame_interp_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/frame_interp.cpp
 )
 
 target_sources(unit_tests PRIVATE

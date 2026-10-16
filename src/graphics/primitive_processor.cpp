@@ -277,6 +277,23 @@ void PrimitiveProcessor::ClearPerFrameCache() {
 }
 
 bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
+  if (interp_results_frame_ != shared_memory_.interp_frame_) {
+    interp_results_frame_ = shared_memory_.interp_frame_;
+    interp_results_.clear();
+    interp_result_next_ = 0;
+  }
+  if (shared_memory_.interp_replay_) {
+    const uint32_t packet = shared_memory_.interp_packet_;
+    while (interp_result_next_ < interp_results_.size() &&
+           interp_results_[interp_result_next_].first < packet) {
+      ++interp_result_next_;
+    }
+    if (interp_result_next_ < interp_results_.size() &&
+        interp_results_[interp_result_next_].first == packet) {
+      result_out = interp_results_[interp_result_next_].second;
+      return true;
+    }
+  }
   SCOPE_profile_cpu_f("gpu");
 
   const RegisterFile& regs = register_file_;
@@ -933,6 +950,9 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
   result_out.host_shader_index_endian = cacheable.host_shader_index_endian;
   result_out.host_primitive_reset_enabled = cacheable.host_primitive_reset_enabled;
   result_out.host_index_buffer_handle = cacheable.host_index_buffer_handle;
+  if (shared_memory_.interp_recording_ && !shared_memory_.interp_replay_) {
+    interp_results_.emplace_back(shared_memory_.interp_packet_, result_out);
+  }
   return true;
 }
 

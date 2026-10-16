@@ -581,9 +581,12 @@ struct ResolveInfo {
 // color render target formats are properly emulated as -32...32, true if
 // emulated as snorm, with range limited to -1...1, but with correct blending
 // within that range.
+// `vertices_guest_override`, if not null, replaces the 6 guest dwords of the
+// resolve rectangle read from vertex fetch 0 (frame interpolation replays).
 bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
-                    bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out);
+                    bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out,
+                    const uint32_t* vertices_guest_override = nullptr);
 
 }  // namespace rex::graphics::draw_util

@@ -80,6 +80,8 @@ class D3D12SharedMemory : public SharedMemory {
                                         uint32_t length_allocations) override;
 
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+  void InterpRestore(uint32_t start, uint32_t length, uint64_t version) override;
+  bool InterpUpload(uint32_t start, const uint8_t* data, uint32_t length) override;
 
  private:
   D3D12CommandProcessor& command_processor_;
@@ -110,6 +112,15 @@ class D3D12SharedMemory : public SharedMemory {
   D3D12_CPU_DESCRIPTOR_HANDLE buffer_descriptor_heap_start_;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> upload_buffer_pool_;
+
+  // Frame interpolation: this frame's uploads, copied GPU-side as they go
+  // (see SharedMemory::interp_recording_). Created on first use.
+  static constexpr uint64_t kInterpVersionBufferSize = 64 << 20;
+  ID3D12Resource* interp_version_buffer_ = nullptr;
+  D3D12_RESOURCE_STATES interp_version_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
+  uint64_t interp_version_used_ = 0;
+  uint32_t interp_version_frame_ = UINT32_MAX;
+  void TransitionInterpVersionBuffer(D3D12_RESOURCE_STATES new_state);
 };
 
 }  // namespace rex::graphics::d3d12

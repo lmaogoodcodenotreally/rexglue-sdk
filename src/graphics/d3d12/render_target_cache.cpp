@@ -1169,9 +1169,11 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
 
   draw_util::ResolveInfo resolve_info;
   bool fixed_16_truncated_to_minus_1_to_1 = IsFixed16TruncatedToMinus1To1();
+  const uint32_t* interp_rect =
+      shared_memory.InterpResolveRect(register_file().GetVertexFetch(0).address << 2);
   if (!draw_util::GetResolveInfo(register_file(), memory, draw_resolution_scale_x(),
                                  draw_resolution_scale_y(), fixed_16_truncated_to_minus_1_to_1,
-                                 fixed_16_truncated_to_minus_1_to_1, resolve_info)) {
+                                 fixed_16_truncated_to_minus_1_to_1, resolve_info, interp_rect)) {
     return false;
   }
 
