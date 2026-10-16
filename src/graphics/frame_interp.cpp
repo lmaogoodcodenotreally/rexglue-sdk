@@ -10,6 +10,7 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <tuple>
 
 #include <rex/graphics/xenos.h>
 
@@ -207,7 +208,7 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
     }
     return common ? sum : std::numeric_limits<float>::infinity();
   };
-  auto pair_by = [&](uint64_t ParsedFrame::Segment::*key) {
+  auto pair_by = [&](uint64_t ParsedFrame::Segment::*key, bool sure_key) {
     auto order = [&](const ParsedFrame& frame, auto skip) {
       std::vector<std::pair<uint64_t, uint32_t>> v;
       for (uint32_t i = 0; i < frame.segments.size(); ++i) {
@@ -229,52 +230,77 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
       if (same_count && b - a == 1) {
         match[cur_order[a].second] = pa->second;
         used[pa->second] = true;
-        sure[cur_order[a].second] = true;
+        sure[cur_order[a].second] = sure_key;
         continue;
       }
-      for (size_t c = a; c < b; ++c) {  // a few copies: the quadratic search is fine
-        const int64_t at = cur_order[c].second;
+      // The nearest unused copy to cur draw `at` (or to all copies, for
+      // `any`), ties going to the nearest in stream order.
+      auto nearest = [&](int64_t at, bool any, float& best_distance) {
         auto best = pb;
-        float best_distance = std::numeric_limits<float>::infinity();
         int64_t best_tie = 0;
-        auto consider = [&](decltype(pa) q, int64_t tie) {
+        best_distance = std::numeric_limits<float>::infinity();
+        for (auto q = pa; q != pb && best_distance != 0; ++q) {  // equal: the same draw
+          if (!any && used[q->second]) continue;
           const float dq = distance(cur.segments[at], prev.segments[q->second], best_distance);
+          const int64_t tie = std::abs(q->second - at);
           if (best == pb || dq < best_distance || (dq == best_distance && tie < best_tie)) {
             best = q;
             best_distance = dq;
             best_tie = tie;
           }
-        };
-        auto occurrence = same_count ? pa + (c - a) : pb;
-        if (occurrence != pb && used[occurrence->second]) {
-          occurrence = pb;
         }
-        float occurrence_distance = 0;
-        if (occurrence != pb) {
-          consider(occurrence, -1);
-          occurrence_distance = best_distance;
-        }
-        for (auto q = pa; q != pb && best_distance != 0; ++q) {  // equal: the same draw
-          if (q != occurrence && !used[q->second]) {
-            consider(q, std::abs(q->second - at));
+        return best;
+      };
+      auto take = [&](int64_t at, uint32_t q, bool is_sure) {
+        match[at] = q;
+        used[q] = true;
+        sure[at] = is_sure;
+        copies[at] = uint32_t(b - a);
+      };
+      // First every copy that its own occurrence fits within the margin of its
+      // nearest, so that a copy that moved toward another's place does not
+      // take that one's pair; then the rest, nearest among those left.
+      if (same_count) {  // a few copies: the quadratic searches are fine
+        for (size_t c = a; c < b; ++c) {
+          const int64_t at = cur_order[c].second;
+          const auto occurrence = pa + (c - a);
+          float best_distance;
+          nearest(at, true, best_distance);
+          if (distance(cur.segments[at], prev.segments[occurrence->second],
+                       std::numeric_limits<float>::infinity()) <= best_distance + kCopyMargin) {
+            take(at, occurrence->second, sure_key);
           }
         }
-        if (occurrence != pb && occurrence_distance <= best_distance + kCopyMargin) {
-          best = occurrence;
+      }
+      std::vector<std::tuple<float, int64_t, uint32_t, uint32_t>> options;  // nearest first
+      for (size_t c = a; c < b; ++c) {
+        const uint32_t at = cur_order[c].second;
+        if (match[at] != kNone) continue;
+        for (auto q = pa; q != pb; ++q) {
+          if (!used[q->second]) {
+            options.emplace_back(distance(cur.segments[at], prev.segments[q->second],
+                                          std::numeric_limits<float>::infinity()),
+                                 std::abs(int64_t(q->second) - at), at, q->second);
+          }
         }
-        copies[at] = uint32_t(b - a);
-        if (best != pb) {
-          match[at] = best->second;
-          used[best->second] = true;
-          sure[at] = same_count;
+      }
+      std::sort(options.begin(), options.end());
+      // Guesses: with copies re-sorted or the count changed, the copy left
+      // over is as likely another object (one that came into view at one
+      // end of a row while another left at the other).
+      for (const auto& [d, tie, at, q] : options) {
+        if (match[at] == kNone && !used[q]) {
+          take(at, q, false);
         }
       }
     }
   };
-  pair_by(&ParsedFrame::Segment::signature);
+  pair_by(&ParsedFrame::Segment::signature, true);
   // Then by the draw alone: which textures a draw sets itself depends on what
   // the draw before it left bound, which changes when draws are re-sorted.
-  pair_by(&ParsedFrame::Segment::draw);
+  // Those pairings are guesses: a copy left over from the first pass is
+  // as likely another object.
+  pair_by(&ParsedFrame::Segment::draw, false);
 
   // The game uploads only the constant ranges that changed since its previous
   // draw, so one draw can split its writes differently between frames: those
