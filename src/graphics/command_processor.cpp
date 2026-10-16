@@ -14,6 +14,7 @@
 #include <optional>
 #include <cinttypes>
 #include <cstring>
+#include <cstdio>
 #include <string_view>
 
 #include <fmt/format.h>
@@ -1285,6 +1286,19 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
     if (SharedMemory* sm = InterpSharedMemory(); sm && sm->interp_dump_) {  // TEMP DIAGNOSTIC
       REXGPU_INFO("IDUMP swap segments {} matched {} lerped {} jumped {} cut {}", stats.segments,
                   stats.matched, stats.lerped, stats.jumped, cut);
+      // TEMP DIAGNOSTIC: both raw streams, for offline pairing analysis.
+      static int dump_index = 0;
+      const std::pair<const char*, const std::vector<uint32_t>*> files[] = {
+          {"prev", &interp_prev_}, {"cur", &interp_cur_}};
+      for (const auto& [name, data] : files) {
+        const std::string path =
+            fmt::format("C:/Users/User/AppData/Local/Temp/opencode/istream_{}_{}.bin", dump_index, name);
+        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+          std::fwrite(data->data(), 4, data->size(), f);
+          std::fclose(f);
+        }
+      }
+      ++dump_index;
     }
     interp_stat_cuts_ += cut;
     interpolate = !cut && HoldSwapTexture();

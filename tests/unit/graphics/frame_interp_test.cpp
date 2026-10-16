@@ -86,6 +86,35 @@ TEST_CASE("frame_interp leaves segments whose constant layout changed") {
   CHECK(cur.Float(cur.be.size() - 3) == 5.0f);
 }
 
+TEST_CASE("frame_interp pairs constants by register when the upload split changed") {
+  // The game uploads only the ranges that changed since its previous draw.
+  Stream prev, cur;
+  prev.Shaders(0x1000, 0x2000);
+  prev.Constants(0x4000, {8, 8, 8, 8});
+  prev.Draw(0x11);
+  prev.Shaders(0x3000, 0x4000);
+  prev.Constants(0x4010, {8});  // 0x4000-0x4003 kept from the draw before
+  prev.Draw(0x22);
+  cur.Shaders(0x1000, 0x2000);
+  cur.Constants(0x4000, {10, 10});
+  cur.Constants(0x4002, {10, 10});
+  size_t split = cur.be.size() - 2;
+  cur.Draw(0x11);
+  cur.Shaders(0x3000, 0x4000);
+  cur.Constants(0x4002, {10});
+  size_t back = cur.be.size() - 1;
+  cur.Constants(0x4010, {10});
+  cur.Draw(0x22);
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Stats s = Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  CHECK(s.lerped == 3);
+  CHECK(cur.Float(split) == 9.0f);
+  CHECK(cur.Float(back) == 9.0f);  // what the previous frame's draw saw
+}
+
 TEST_CASE("frame_interp pairs same-shader draws by their textures") {
   auto icon = [](Stream& s, uint32_t texture_base, float x) {
     s.Shaders(0x1000, 0x2000);
@@ -96,7 +125,7 @@ TEST_CASE("frame_interp pairs same-shader draws by their textures") {
     s.Draw(0x11);
   };
   Stream prev, cur;
-  icon(prev, 0xA0000000, 0);
+  icon(prev, 0xA0000000, 8);
   icon(prev, 0xB0000000, 100);
   icon(cur, 0xB0000000, 110);  // the icons swapped draw order
   size_t b = cur.be.size() - 3;
@@ -108,7 +137,36 @@ TEST_CASE("frame_interp pairs same-shader draws by their textures") {
   Parse(cur.be.data(), cur.be.size(), pc);
   Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
   CHECK(cur.Float(b) == 105.0f);  // B lerps with B, not with A
-  CHECK(cur.Float(a) == 10.0f);   // A sits behind the resync point: drawn as is
+  CHECK(cur.Float(a) == 9.0f);
+}
+
+TEST_CASE("frame_interp pairs the k-th draw of a signature with the k-th") {
+  // One mesh drawn in two passes, with another draw culled between them.
+  auto mesh = [](Stream& s, float x) {
+    s.Shaders(0x1000, 0x2000);
+    s.Constants(0x4000, {x});
+    s.Draw(0x11);
+  };
+  Stream prev, cur;
+  mesh(prev, 8);
+  prev.Shaders(0x3000, 0x4000);
+  prev.Draw(0x22);
+  mesh(prev, 100);
+  cur.Shaders(0x3000, 0x4000);  // re-sorted ahead of the first pass
+  cur.Draw(0x22);
+  mesh(cur, 10);
+  size_t first = cur.be.size() - 3;
+  mesh(cur, 110);
+  size_t second = cur.be.size() - 3;
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Stats s = Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  CHECK(s.matched == 4);
+  CHECK(s.jumped == 0);
+  CHECK(cur.Float(first) == 9.0f);
+  CHECK(cur.Float(second) == 105.0f);
 }
 
 TEST_CASE("frame_interp leaves a pairing whose constants jumped") {

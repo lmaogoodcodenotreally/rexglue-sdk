@@ -27,7 +27,8 @@ namespace rex::graphics::frame_interp {
 
 struct ParsedFrame {
   struct Segment {
-    uint64_t signature;  // shaders + draw initiator (+ index base) of the closing draw
+    uint64_t signature;  // `draw` + the texture bases the segment sets
+    uint64_t draw;       // shaders + draw initiator (+ index base) of the closing draw
     uint64_t layout;     // the headers of the ALU-constant packets in the segment
     uint32_t alu_begin, alu_end;  // range in alu_offset / alu_count
     uint32_t packet;     // dword offset of the closing draw packet (the stream size for the tail)
@@ -35,12 +36,13 @@ struct ParsedFrame {
   std::vector<Segment> segments;  // one per draw, plus the tail after the last draw
   std::vector<uint32_t> alu_offset;  // dword offset of the first ALU constant written
   std::vector<uint32_t> alu_count;   // ALU constant dwords written from there
+  std::vector<uint32_t> alu_reg;     // the register of the first one
 };
 
 struct Stats {
   uint32_t segments = 0;
   uint32_t matched = 0;  // paired with a previous-frame segment of the same signature
-  uint32_t lerped = 0;   // ...and the same constant layout, so its constants were lerped
+  uint32_t lerped = 0;   // ...and its constants were lerped
   uint32_t jumped = 0;   // ...but a constant jumped (a mispairing or a wrap): drawn as is
 };
 
@@ -49,9 +51,10 @@ void Parse(const uint32_t* stream_be, size_t dword_count, ParsedFrame& out);
 // Moves every ALU constant written by a paired segment of `cur` from its value
 // toward the previous frame's value: result = prev + (cur - prev) * t. t = 1
 // leaves `cur` as is, t = 0.5 is the midpoint. Non-finite values are kept. A
-// segment where any constant moved by more than half its magnitude (floor 1)
+// segment where any constant moved by more than half its magnitude (floor 2)
 // is not motion - two different draws paired, or a wrapping value - and keeps
-// `cur`.
+// `cur`. Draws pair by signature, then by draw alone; constants by position
+// when both frames wrote the same layout, else by register.
 // `lerped_pairs`, if given, receives (cur packet, prev packet) of every lerped
 // segment, in stream order.
 Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cur_be,
@@ -65,7 +68,7 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
 // fetch constant's xenos::Endian. Non-finite values are kept. Returns false,
 // leaving `cur` as is, when the data does not correspond: a word outside
 // `float_words` (a packed color, say) differs, or a float jumped as
-// Interpolate's constants would (with a floor of 2 instead of 1 - normals).
+// Interpolate's constants would.
 bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
                       uint32_t stride_words, uint64_t float_words, uint32_t endian, float t);
 
