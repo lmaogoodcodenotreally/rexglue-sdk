@@ -390,3 +390,33 @@ TEST_CASE("frame_interp lerps a particle that outran its own size") {
   REQUIRE(LerpVertexFloats(prev.data(), cur.data(), 4, 3, 0b111, 2, 0.5f));
   CHECK(f(cur[0]) == 0.75f);
 }
+
+TEST_CASE("frame_interp swaps copies that traded the texture they set") {
+  // Two rickshaws of one mesh: the first drawn binds the texture, the second
+  // finds it bound. Drawn in the other order, each takes the other's
+  // signature; paired by it they would meet halfway.
+  auto rickshaw = [](Stream& s, bool binds, float x) {
+    s.Shaders(0x1000, 0x2000);
+    if (binds) {
+      s.Put((1u << 16) | 0x4800);
+      s.Put(0x2);
+      s.Put(0xA0000000);
+    }
+    s.Constants(0x4000, {x, 0, 0, 1});
+    s.Draw(0x11);
+  };
+  Stream prev, cur;
+  rickshaw(prev, true, 10);
+  rickshaw(prev, false, 13);
+  rickshaw(cur, true, 13.5f);
+  const size_t b = cur.be.size() - 6;
+  rickshaw(cur, false, 10.5f);
+  const size_t a = cur.be.size() - 6;
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  CHECK(cur.Float(b) == 13.25f);  // each with itself
+  CHECK(cur.Float(a) == 10.25f);
+}

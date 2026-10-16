@@ -389,6 +389,57 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
   // Those pairings are guesses: a copy left over from the first pass is
   // as likely another object.
   pair_by(&ParsedFrame::Segment::draw, false);
+  // Two copies drawn in the other order this frame can trade the textures
+  // they set themselves, so their signatures: each paired with the other's
+  // draw and both lerped toward each other (two rickshaws meeting halfway).
+  // Within a draw whose copies carry several signatures, two pairings that
+  // are nearer swapped are swapped. Only draws of one constant layout compare
+  // whole: by register, the few registers two layouts share can make another
+  // draw look nearer.
+  {
+    constexpr float kInf = std::numeric_limits<float>::infinity();
+    std::vector<std::tuple<uint64_t, uint64_t, uint32_t>> group;  // draw, layout, cur draw
+    for (uint32_t i = 0; i < cur.segments.size(); ++i) {
+      if (match[i] != kNone && prev.segments[match[i]].layout == cur.segments[i].layout) {
+        group.emplace_back(cur.segments[i].draw, cur.segments[i].layout, i);
+      }
+    }
+    std::sort(group.begin(), group.end());
+    std::vector<std::pair<uint32_t, float>> uneasy;  // cur draw paired off by more than the margin
+    for (size_t a = 0, b; a < group.size(); a = b) {
+      bool mixed = false;
+      for (b = a + 1; b < group.size() && std::get<0>(group[b]) == std::get<0>(group[a]) &&
+                      std::get<1>(group[b]) == std::get<1>(group[a]);
+           ++b) {
+        mixed |= cur.segments[std::get<2>(group[b])].signature !=
+                 cur.segments[std::get<2>(group[a])].signature;
+      }
+      // shortcut: a draw with more than 64 copies (a particle cloud) is not
+      // searched; upgrade if such swaps show.
+      if (!mixed || b - a > 64) continue;
+      uneasy.clear();
+      for (size_t x = a; x < b; ++x) {
+        const uint32_t i = std::get<2>(group[x]);
+        const float d = distance(cur.segments[i], prev.segments[match[i]], kInf);
+        if (d > kCopyMargin && d < kInf) uneasy.emplace_back(i, d);
+      }
+      for (size_t x = 0; x < uneasy.size(); ++x) {
+        for (size_t y = x + 1; y < uneasy.size(); ++y) {
+          auto& [i, at_i] = uneasy[x];
+          auto& [j, at_j] = uneasy[y];
+          const float now = at_i + at_j - kCopyMargin;
+          const float di = distance(cur.segments[i], prev.segments[match[j]], now);
+          if (di >= now) continue;
+          const float dj = distance(cur.segments[j], prev.segments[match[i]], now - di);
+          if (di + dj >= now) continue;
+          std::swap(match[i], match[j]);
+          at_i = di;
+          at_j = dj;
+          sure[i] = sure[j] = false;
+        }
+      }
+    }
+  }
 
   // The game uploads only the constant ranges that changed since its previous
   // draw, so one draw can split its writes differently between frames: those
