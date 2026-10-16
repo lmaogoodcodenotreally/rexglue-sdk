@@ -27,6 +27,10 @@ constexpr float kJump = 0.5f;
 constexpr float kJumpFloor = 2.0f;
 // How many previous-frame draws back a constant a draw saw may be looked for.
 constexpr uint32_t kLookBack = 16;
+// How much nearer (sum of |cur - prev| constants) another copy of a mesh must
+// be than the same occurrence to pair instead: copies told apart by vertex
+// data alone (UI text quads) have near-equal constants and keep their order.
+constexpr float kCopyMargin = 1.0f;
 
 bool Jumped(float c, float p) {
   return std::abs(c - p) > std::max(kJumpFloor, kJump * std::max(std::abs(c), std::abs(p)));
@@ -150,6 +154,7 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
   std::vector<uint32_t> match(cur.segments.size(), kNone);
   std::vector<bool> used(prev.segments.size());
   std::vector<bool> sure(cur.segments.size());  // its signature's count did not change
+  std::vector<uint32_t> copies(cur.segments.size());  // TEMP DIAGNOSTIC: draws of its signature
   std::vector<uint32_t> mark(kAluEnd - kAluFirst), mark_at(kAluEnd - kAluFirst);
   uint32_t mark_stamp = 0;
   // The cur draw's ALU constants, by register, for `distance` to a draw with
@@ -240,15 +245,24 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
             best_tie = tie;
           }
         };
-        const auto occurrence = same_count ? pa + (c - a) : pb;
-        if (occurrence != pb && !used[occurrence->second]) {
+        auto occurrence = same_count ? pa + (c - a) : pb;
+        if (occurrence != pb && used[occurrence->second]) {
+          occurrence = pb;
+        }
+        float occurrence_distance = 0;
+        if (occurrence != pb) {
           consider(occurrence, -1);
+          occurrence_distance = best_distance;
         }
         for (auto q = pa; q != pb && best_distance != 0; ++q) {  // equal: the same draw
           if (q != occurrence && !used[q->second]) {
             consider(q, std::abs(q->second - at));
           }
         }
+        if (occurrence != pb && occurrence_distance <= best_distance + kCopyMargin) {
+          best = occurrence;
+        }
+        copies[at] = uint32_t(b - a);
         if (best != pb) {
           match[at] = best->second;
           used[best->second] = true;
@@ -336,6 +350,7 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
     // that jumped is likely another draw: drawn as is.
     if (!visit(false)) {
       ++stats.jumped;
+      stats.suspect += copies[i] > 2;  // TEMP DIAGNOSTIC
       if (!sure[i]) continue;
     }
     ++stats.lerped;

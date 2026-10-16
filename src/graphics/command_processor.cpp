@@ -1284,9 +1284,18 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
                                       &interp_pairs_);
     // Most paired draws jumped: a camera cut or scene change, nothing to blend.
     const bool cut = stats.jumped * 4 > stats.matched;
-    if (SharedMemory* sm = InterpSharedMemory(); sm && sm->interp_dump_) {  // TEMP DIAGNOSTIC
-      REXGPU_INFO("IDUMP swap segments {} matched {} lerped {} jumped {} cut {}", stats.segments,
-                  stats.matched, stats.lerped, stats.jumped, cut);
+    // TEMP DIAGNOSTIC: also dump frames where a copy of a mesh jumped (at
+    // most one a second, 40 a run).
+    static uint32_t suspect_dumps = 0, suspect_wait = 0;
+    suspect_wait -= suspect_wait != 0;
+    const bool suspect = stats.suspect && !cut && !suspect_wait && suspect_dumps < 40;
+    if (suspect) {
+      ++suspect_dumps;
+      suspect_wait = 60;
+    }
+    if (SharedMemory* sm = InterpSharedMemory(); sm && (sm->interp_dump_ || suspect)) {
+      REXGPU_INFO("IDUMP swap segments {} matched {} lerped {} jumped {} suspect {} cut {}",
+                  stats.segments, stats.matched, stats.lerped, stats.jumped, stats.suspect, cut);
       // TEMP DIAGNOSTIC: both raw streams, for offline pairing analysis.
       static int dump_index = 0;
       const std::pair<const char*, const std::vector<uint32_t>*> files[] = {

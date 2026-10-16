@@ -192,6 +192,30 @@ TEST_CASE("frame_interp pairs copies of one mesh by their constants") {
   CHECK(cur.Float(second) == 10.0f);
 }
 
+TEST_CASE("frame_interp keeps the order of copies whose constants barely differ") {
+  // UI text quads: one shader and texture, told apart by their vertex data.
+  auto quad = [](Stream& s, float x) {
+    s.Shaders(0x1000, 0x2000);
+    s.Constants(0x4000, {x});
+    s.Draw(0x11);
+  };
+  Stream prev, cur;
+  quad(prev, 1.0f);
+  quad(prev, 1.25f);
+  quad(cur, 1.25f);
+  size_t first = cur.be.size() - 3;
+  quad(cur, 1.0f);
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  std::vector<std::pair<uint32_t, uint32_t>> pairs;
+  Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f, &pairs);
+  REQUIRE(pairs.size() >= 2);
+  CHECK(pairs[0].second == pp.segments[0].packet);  // the first with the first
+  CHECK(cur.Float(first) == 1.125f);
+}
+
 TEST_CASE("frame_interp leaves a guessed pairing whose constants jumped") {
   Stream prev, cur;
   prev.Shaders(0x1000, 0x2000);

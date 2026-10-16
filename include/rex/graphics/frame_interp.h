@@ -44,6 +44,7 @@ struct Stats {
   uint32_t matched = 0;  // paired with a previous-frame segment of the same signature
   uint32_t lerped = 0;   // ...and its constants were lerped
   uint32_t jumped = 0;   // ...where a constant jumped (fast motion, a cut or a mispairing)
+  uint32_t suspect = 0;  // TEMP DIAGNOSTIC: ...a draw with more than 2 copies
 };
 
 void Parse(const uint32_t* stream_be, size_t dword_count, ParsedFrame& out);
