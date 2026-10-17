@@ -18,6 +18,7 @@
  * frame. Streams are stored exactly as the guest wrote them (big-endian).
  */
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -29,6 +30,9 @@ struct ParsedFrame {
   struct Segment {
     uint64_t signature;  // `draw` + the texture bases the segment sets
     uint64_t draw;       // shaders + draw initiator (+ index base) of the closing draw
+    // Its shaders + primitive type alone: without the vertex count and index
+    // base dynamic geometry (particles, ring-allocated indices) changes.
+    uint64_t shaders;
     // `draw` + what was drawn into the textures the frame rendered itself
     // (resolved) that the segment sets: a menu icon copied to the one icon
     // texture is told apart by the icon drawn there.
@@ -71,19 +75,39 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
                   const ParsedFrame& cur, float t,
                   std::vector<std::pair<uint32_t, uint32_t>>* lerped_pairs = nullptr);
 
+// The words of a vertex that hold packed values rather than one float32, by
+// the fetch format of the attribute there.
+struct PackedWords {
+  uint64_t words = 0;                // bit k: word k is packed
+  uint64_t is_signed = 0;            // ...with signed lanes
+  std::array<uint8_t, 64> format{};  // ...as this xenos::VertexFormat
+  bool operator==(const PackedWords&) const = default;
+};
+
 // Vertex data the CPU rewrites every frame (CPU-skinned meshes) moves with the
 // constants: lerps, in place in `cur`, the float32 words of each vertex (bit k
 // of `float_words` = word k of the `stride_words`-word vertex) from `prev`, as
 // Interpolate does. Words are as stored in guest memory, `endian` is the vertex
-// fetch constant's xenos::Endian. Non-finite values are kept. Words in
-// `byte_words` (8:8:8:8 colors: a fade) lerp per byte. Returns false,
-// leaving `cur` as is, when the data does not correspond: another word
-// (packed normals, indices) differs, or a float jumped as
-// Interpolate's constants would, or a sprite switched rather than moved (every
-// float that changed jumped by its own whole extent while another word stayed:
-// a texture coordinate picking another atlas cell under a quad standing still).
+// fetch constant's xenos::Endian. Non-finite values are kept. Packed words
+// lerp lane by lane (an 8:8:8:8 color fading, a 10:11:11 normal turning with
+// a skinned limb, 16:16 half texture coordinates). Returns false, leaving
+// `cur` as is, when the data does not correspond: another word (indices)
+// differs, or a float jumped as Interpolate's constants would, or a sprite
+// switched rather than moved (every float that changed jumped by its own
+// whole extent while another word stayed: a texture coordinate picking
+// another atlas cell under a quad standing still).
 bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
-                      uint32_t stride_words, uint64_t float_words, uint64_t byte_words,
+                      uint32_t stride_words, uint64_t float_words, const PackedWords& packed,
                       uint32_t endian, float t);
+
+// For a draw of independent primitives of `group` vertices each (particle
+// quads) whose list shifted as particles were born and died, so that the
+// stream as a whole does not correspond: each primitive is lerped, as
+// LerpVertexFloats would, from the nearest previous one within 8 places that
+// corresponds; the others are left as they are. Returns how many were lerped.
+uint32_t LerpPrimitives(const uint32_t* prev, uint32_t prev_vertices, uint32_t* cur,
+                        uint32_t vertices, uint32_t group, uint32_t stride_words,
+                        uint64_t float_words, const PackedWords& packed, uint32_t endian,
+                        float t);
 
 }  // namespace rex::graphics::frame_interp

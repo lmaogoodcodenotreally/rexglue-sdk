@@ -1278,7 +1278,11 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
   const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
   const uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
   const uint64_t interval = now - interp_last_swap_;
-  const uint64_t period = std::clamp<uint64_t>(interval, freq / 60, freq / 30);
+  // The guest's tick: the shortest recent interval, rising slowly in 30 Hz
+  // scenes. Not the last one: a late frame would widen the room it lacked.
+  interp_period_ = std::clamp<uint64_t>(std::min(interval, interp_period_ + interp_period_ / 32),
+                                        freq / 60, freq / 30);
+  const uint64_t period = interp_period_;
   interp_last_swap_ = now;
   static uint64_t g_prev_real = 0, g_prev_cost = 0;  // TEMP DIAGNOSTIC: the guard's inputs
   {  // TEMP DIAGNOSTIC: where a late frame's time went (since the previous swap).
@@ -1574,6 +1578,10 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
   }
 
   if (interp_replaying_) {
+    static int vs_diag_left = 0;  // TEMP DIAGNOSTIC: streams left unlerped, 100 per window
+    if (interp_stat_frames_ == 0) {
+      vs_diag_left = 100;
+    }
     auto pair = std::lower_bound(interp_pairs_.begin(), interp_pairs_.end(),
                                  std::make_pair(packet, uint32_t(0)));
     const bool paired = pair != interp_pairs_.end() && pair->first == packet;
@@ -1585,7 +1593,7 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
              q != interp_vs_prev_.end() && q->packet == pair->second; ++q) {
           if (q->binding == s->binding && q->bytes == s->bytes &&
               q->stride_words == s->stride_words && q->float_words == s->float_words &&
-              q->byte_words == s->byte_words &&
+              q->packed == s->packed &&
               q->endian == s->endian) {
             p = &*q;
             break;
@@ -1594,9 +1602,20 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
       }
       if (!p) {
         ++interp_vs_stat_[3];
-        if (shared_memory->interp_dump_) {  // TEMP DIAGNOSTIC
-          REXGPU_INFO("IDUMP vunpaired pkt={} paired {} b={} at {:08X} bytes {} stride {}", packet,
-                      paired, s->binding, s->start, s->bytes, s->stride_words);
+        if (shared_memory->interp_dump_ || vs_diag_left-- > 0) {  // TEMP DIAGNOSTIC
+          std::string prev_streams;  // the paired draw's streams, binding:bytes/stride/mask
+          if (paired) {
+            for (auto q = streams_at(interp_vs_prev_, pair->second);
+                 q != interp_vs_prev_.end() && q->packet == pair->second; ++q) {
+              prev_streams += fmt::format(" {}:{}/{}/{:X}", q->binding, q->bytes, q->stride_words,
+                                          q->float_words);
+            }
+          }
+          REXGPU_INFO("IDUMP vunpaired frame {} pkt={} paired {} b={} at {:08X} bytes {} stride {} "
+                      "mask {:X} vs {:016X}; prev{}",
+                      interp_stat_frames_, packet, paired, s->binding, s->start, s->bytes,
+                      s->stride_words, s->float_words, vertex_shader.ucode_data_hash(),
+                      prev_streams);
         }
         continue;
       }
@@ -1624,10 +1643,42 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
       const uint32_t begin = first * s->stride_words, end = last * s->stride_words;
       interp_vs_scratch_.assign(cur + begin, cur + end);
       if (!frame_interp::LerpVertexFloats(prev + begin, interp_vs_scratch_.data(), last - first,
-                                          s->stride_words, s->float_words, s->byte_words,
+                                          s->stride_words, s->float_words, s->packed,
                                           s->endian, 0.5f)) {
+        // Independent primitives (particle quads, auto-indexed) whose list
+        // shifted as particles were born and died pair one by one.
+        reg::VGT_DRAW_INITIATOR init;
+        init.value = register_file_->values[XE_GPU_REG_VGT_DRAW_INITIATOR];
+        uint32_t group = 0;
+        if (init.source_select == xenos::SourceSelect::kAutoIndex) {
+          switch (init.prim_type) {
+            case xenos::PrimitiveType::kPointList:
+              group = 1;
+              break;
+            case xenos::PrimitiveType::kTriangleList:
+            case xenos::PrimitiveType::kRectangleList:
+              group = 3;
+              break;
+            case xenos::PrimitiveType::kQuadList:
+              group = 4;
+              break;
+            default:
+              break;
+          }
+        }
+        if (group) {
+          interp_vs_scratch_.assign(cur, cur + words);
+          if (frame_interp::LerpPrimitives(prev, vertices, interp_vs_scratch_.data(), vertices,
+                                           group, s->stride_words, s->float_words, s->packed,
+                                           s->endian, 0.5f)) {
+            shared_memory->InterpWrite(s->start, interp_vs_scratch_.data(), words * 4);
+            interp_vs_written_.push_back(s->start);
+            interp_vs_stat_[2] += (words * 4) >> 10;
+            continue;
+          }
+        }
         ++interp_vs_stat_[4];
-        if (shared_memory->interp_dump_) {  // TEMP DIAGNOSTIC
+        if (shared_memory->interp_dump_ || vs_diag_left-- > 0) {  // TEMP DIAGNOSTIC
           // The first word that failed: outside the float mask, or a jump.
           const uint32_t* pw = prev + begin;
           const uint32_t* cw = cur + begin;
@@ -1642,12 +1693,23 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
               break;
             }
           }
-          REXGPU_INFO("IDUMP vjumped pkt={} b={} at {:08X} prev at {:08X} bytes {} stride {} "
+          REXGPU_INFO("IDUMP vjumped frame {} vs {:016X} pkt={} b={} at {:08X} prev at {:08X} bytes {} stride {} "
                       "mask {:X} verts {}..{} word {} (vertex {} word {}) {:08X} -> {:08X}",
-                      packet, s->binding, s->start, p->start, s->bytes, s->stride_words,
-                      s->float_words, first, last, bad, (begin + bad) / s->stride_words,
+                      interp_stat_frames_, vertex_shader.ucode_data_hash(), packet, s->binding,
+                      s->start, p->start, s->bytes, s->stride_words, s->float_words, first, last, bad, (begin + bad) / s->stride_words,
                       (begin + bad) % s->stride_words, bad < end - begin ? pw[bad] : 0,
                       bad < end - begin ? cw[bad] : 0);
+          // TEMP DIAGNOSTIC: the first 40 jumped streams, prev then cur, whole.
+          static int vj_files = 0;
+          if (vj_files < 40) {
+            if (FILE* f = std::fopen(fmt::format("C:/Users/User/AppData/Local/Temp/opencode/vj/"
+                                                 "{}_{:X}_s{}.bin", vj_files++, s->start,
+                                                 s->stride_words).c_str(), "wb")) {
+              std::fwrite(prev, 4, words, f);
+              std::fwrite(cur, 4, words, f);
+              std::fclose(f);
+            }
+          }
           // TEMP DIAGNOSTIC: the whole failing vertex and the one before, as floats.
           if (bad < end - begin) {
             const uint32_t v0 = bad / s->stride_words;
@@ -1686,15 +1748,24 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
     if (!binding.stride_words || binding.stride_words > 64) {
       continue;
     }
-    uint64_t float_words = 0, byte_words = 0;
+    uint64_t float_words = 0;
+    frame_interp::PackedWords packed;
     for (const Shader::VertexBinding::Attribute& attribute : binding.attributes) {
       const auto& a = attribute.fetch_instr.attributes;
-      if (a.data_format == xenos::VertexFormat::k_8_8_8_8 && a.offset >= 0 &&
-          uint32_t(a.offset) < binding.stride_words) {
-        byte_words |= uint64_t(1) << a.offset;
-      }
       uint32_t count = 0;
       switch (a.data_format) {
+        case xenos::VertexFormat::k_8_8_8_8:
+        case xenos::VertexFormat::k_2_10_10_10:
+        case xenos::VertexFormat::k_10_11_11:
+        case xenos::VertexFormat::k_11_11_10:
+        case xenos::VertexFormat::k_16_16:
+        case xenos::VertexFormat::k_16_16_FLOAT:
+          if (a.offset >= 0 && uint32_t(a.offset) < binding.stride_words) {
+            packed.words |= uint64_t(1) << a.offset;
+            packed.is_signed |= uint64_t(a.is_signed) << a.offset;
+            packed.format[a.offset] = uint8_t(a.data_format);
+          }
+          break;
         case xenos::VertexFormat::k_32_FLOAT:
           count = 1;
           break;
@@ -1761,7 +1832,7 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
     }
     interp_vs_cur_.push_back({packet, uint32_t(binding.binding_index), start, lerp_bytes,
                               binding.stride_words, uint32_t(fetch.endian), float_words,
-                              byte_words, copy->second});
+                              packed, copy->second});
   }
 }
 

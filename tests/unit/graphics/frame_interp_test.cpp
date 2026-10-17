@@ -1,11 +1,14 @@
 #include <bit>
+#include <cmath>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/graphics/frame_interp.h>
+#include <rex/graphics/xenos.h>
 
 using namespace rex::graphics::frame_interp;
+namespace xenos = rex::graphics::xenos;
 
 namespace {
 
@@ -68,7 +71,7 @@ TEST_CASE("frame_interp lerps paired constants and resyncs past an added draw") 
   CHECK(cur.Float(added) == 7.0f);  // the new draw's constant is untouched
 }
 
-TEST_CASE("frame_interp leaves segments whose constant layout changed") {
+TEST_CASE("frame_interp keeps the registers the previous frame never wrote") {
   Stream prev, cur;
   prev.Shaders(0x1000, 0x2000);
   prev.Constants(0x4000, {0, 0});
@@ -82,7 +85,7 @@ TEST_CASE("frame_interp leaves segments whose constant layout changed") {
   Parse(cur.be.data(), cur.be.size(), pc);
   Stats s = Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
   CHECK(s.matched == 2);
-  CHECK(s.lerped == 1);  // only the empty tail
+  CHECK(s.lerped == 2);
   CHECK(cur.Float(cur.be.size() - 3) == 5.0f);
 }
 
@@ -307,7 +310,7 @@ TEST_CASE("frame_interp follows a light switched to another source") {
   Parse(prev.be.data(), prev.be.size(), pp);
   Parse(cur.be.data(), cur.be.size(), pc);
   Stats s = Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
-  CHECK(s.jumped == 1);
+  CHECK(s.jumped == 0);  // a light that drew another draw cleanly: no jump
   CHECK(cur.Float(x + 1) == 0.9f);  // B's in-between, not halfway from A
   CHECK(cur.Float(x + 2) == -2.95f);
 }
@@ -331,6 +334,61 @@ TEST_CASE("frame_interp lerps a sure pairing through fast motion") {
   CHECK(cur.Float(x) == 0.0f);
 }
 
+PackedWords Packed(uint32_t word, xenos::VertexFormat format) {
+  PackedWords packed;
+  packed.words = uint64_t(1) << word;
+  packed.format[word] = uint8_t(format);
+  return packed;
+}
+
+TEST_CASE("frame_interp turns a rigid matrix that turned far in one tick") {
+  // A fist's world matrix (3 basis rows, translation row) turning 90 degrees
+  // about z in one tick of a strike: halfway it is turned 45 degrees, at full
+  // size (a per-element lerp would shrink it to 0.71), and moved halfway.
+  Stream prev, cur;
+  prev.Shaders(0x1000, 0x2000);
+  prev.Constants(0x4000, {2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 10, 0, 0, 1});
+  prev.Draw(0x11);
+  cur.Shaders(0x1000, 0x2000);
+  cur.Constants(0x4000, {0, 2, 0, 0, -2, 0, 0, 0, 0, 0, 2, 0, 12, 0, 0, 1});
+  const size_t x = cur.be.size() - 16;
+  cur.Draw(0x11);
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  const float h = 2 * std::sqrt(0.5f);
+  CHECK(std::abs(cur.Float(x + 0) - h) < 1e-4f);
+  CHECK(std::abs(cur.Float(x + 1) - h) < 1e-4f);
+  CHECK(std::abs(cur.Float(x + 4) + h) < 1e-4f);
+  CHECK(std::abs(cur.Float(x + 5) - h) < 1e-4f);
+  CHECK(std::abs(cur.Float(x + 10) - 2) < 1e-4f);
+  CHECK(cur.Float(x + 12) == 11.0f);
+}
+
+TEST_CASE("frame_interp turns a mirrored rigid matrix") {
+  // A view-space matrix with z flipped (determinant -1) turning 90 degrees.
+  Stream prev, cur;
+  prev.Shaders(0x1000, 0x2000);
+  prev.Constants(0x4000, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, 0});
+  prev.Draw(0x11);
+  cur.Shaders(0x1000, 0x2000);
+  cur.Constants(0x4000, {0, 1, 0, 0, -1, 0, 0, 0, 0, 0, -1, 0});
+  const size_t x = cur.be.size() - 12;
+  cur.Draw(0x11);
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  const float h = std::sqrt(0.5f);
+  CHECK(std::abs(cur.Float(x + 0) - h) < 1e-4f);
+  CHECK(std::abs(cur.Float(x + 1) - h) < 1e-4f);
+  CHECK(std::abs(cur.Float(x + 4) + h) < 1e-4f);
+  CHECK(std::abs(cur.Float(x + 10) + 1) < 1e-4f);
+}
+
 TEST_CASE("frame_interp lerps the float words of vertex data in guest byte order") {
   // Two 3-word vertices: a big-endian (k8in32 = 2) float pair and an unlisted
   // word (a packed color) that must match between the frames.
@@ -338,7 +396,7 @@ TEST_CASE("frame_interp lerps the float words of vertex data in guest byte order
   auto f = [](uint32_t w) { return std::bit_cast<float>(std::byteswap(w)); };
   const uint32_t prev[] = {be(1.5f), be(10), 0x33333333, be(4), be(1.5f), 0x44444444};
   uint32_t cur[] = {be(2), be(20), 0x33333333, be(4), be(2), 0x44444444};
-  REQUIRE(LerpVertexFloats(prev, cur, 2, 3, 0b011, 0, 2, 0.5f));
+  REQUIRE(LerpVertexFloats(prev, cur, 2, 3, 0b011, {}, 2, 0.5f));
   REQUIRE(f(cur[0]) == 1.75f);
   REQUIRE(f(cur[1]) == 15.0f);
   REQUIRE(cur[2] == 0x33333333);
@@ -346,10 +404,10 @@ TEST_CASE("frame_interp lerps the float words of vertex data in guest byte order
   REQUIRE(f(cur[4]) == 1.75f);
 
   uint32_t recolored[] = {be(2), be(20), 0x55555555, be(4), be(2), 0x44444444};
-  REQUIRE(!LerpVertexFloats(prev, recolored, 2, 3, 0b011, 0, 2, 0.5f));  // another vertex
+  REQUIRE(!LerpVertexFloats(prev, recolored, 2, 3, 0b011, {}, 2, 0.5f));  // another vertex
   REQUIRE(f(recolored[0]) == 2.0f);
   uint32_t jumped[] = {be(100), be(20), 0x33333333, be(4), be(2), 0x44444444};
-  REQUIRE(!LerpVertexFloats(prev, jumped, 2, 3, 0b011, 0, 2, 0.5f));  // 1.5 -> 100
+  REQUIRE(!LerpVertexFloats(prev, jumped, 2, 3, 0b011, {}, 2, 0.5f));  // 1.5 -> 100
   REQUIRE(f(jumped[0]) == 100.0f);
 }
 
@@ -360,14 +418,54 @@ TEST_CASE("frame_interp lerps a fading vertex color per byte") {
   auto f = [](uint32_t w) { return std::bit_cast<float>(std::byteswap(w)); };
   const uint32_t prev[] = {be(1), be(2), 0xEBEEFF20, be(5), be(2), 0xEBEEFF20};
   uint32_t cur[] = {be(2), be(2), 0xEBEEFF10, be(6), be(2), 0xEBEEFF10};
-  REQUIRE(LerpVertexFloats(prev, cur, 2, 3, 0b011, 0b100, 2, 0.5f));
+  REQUIRE(LerpVertexFloats(prev, cur, 2, 3, 0b011, Packed(2, xenos::VertexFormat::k_8_8_8_8), 2, 0.5f));
   CHECK(f(cur[0]) == 1.5f);
   CHECK(cur[2] == 0xEBEEFF18);
   CHECK(f(cur[3]) == 5.5f);
   // A fade alone, the quad standing still, is not a sprite switch.
   uint32_t still[] = {be(1), be(2), 0xEBEEFF10, be(5), be(2), 0xEBEEFF10};
-  REQUIRE(LerpVertexFloats(prev, still, 2, 3, 0b011, 0b100, 2, 0.5f));
+  REQUIRE(LerpVertexFloats(prev, still, 2, 3, 0b011, Packed(2, xenos::VertexFormat::k_8_8_8_8), 2, 0.5f));
   CHECK(still[5] == 0xEBEEFF18);
+}
+
+TEST_CASE("frame_interp lerps a skinned vertex's packed normal per lane") {
+  // A CPU-skinned limb: position floats plus a signed 10:11:11 normal that
+  // turns every tick. Lanes (from the low bit, after the swap): 11, 11, 10.
+  auto be = [](float f) { return std::byteswap(std::bit_cast<uint32_t>(f)); };
+  auto normal = [](int32_t x, int32_t y, int32_t z) {
+    return std::byteswap((uint32_t(x) & 0x7FF) | (uint32_t(y) & 0x7FF) << 11 |
+                         (uint32_t(z) & 0x3FF) << 22);
+  };
+  PackedWords packed = Packed(1, xenos::VertexFormat::k_10_11_11);
+  packed.is_signed = 0b10;
+  const uint32_t prev[] = {be(1), normal(100, -200, 50)};
+  uint32_t cur[] = {be(3), normal(200, -100, -50)};
+  REQUIRE(LerpVertexFloats(prev, cur, 1, 2, 0b01, packed, 2, 0.5f));
+  CHECK(cur[1] == normal(150, -150, 0));
+  // Unlisted, the changed word is another vertex.
+  uint32_t other[] = {be(3), normal(200, -100, -50)};
+  CHECK(!LerpVertexFloats(prev, other, 1, 2, 0b01, {}, 2, 0.5f));
+}
+
+TEST_CASE("frame_interp turns tumbling debris instances") {
+  // Per-instance 3x4 matrices (translation in w), 16 floats each: one piece
+  // spins 120 degrees in a tick (its entries swing past a jump), another's
+  // slot is cleared. The piece turns 60 degrees; the cleared slot stays clear.
+  auto be = [](float f) { return std::byteswap(std::bit_cast<uint32_t>(f)); };
+  auto f = [](uint32_t w) { return std::bit_cast<float>(std::byteswap(w)); };
+  const float c = 1.5f * -0.5f, s = 1.5f * std::sqrt(0.75f);
+  const uint32_t prev[32] = {be(1.5f), 0, 0, be(3), 0, be(1.5f), 0, be(4), 0, 0, be(1.5f), be(5),
+                             0, 0, 0, be(1),
+                             be(1), 0, 0, be(7), 0, be(1), 0, be(8), 0, 0, be(1), be(9),
+                             0, 0, 0, be(1)};
+  uint32_t cur[32] = {be(c), be(-s), 0, be(5), be(s), be(c), 0, be(4), 0, 0, be(1.5f), be(5),
+                      0, 0, 0, be(1)};
+  REQUIRE(LerpVertexFloats(prev, cur, 2, 16, 0xFFFF, {}, 2, 0.5f));
+  CHECK(std::abs(f(cur[0]) - 0.75f) < 1e-4f);
+  CHECK(std::abs(f(cur[1]) + 1.5f * std::sqrt(0.75f)) < 1e-4f);
+  CHECK(std::abs(f(cur[10]) - 1.5f) < 1e-4f);
+  CHECK(f(cur[3]) == 4.0f);
+  CHECK(cur[16 + 3] == 0);
 }
 
 TEST_CASE("frame_interp keeps a sprite that switched atlas cells") {
@@ -386,10 +484,10 @@ TEST_CASE("frame_interp keeps a sprite that switched atlas cells") {
   std::vector<uint32_t> prev, name, scroll;
   quad(0.0f, prev);
   quad(0.2f, name);
-  REQUIRE(!LerpVertexFloats(prev.data(), name.data(), 4, 4, 0b1111, 0, 2, 0.5f));
+  REQUIRE(!LerpVertexFloats(prev.data(), name.data(), 4, 4, 0b1111, {}, 2, 0.5f));
   CHECK(f(name[3]) == 0.2f);
   quad(0.02f, scroll);
-  REQUIRE(LerpVertexFloats(prev.data(), scroll.data(), 4, 4, 0b1111, 0, 2, 0.5f));
+  REQUIRE(LerpVertexFloats(prev.data(), scroll.data(), 4, 4, 0b1111, {}, 2, 0.5f));
   CHECK(f(scroll[3]) == 0.01f);
 }
 
@@ -404,7 +502,7 @@ TEST_CASE("frame_interp lerps a particle that outran its own size") {
     prev.insert(prev.end(), {be(x), be(y), be(0.5f + x * 0.1f)});
     cur.insert(cur.end(), {be(x + 1.5f), be(y + 0.25f), be(0.5f + x * 0.1f)});
   }
-  REQUIRE(LerpVertexFloats(prev.data(), cur.data(), 4, 3, 0b111, 0, 2, 0.5f));
+  REQUIRE(LerpVertexFloats(prev.data(), cur.data(), 4, 3, 0b111, {}, 2, 0.5f));
   CHECK(f(cur[0]) == 0.75f);
 }
 
@@ -436,4 +534,79 @@ TEST_CASE("frame_interp swaps copies that traded the texture they set") {
   Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
   CHECK(cur.Float(b) == 13.25f);  // each with itself
   CHECK(cur.Float(a) == 10.25f);
+}
+
+TEST_CASE("frame_interp follows two faces that traded their expression textures") {
+  // Two fighters' faces of one mesh, each binding its expression texture; the
+  // expressions changed so that each now shows the other's last texture, and
+  // the second face's constants arrive split differently.
+  auto face = [](Stream& s, uint32_t texture, float x, bool split) {
+    s.Shaders(0x1000, 0x2000);
+    s.Put((1u << 16) | 0x4800);
+    s.Put(0x2);
+    s.Put(texture);
+    if (split) {
+      s.Constants(0x4000, {x, 0});
+      s.Constants(0x4002, {0, 1});
+    } else {
+      s.Constants(0x4000, {x, 0, 0, 1});
+    }
+    s.Draw(0x11);
+    return s.be.size() - (split ? 7 : 6);
+  };
+  Stream prev, cur;
+  face(prev, 0xA0000000, 10, false);
+  face(prev, 0xB0000000, 13, false);
+  const size_t a = face(cur, 0xB0000000, 10.5f, false);
+  const size_t b = face(cur, 0xA0000000, 13.5f, true);
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  CHECK(cur.Float(a) == 10.25f);  // each with itself
+  CHECK(cur.Float(b) == 13.25f);
+}
+
+TEST_CASE("frame_interp pairs a mesh drawn from moved index data") {
+  Stream prev, cur;
+  prev.Shaders(0x1000, 0x2000);
+  prev.Constants(0x4000, {10, 0, 0, 1});
+  prev.Type3(0x22, {0, 0x00300004, 0x100000, 0x30});  // DRAW_INDX: viz, initiator, base, size
+  cur.Shaders(0x1000, 0x2000);
+  cur.Constants(0x4000, {11, 0, 0, 1});
+  const size_t x = cur.be.size() - 4;
+  cur.Type3(0x22, {0, 0x00240004, 0x101000, 0x24});  // ring-allocated indices, fewer this tick
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Stats s = Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  CHECK(s.lerped == 2);
+  CHECK(cur.Float(x) == 10.5f);
+}
+
+TEST_CASE("frame_interp lerps particle quads whose list shifted") {
+  // Quads of 4 vertices (x, y, z, u, v); a particle born at the front this
+  // tick shifts the others one place on.
+  auto quads = [](std::vector<float> xs) {
+    std::vector<uint32_t> words;
+    for (float x : xs) {
+      for (int v = 0; v < 4; ++v) {
+        for (float f : {x + (v & 1), 1.0f, 2.0f, float(v >> 1), float(v & 1)}) {
+          words.push_back(std::bit_cast<uint32_t>(f));
+        }
+      }
+    }
+    return words;
+  };
+  const std::vector<uint32_t> prev = quads({0, 10, 20});
+  std::vector<uint32_t> cur = quads({100, 0.4f, 10.4f, 20.4f});
+  CHECK(!LerpVertexFloats(prev.data(), cur.data(), 12, 5, 0x1F, {}, 0, 0.5f));
+  CHECK(LerpPrimitives(prev.data(), 12, cur.data(), 16, 4, 5, 0x1F, {}, 0, 0.5f) == 3);
+  auto x = [&](int quad) { return std::bit_cast<float>(cur[quad * 20]); };
+  CHECK(x(0) == 100.0f);  // the newborn has no previous place
+  CHECK(x(1) == 0.2f);
+  CHECK(x(2) == 10.2f);
+  CHECK(x(3) == 20.2f);
 }

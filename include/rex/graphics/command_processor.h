@@ -291,6 +291,7 @@ class CommandProcessor {
   bool interp_held_pending_ = false;
   uint64_t interp_held_deadline_ = 0;  // host ticks
   uint64_t interp_last_swap_ = 0;      // host ticks of the previous real swap
+  uint64_t interp_period_ = 0;         // host ticks of the guest's tick (60 or 30 Hz)
   uint32_t interp_held_width_ = 0, interp_held_height_ = 0;
   std::vector<uint32_t> interp_cur_, interp_prev_, interp_work_, interp_regs_;
   std::vector<uint32_t> interp_start_regs_;  // registers when the frame's recording began
@@ -310,7 +311,8 @@ class CommandProcessor {
   // previous frame; the replay draws them lerped like the constants.
   struct InterpVertexStream {
     uint32_t packet, binding, start, bytes, stride_words, endian;
-    uint64_t float_words, byte_words;
+    uint64_t float_words;
+    frame_interp::PackedWords packed;
     size_t data;  // dword offset in the frame's data
   };
   std::vector<InterpVertexStream> interp_vs_cur_, interp_vs_prev_;
