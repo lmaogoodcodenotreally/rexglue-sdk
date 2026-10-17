@@ -139,7 +139,14 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
       break;
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
-      if (WindowSDL* window = GetWindow(event.key.windowID)) {
+      WindowSDL* window = GetWindow(event.key.windowID);
+      // TEMP DIAGNOSTIC: REX_INPUT_UNFOCUSED=1 routes keys posted to the
+      // unfocused window (SDL tags them with no window) to the only one.
+      static const bool unfocused = std::getenv("REX_INPUT_UNFOCUSED") != nullptr;
+      if (!window && unfocused && windows_.size() == 1) {
+        window = windows_.begin()->second;
+      }
+      if (window) {
         window->HandleKeyEvent(event);
       }
       break;

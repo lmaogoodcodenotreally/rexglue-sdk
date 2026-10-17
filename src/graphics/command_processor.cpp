@@ -41,6 +41,7 @@
 #include <rex/system/user_module.h>
 
 #include "wait_wake.h"
+#include <rex/ui/presenter.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
@@ -769,6 +770,38 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  // Shader constant runs (most of a frame's register writes, and all of a
+  // replay's lerped ones) go in bulk: only the span that changed is written,
+  // so re-emitted values leave the constant buffers clean.
+  if (!write_one_reg && base_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      base_index + count - 1 <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    const memory::RingBuffer::ReadRange range = reader->BeginRead(count * sizeof(uint32_t));
+    const uint32_t first_count = uint32_t(range.first_length / sizeof(uint32_t));
+    auto guest = [&](uint32_t i) {  // as stored, big-endian
+      uint32_t v;
+      std::memcpy(&v, i < first_count ? range.first + i * 4 : range.second + (i - first_count) * 4,
+                  sizeof(v));
+      return v;
+    };
+    const uint32_t* values = register_file_->values + base_index;
+    uint32_t lo = 0, hi = count;
+    while (lo < hi && std::byteswap(guest(lo)) == values[lo]) ++lo;
+    while (hi > lo && std::byteswap(guest(hi - 1)) == values[hi - 1]) --hi;
+    if (lo < std::min(hi, first_count)) {
+      WriteRegistersFromMem(base_index + lo,
+                            reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(range.first)) + lo,
+                            std::min(hi, first_count) - lo);
+    }
+    if (hi > first_count) {
+      const uint32_t from = std::max(lo, first_count);
+      WriteRegistersFromMem(
+          base_index + from,
+          reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(range.second)) + (from - first_count),
+          hi - from);
+    }
+    reader->EndRead(range);
+    return true;
+  }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
@@ -1042,6 +1075,60 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   return true;
 }
 
+// TEMP DIAGNOSTIC: REX_CAPTURE_FRAMES=<swap>,<swap>,... saves the guest output
+// (the game's own frame, no desktop) after the in-between ("i") and the real
+// ("r") present of those swaps, as 24-bit BMPs in opencode/cap.
+static uint32_t g_capture_swap = 0;
+static bool CaptureWanted(uint32_t swap) {
+  static const std::vector<uint32_t> wanted = [] {
+    std::vector<uint32_t> v;
+    if (const char* e = std::getenv("REX_CAPTURE_FRAMES")) {
+      for (const char* c = e; *c;) {
+        v.push_back(uint32_t(std::strtoul(c, const_cast<char**>(&c), 10)));
+        while (*c == ',') ++c;
+      }
+    }
+    return v;
+  }();
+  return std::find(wanted.begin(), wanted.end(), swap) != wanted.end();
+}
+static void CaptureGuest(GraphicsSystem* graphics_system, const char* kind, uint32_t swap) {
+  ui::Presenter* presenter = graphics_system ? graphics_system->presenter() : nullptr;
+  ui::RawImage image;
+  if (!presenter || !presenter->CaptureGuestOutput(image)) {
+    return;
+  }
+  const std::string path =
+      fmt::format("C:/Users/User/AppData/Local/Temp/opencode/cap/{}_{}.bmp", kind, swap);
+  FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) {
+    return;
+  }
+  const uint32_t row = (image.width * 3 + 3) & ~3u, size = 54 + row * image.height;
+  uint8_t header[54] = {'B', 'M'};
+  auto put = [&](uint32_t at, uint32_t v) { std::memcpy(header + at, &v, 4); };
+  put(2, size);
+  put(10, 54);
+  put(14, 40);
+  put(18, image.width);
+  put(22, image.height);
+  header[26] = 1;
+  header[28] = 24;
+  put(34, row * image.height);
+  std::fwrite(header, 1, 54, f);
+  std::vector<uint8_t> line(row);
+  for (uint32_t y = image.height; y-- > 0;) {
+    const uint8_t* src = image.data.data() + size_t(y) * image.stride;
+    for (uint32_t x = 0; x < image.width; ++x) {
+      line[x * 3 + 0] = src[x * 4 + 2];
+      line[x * 3 + 1] = src[x * 4 + 1];
+      line[x * 3 + 2] = src[x * 4 + 0];
+    }
+    std::fwrite(line.data(), 1, row, f);
+  }
+  std::fclose(f);
+}
+
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
@@ -1089,6 +1176,9 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
       SwapWithInterpolation(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
     } else {
       IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+      if (CaptureWanted(++g_capture_swap)) {  // TEMP DIAGNOSTIC
+        CaptureGuest(graphics_system_, "r", g_capture_swap);
+      }
       // TEMP DIAGNOSTIC: the same pacing line as frame_interp's, for comparison.
       static uint64_t last = 0, sum = 0, slow = 0, frames = 0;
       const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
@@ -1208,6 +1298,9 @@ void CommandProcessor::ServiceHeldSwap(bool force) {
   }
   interp_held_pending_ = false;
   PresentHeldSwapTexture(interp_held_width_, interp_held_height_);
+  if (CaptureWanted(g_capture_swap)) {  // TEMP DIAGNOSTIC
+    CaptureGuest(graphics_system_, "r", g_capture_swap);
+  }
 }
 
 void CommandProcessor::ReplayInterpolatedFrame() {
@@ -1381,15 +1474,22 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
     interpolate = !cut && HoldSwapTexture();
   }
   parse_budget.reset();
+  ++g_capture_swap;  // TEMP DIAGNOSTIC
   if (interpolate) {
     ReplayInterpolatedFrame();
     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+    if (CaptureWanted(g_capture_swap)) {  // TEMP DIAGNOSTIC
+      CaptureGuest(graphics_system_, "i", g_capture_swap);
+    }
     interp_held_width_ = frontbuffer_width;
     interp_held_height_ = frontbuffer_height;
     interp_held_deadline_ = rex::chrono::Clock::QueryHostTickCount() + period / 2;
     interp_held_pending_ = true;
   } else {
     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+    if (CaptureWanted(g_capture_swap)) {  // TEMP DIAGNOSTIC
+      CaptureGuest(graphics_system_, "r", g_capture_swap);
+    }
   }
 
   if (enabled) {

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstdlib>
 #include <cstring>
 #include <string_view>
 
@@ -255,6 +256,10 @@ X_RESULT MnkInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t flags,
   return X_ERROR_SUCCESS;
 }
 
+// TEMP DIAGNOSTIC: REX_INPUT_UNFOCUSED=1 takes keys posted to the window
+// without focus (automated menu runs; the user's own keys go elsewhere).
+static const bool g_unfocused_input = std::getenv("REX_INPUT_UNFOCUSED") != nullptr;
+
 X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   if (!IsEnabled() || id != kMnkDevice) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -265,7 +270,7 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   QueueMouseCaptureUpdate(IsEnabled() && REXCVAR_GET(mnk_mouse) && IsMouseLookActive() &&
                           has_focus_ && is_active());
 
-  if (!is_active() || !has_focus_) {
+  if (!is_active() || !(has_focus_ || g_unfocused_input)) {
     if (out_state) {
       std::memset(out_state, 0, sizeof(*out_state));
       out_state->packet_number = packet_number_;
@@ -490,7 +495,7 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
 }
 
 void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  if (!IsEnabled() || !(has_focus_ || g_unfocused_input))
     return;
   std::lock_guard lock(state_mutex_);
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());

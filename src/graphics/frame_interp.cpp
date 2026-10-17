@@ -765,7 +765,20 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
       for (uint32_t e = 0; e < seg.alu_end - seg.alu_begin; ++e) {
         const uint32_t co = cur.alu_offset[seg.alu_begin + e];
         uint64_t* rec = &lerped[cur.alu_reg[seg.alu_begin + e] - kAluFirst];
-        for (uint32_t d = 0; d < cur.alu_count[seg.alu_begin + e]; ++d) {
+        const uint32_t count = cur.alu_count[seg.alu_begin + e];
+        for (uint32_t d = 0; d < count; ++d) {
+          // Most constants did not change: skipped in bulk (recorded as they are).
+          if (same_layout && (!pass || turned.empty())) {
+            const uint32_t* c0 = cur_be + co;
+            const uint32_t to = uint32_t(
+                std::mismatch(c0 + d, c0 + count, prev_be + prev_of(e, 0) + d).first - c0);
+            for (; pass == 1 && d < to; ++d) {
+              const uint32_t cb = Load(cur_be, co + d);
+              rec[d] = uint64_t(cb) << 32 | cb;
+            }
+            d = to;
+            if (d == count) break;
+          }
           const uint32_t po = prev_of(e, d);
           const uint32_t cb = Load(cur_be, co + d);
           if (pass == 1) {
