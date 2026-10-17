@@ -24,6 +24,7 @@ namespace {
 constexpr uint32_t kAluFirst = 0x4000;  // SHADER_CONSTANT_000_X
 constexpr uint32_t kAluEnd = 0x4800;    // first fetch constant register
 constexpr uint32_t kFetchEnd = kAluEnd + 32 * 6;
+constexpr uint32_t kRbModeControl = 0x2208, kRbCopyDestBase = 0x2319;
 // Relative change of one constant between frames beyond which it is no motion.
 constexpr float kJump = 0.5f;
 // Absolute floor of that change: unit rotation matrix elements and normals
@@ -68,13 +69,33 @@ void Parse(const uint32_t* be, size_t n, ParsedFrame& out) {
   out.alu_offset.clear();
   out.alu_count.clear();
   out.alu_reg.clear();
-  uint64_t vs = 0, ps = 0, layout = 0, textures = 0;
+  uint64_t vs = 0, ps = 0, layout = 0, textures = 0, sampled = 0;
   uint32_t alu_begin = 0;
+  // A texture the frame rendered (resolved) itself is the same address for
+  // every image copied there (each menu icon, drawn then copied, then shown):
+  // it is told apart by the textures the last draw before the copy changed
+  // (not merely re-set: the first icon re-sets the whole block).
+  uint32_t mode = 0, copy_dest = 0;
+  uint64_t changed = 0, drawn = 0;
+  std::array<uint32_t, 32> bound{};
+  std::vector<std::pair<uint32_t, uint64_t>> resolved;  // copy destination, what was drawn
   auto close = [&](uint64_t draw, size_t packet) {
-    out.segments.push_back({Mix(draw, textures), draw, layout, alu_begin,
+    if (xenos::EdramMode(mode & 7) == xenos::EdramMode::kCopy) {
+      const uint32_t dest = copy_dest & 0xFFFFF000u;
+      auto r = std::find_if(resolved.begin(), resolved.end(),
+                            [&](const auto& x) { return x.first == dest; });
+      if (r == resolved.end()) r = resolved.insert(r, {dest, 0});
+      r->second = drawn;
+    } else {
+      drawn = changed;
+    }
+    out.segments.push_back({Mix(draw, textures), draw, sampled ? Mix(draw, sampled) : draw, layout,
+                            alu_begin,
                             uint32_t(out.alu_offset.size()), uint32_t(packet)});
     layout = 0;
     textures = 0;
+    sampled = 0;
+    changed = 0;
     alu_begin = uint32_t(out.alu_offset.size());
   };
   size_t i = 0;
@@ -106,7 +127,24 @@ void Parse(const uint32_t* be, size_t n, ParsedFrame& out) {
         for (uint32_t reg = std::max(base, kAluEnd); reg < fetch_last && i + 1 + (reg - base) < n;
              ++reg) {
           if ((reg - kAluEnd) % 6 == 1) {
-            textures = Mix(Mix(textures, reg), Load(be, i + 1 + (reg - base)) & 0xFFFFF000u);
+            const uint32_t texture = Load(be, i + 1 + (reg - base)) & 0xFFFFF000u;
+            textures = Mix(Mix(textures, reg), texture);
+            if (uint32_t& slot = bound[(reg - kAluEnd) / 6]; slot != texture) {
+              slot = texture;
+              changed = Mix(Mix(changed, reg), texture);
+            }
+            for (const auto& [dest, what] : resolved) {
+              if (dest == texture) {
+                textures = Mix(textures, what);
+                sampled = Mix(sampled, what);
+              }
+            }
+          }
+        }
+        for (uint32_t reg : {kRbModeControl, kRbCopyDestBase}) {
+          const size_t at = one_reg ? i + count : i + 1 + (reg - base);
+          if (reg >= base && reg < last && at < n) {
+            (reg == kRbModeControl ? mode : copy_dest) = Load(be, at);
           }
         }
         i += 1 + count;
@@ -256,6 +294,70 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
         sure[at] = is_sure;
         copies[at] = uint32_t(b - a);
       };
+      // Many copies (instanced meshes, particles: hundreds): candidates are
+      // searched outward along the constant that spreads the copies most (an
+      // instance position), as |its difference| bounds `distance` from below.
+      std::vector<std::pair<float, uint32_t>> axis;  // prev copies by its value
+      uint32_t axis_reg = 0;
+      if ((b - a) * size_t(pb - pa) >= 1024) {
+        // Ranked on a sample, then checked on every copy.
+        auto spread = [&](uint32_t reg, size_t step) {
+          float lo = std::numeric_limits<float>::infinity(), hi = -lo;
+          auto widen = [&](std::optional<float> v) {
+            if (v) {
+              lo = std::min(lo, *v);
+              hi = std::max(hi, *v);
+            }
+            return v.has_value();
+          };
+          for (size_t c = a; c < b; c += step) {
+            if (!widen(AxisValue(cur_be, cur, cur.segments[cur_order[c].second], reg))) return -1.0f;
+          }
+          for (size_t k = 0; k < size_t(pb - pa); k += step) {
+            if (!widen(AxisValue(prev_be, prev, prev.segments[pa[k].second], reg))) return -1.0f;
+          }
+          return hi - lo;
+        };
+        const auto& first = cur.segments[cur_order[a].second];
+        const size_t step = std::max<size_t>(1, (b - a + size_t(pb - pa)) / 32);
+        std::vector<std::pair<float, uint32_t>> ranked;
+        for (uint32_t e = first.alu_begin, flat = 0; e < first.alu_end && flat < 64;
+             flat += cur.alu_count[e++]) {
+          for (uint32_t d = 0; d < cur.alu_count[e] && flat + d < 64; ++d) {
+            if (const float s = spread(cur.alu_reg[e] + d, step); s > 0) {
+              ranked.emplace_back(s, cur.alu_reg[e] + d);
+            }
+          }
+        }
+        std::sort(ranked.rbegin(), ranked.rend());
+        for (size_t r = 0; r < std::min<size_t>(ranked.size(), 4) && !axis_reg; ++r) {
+          axis_reg = spread(ranked[r].second, 1) > 0 ? ranked[r].second : 0;
+        }
+      }
+      if (axis_reg) {
+        for (auto q = pa; q != pb; ++q) {
+          axis.emplace_back(*AxisValue(prev_be, prev, prev.segments[q->second], axis_reg), q->second);
+        }
+        std::sort(axis.begin(), axis.end());
+      }
+      // Visits the prev copies `visit` asks for, nearest on the axis first,
+      // until they are farther on it than `reach()`.
+      auto outward = [&](uint32_t at, auto reach, auto visit) {
+        if (axis.empty()) {
+          for (auto q = pa; q != pb && visit(q->second); ++q) {
+          }
+          return;
+        }
+        const float x = *AxisValue(cur_be, cur, cur.segments[at], axis_reg);
+        auto hi = std::lower_bound(axis.begin(), axis.end(), std::make_pair(x, 0u));
+        auto lo = hi;
+        while (lo != axis.begin() || hi != axis.end()) {
+          const float below = lo != axis.begin() ? x - (lo - 1)->first : std::numeric_limits<float>::infinity();
+          const float above = hi != axis.end() ? hi->first - x : std::numeric_limits<float>::infinity();
+          if (std::min(below, above) > reach()) break;
+          if (!visit(below <= above ? (--lo)->second : (hi++)->second)) break;
+        }
+      };
       // First every copy that its own occurrence fits within the margin of its
       // nearest, so that a copy that moved toward another's place does not
       // take that one's pair; then the rest, nearest among those left. Only
@@ -269,8 +371,11 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
               distance(cur.segments[at], prev.segments[occurrence->second],
                        std::numeric_limits<float>::infinity()) - kCopyMargin;
           bool nearer = false;
-          for (auto q = pa; q != pb && bound > 0 && !nearer; ++q) {
-            nearer = distance(cur.segments[at], prev.segments[q->second], bound) < bound;
+          if (bound > 0) {
+            outward(uint32_t(at), [&] { return bound; }, [&](uint32_t q) {
+              nearer = distance(cur.segments[at], prev.segments[q], bound) < bound;
+              return !nearer;
+            });
           }
           if (!nearer) {
             take(at, occurrence->second, sure_key);
@@ -292,74 +397,15 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
           found = true;
         }
       };
-      // Many copies left (instanced meshes: hundreds): candidates are searched
-      // outward along the constant that spreads the copies most (an instance
-      // position), as |its difference| bounds `distance` from below.
-      std::vector<std::pair<float, uint32_t>> axis;  // unused prev copies by its value
-      std::vector<uint32_t> left_cur, left_prev;
-      for (size_t c = a; c < b; ++c) {
-        if (match[cur_order[c].second] == kNone) left_cur.push_back(cur_order[c].second);
-      }
-      for (auto q = pa; q != pb; ++q) {
-        if (!used[q->second]) left_prev.push_back(q->second);
-      }
-      uint32_t axis_reg = 0;
-      if (left_cur.size() * left_prev.size() >= 1024) {
-        // Ranked on a sample, then checked on every copy left.
-        auto spread = [&](uint32_t reg, size_t step) {
-          float lo = std::numeric_limits<float>::infinity(), hi = -lo;
-          for (int f = 0; f < 2; ++f) {
-            const auto& left = f ? left_prev : left_cur;
-            for (size_t k = 0; k < left.size(); k += step) {
-              const auto v = f ? AxisValue(prev_be, prev, prev.segments[left[k]], reg)
-                               : AxisValue(cur_be, cur, cur.segments[left[k]], reg);
-              if (!v) return -1.0f;
-              lo = std::min(lo, *v);
-              hi = std::max(hi, *v);
-            }
-          }
-          return hi - lo;
-        };
-        const auto& first = cur.segments[left_cur[0]];
-        std::vector<std::pair<float, uint32_t>> ranked;
-        for (uint32_t e = first.alu_begin, flat = 0; e < first.alu_end && flat < 64;
-             flat += cur.alu_count[e++]) {
-          for (uint32_t d = 0; d < cur.alu_count[e] && flat + d < 64; ++d) {
-            const size_t step = std::max<size_t>(1, (left_cur.size() + left_prev.size()) / 32);
-            if (const float s = spread(cur.alu_reg[e] + d, step); s > 0) {
-              ranked.emplace_back(s, cur.alu_reg[e] + d);
-            }
-          }
-        }
-        std::sort(ranked.rbegin(), ranked.rend());
-        for (size_t r = 0; r < std::min<size_t>(ranked.size(), 4) && !axis_reg; ++r) {
-          axis_reg = spread(ranked[r].second, 1) > 0 ? ranked[r].second : 0;
-        }
-      }
-      if (axis_reg) {
-        for (const uint32_t q : left_prev) {
-          axis.emplace_back(*AxisValue(prev_be, prev, prev.segments[q], axis_reg), q);
-        }
-        std::sort(axis.begin(), axis.end());
-      }
       auto best_for = [&](uint32_t at, Option& best) {
         bool found = false;
-        if (axis.empty()) {
-          for (auto q = pa; q != pb; ++q) {
-            if (!used[q->second]) consider(at, q->second, found, best);
-          }
-          return found;
-        }
-        const float x = *AxisValue(cur_be, cur, cur.segments[at], axis_reg);
-        auto hi = std::lower_bound(axis.begin(), axis.end(), std::make_pair(x, 0u));
-        auto lo = hi;
-        while (lo != axis.begin() || hi != axis.end()) {
-          const float below = lo != axis.begin() ? x - (lo - 1)->first : std::numeric_limits<float>::infinity();
-          const float above = hi != axis.end() ? hi->first - x : std::numeric_limits<float>::infinity();
-          if (found && std::min(below, above) > std::get<0>(best)) break;
-          const uint32_t q = below <= above ? (--lo)->second : (hi++)->second;
-          if (!used[q]) consider(at, q, found, best);
-        }
+        outward(
+            at,
+            [&] { return found ? std::get<0>(best) : std::numeric_limits<float>::infinity(); },
+            [&](uint32_t q) {
+              if (!used[q]) consider(at, q, found, best);
+              return true;
+            });
         return found;
       };
       std::vector<Option> heap;
@@ -384,6 +430,10 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
     }
   };
   pair_by(&ParsedFrame::Segment::signature, true);
+  // Then by what a draw shows from textures the frame rendered itself: the
+  // textures it sets besides can change with the draw order (an icon drawn
+  // first re-sets a texture the others inherit).
+  pair_by(&ParsedFrame::Segment::content, false);
   // Then by the draw alone: which textures a draw sets itself depends on what
   // the draw before it left bound, which changes when draws are re-sorted.
   // Those pairings are guesses: a copy left over from the first pass is
@@ -585,44 +635,50 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
 }
 
 bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
-                      uint32_t stride_words, uint64_t float_words, uint32_t endian, float t) {
+                      uint32_t stride_words, uint64_t float_words, uint64_t byte_words,
+                      uint32_t endian, float t) {
   const auto e = xenos::Endian(endian);
-  for (uint32_t i = 0; i < vertices * stride_words; ++i) {
-    if (prev[i] == cur[i]) continue;
-    if (!((float_words >> (i % stride_words)) & 1)) {
-      return false;
-    }
-    const float c = std::bit_cast<float>(xenos::GpuSwap(cur[i], e));
-    const float p = std::bit_cast<float>(xenos::GpuSwap(prev[i], e));
-    if (std::isfinite(c) && std::isfinite(p) && Jumped(c, p)) {
-      return false;
+  auto load = [e](uint32_t word) { return std::bit_cast<float>(xenos::GpuSwap(word, e)); };
+  // One pass: every changed word is a float that did not jump; per float
+  // word, its extent over the vertices and how far it moved.
+  std::array<float, 64> lo, hi, moved;
+  lo.fill(std::numeric_limits<float>::infinity());
+  hi.fill(-std::numeric_limits<float>::infinity());
+  moved.fill(0);
+  uint64_t changed = 0, bytes_changed = 0;
+  for (uint32_t v = 0, i = 0; v < vertices; ++v) {
+    for (uint32_t w = 0; w < stride_words; ++w, ++i) {
+      const bool is_float = (float_words >> w) & 1;
+      if (!is_float) {
+        if (prev[i] != cur[i]) {
+          if (!((byte_words >> w) & 1)) {
+            return false;
+          }
+          bytes_changed |= uint64_t(1) << w;
+        }
+        continue;
+      }
+      const float c = load(cur[i]);
+      if (!std::isfinite(c)) continue;
+      if (prev[i] != cur[i]) {
+        const float p = load(prev[i]);
+        if (!std::isfinite(p)) continue;
+        if (Jumped(c, p)) {
+          return false;
+        }
+        changed |= uint64_t(1) << w;
+        moved[w] = std::max(moved[w], std::abs(c - p));
+      }
+      lo[w] = std::min(lo[w], c);
+      hi[w] = std::max(hi[w], c);
     }
   }
   // A sprite switched, not moved: every float word that changed (a texture
   // coordinate picking another atlas cell - a stage name, a digit) moved at
   // least its own extent over the vertices while the others (the position)
   // stayed put. In between would show the cell in between: kept as is.
-  std::array<float, 64> lo, hi, moved;
-  uint64_t still = float_words;
-  lo.fill(std::numeric_limits<float>::infinity());
-  hi.fill(-std::numeric_limits<float>::infinity());
-  moved.fill(0);
-  for (uint32_t v = 0; v < vertices; ++v) {
-    for (uint64_t m = float_words; m; m &= m - 1) {
-      const uint32_t w = uint32_t(std::countr_zero(m)), i = v * stride_words + w;
-      const float c = std::bit_cast<float>(xenos::GpuSwap(cur[i], e));
-      const float p = std::bit_cast<float>(xenos::GpuSwap(prev[i], e));
-      if (!std::isfinite(c) || !std::isfinite(p)) continue;
-      lo[w] = std::min(lo[w], c);
-      hi[w] = std::max(hi[w], c);
-      if (prev[i] != cur[i]) {
-        still &= ~(uint64_t(1) << w);
-        moved[w] = std::max(moved[w], std::abs(c - p));
-      }
-    }
-  }
-  bool switched = still != 0;
-  for (uint64_t m = float_words & ~still; switched && m; m &= m - 1) {
+  bool switched = changed && (float_words & ~changed) != 0;
+  for (uint64_t m = changed; switched && m; m &= m - 1) {
     const uint32_t w = uint32_t(std::countr_zero(m));
     switched = hi[w] > lo[w] && moved[w] >= hi[w] - lo[w];
   }
@@ -630,13 +686,22 @@ bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
     return false;
   }
   for (uint32_t v = 0; v < vertices; ++v, prev += stride_words, cur += stride_words) {
-    for (uint64_t m = float_words; m; m &= m - 1) {
+    for (uint64_t m = changed; m; m &= m - 1) {
       const uint32_t w = uint32_t(std::countr_zero(m));
       if (prev[w] == cur[w]) continue;
-      const float c = std::bit_cast<float>(xenos::GpuSwap(cur[w], e));
-      const float p = std::bit_cast<float>(xenos::GpuSwap(prev[w], e));
+      const float c = load(cur[w]), p = load(prev[w]);
       if (!std::isfinite(c) || !std::isfinite(p)) continue;
       cur[w] = xenos::GpuSwap(std::bit_cast<uint32_t>(p + (c - p) * t), e);
+    }
+    // Byte lanes stay byte lanes under every endian swap: lerped as stored.
+    for (uint64_t m = bytes_changed; m; m &= m - 1) {
+      const uint32_t w = uint32_t(std::countr_zero(m));
+      uint32_t out = 0;
+      for (uint32_t b = 0; b < 32; b += 8) {
+        const float p = float((prev[w] >> b) & 0xFF), c = float((cur[w] >> b) & 0xFF);
+        out |= uint32_t(std::lround(p + (c - p) * t)) << b;
+      }
+      cur[w] = out;
     }
   }
   return true;

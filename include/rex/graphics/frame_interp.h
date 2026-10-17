@@ -29,6 +29,10 @@ struct ParsedFrame {
   struct Segment {
     uint64_t signature;  // `draw` + the texture bases the segment sets
     uint64_t draw;       // shaders + draw initiator (+ index base) of the closing draw
+    // `draw` + what was drawn into the textures the frame rendered itself
+    // (resolved) that the segment sets: a menu icon copied to the one icon
+    // texture is told apart by the icon drawn there.
+    uint64_t content;
     uint64_t layout;     // the headers of the ALU-constant packets in the segment
     uint32_t alu_begin, alu_end;  // range in alu_offset / alu_count
     uint32_t packet;     // dword offset of the closing draw packet (the stream size for the tail)
@@ -71,13 +75,15 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
 // constants: lerps, in place in `cur`, the float32 words of each vertex (bit k
 // of `float_words` = word k of the `stride_words`-word vertex) from `prev`, as
 // Interpolate does. Words are as stored in guest memory, `endian` is the vertex
-// fetch constant's xenos::Endian. Non-finite values are kept. Returns false,
-// leaving `cur` as is, when the data does not correspond: a word outside
-// `float_words` (a packed color, say) differs, or a float jumped as
+// fetch constant's xenos::Endian. Non-finite values are kept. Words in
+// `byte_words` (8:8:8:8 colors: a fade) lerp per byte. Returns false,
+// leaving `cur` as is, when the data does not correspond: another word
+// (packed normals, indices) differs, or a float jumped as
 // Interpolate's constants would, or a sprite switched rather than moved (every
 // float that changed jumped by its own whole extent while another word stayed:
 // a texture coordinate picking another atlas cell under a quad standing still).
 bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
-                      uint32_t stride_words, uint64_t float_words, uint32_t endian, float t);
+                      uint32_t stride_words, uint64_t float_words, uint64_t byte_words,
+                      uint32_t endian, float t);
 
 }  // namespace rex::graphics::frame_interp

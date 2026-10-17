@@ -338,7 +338,7 @@ TEST_CASE("frame_interp lerps the float words of vertex data in guest byte order
   auto f = [](uint32_t w) { return std::bit_cast<float>(std::byteswap(w)); };
   const uint32_t prev[] = {be(1.5f), be(10), 0x33333333, be(4), be(1.5f), 0x44444444};
   uint32_t cur[] = {be(2), be(20), 0x33333333, be(4), be(2), 0x44444444};
-  REQUIRE(LerpVertexFloats(prev, cur, 2, 3, 0b011, 2, 0.5f));
+  REQUIRE(LerpVertexFloats(prev, cur, 2, 3, 0b011, 0, 2, 0.5f));
   REQUIRE(f(cur[0]) == 1.75f);
   REQUIRE(f(cur[1]) == 15.0f);
   REQUIRE(cur[2] == 0x33333333);
@@ -346,11 +346,28 @@ TEST_CASE("frame_interp lerps the float words of vertex data in guest byte order
   REQUIRE(f(cur[4]) == 1.75f);
 
   uint32_t recolored[] = {be(2), be(20), 0x55555555, be(4), be(2), 0x44444444};
-  REQUIRE(!LerpVertexFloats(prev, recolored, 2, 3, 0b011, 2, 0.5f));  // another vertex
+  REQUIRE(!LerpVertexFloats(prev, recolored, 2, 3, 0b011, 0, 2, 0.5f));  // another vertex
   REQUIRE(f(recolored[0]) == 2.0f);
   uint32_t jumped[] = {be(100), be(20), 0x33333333, be(4), be(2), 0x44444444};
-  REQUIRE(!LerpVertexFloats(prev, jumped, 2, 3, 0b011, 2, 0.5f));  // 1.5 -> 100
+  REQUIRE(!LerpVertexFloats(prev, jumped, 2, 3, 0b011, 0, 2, 0.5f));  // 1.5 -> 100
   REQUIRE(f(jumped[0]) == 100.0f);
+}
+
+TEST_CASE("frame_interp lerps a fading vertex color per byte") {
+  // A text quad's 8:8:8:8 color fading out while it moves: the color lerps per
+  // byte (as stored: lanes do not depend on the swap), the position as floats.
+  auto be = [](float f) { return std::byteswap(std::bit_cast<uint32_t>(f)); };
+  auto f = [](uint32_t w) { return std::bit_cast<float>(std::byteswap(w)); };
+  const uint32_t prev[] = {be(1), be(2), 0xEBEEFF20, be(5), be(2), 0xEBEEFF20};
+  uint32_t cur[] = {be(2), be(2), 0xEBEEFF10, be(6), be(2), 0xEBEEFF10};
+  REQUIRE(LerpVertexFloats(prev, cur, 2, 3, 0b011, 0b100, 2, 0.5f));
+  CHECK(f(cur[0]) == 1.5f);
+  CHECK(cur[2] == 0xEBEEFF18);
+  CHECK(f(cur[3]) == 5.5f);
+  // A fade alone, the quad standing still, is not a sprite switch.
+  uint32_t still[] = {be(1), be(2), 0xEBEEFF10, be(5), be(2), 0xEBEEFF10};
+  REQUIRE(LerpVertexFloats(prev, still, 2, 3, 0b011, 0b100, 2, 0.5f));
+  CHECK(still[5] == 0xEBEEFF18);
 }
 
 TEST_CASE("frame_interp keeps a sprite that switched atlas cells") {
@@ -369,10 +386,10 @@ TEST_CASE("frame_interp keeps a sprite that switched atlas cells") {
   std::vector<uint32_t> prev, name, scroll;
   quad(0.0f, prev);
   quad(0.2f, name);
-  REQUIRE(!LerpVertexFloats(prev.data(), name.data(), 4, 4, 0b1111, 2, 0.5f));
+  REQUIRE(!LerpVertexFloats(prev.data(), name.data(), 4, 4, 0b1111, 0, 2, 0.5f));
   CHECK(f(name[3]) == 0.2f);
   quad(0.02f, scroll);
-  REQUIRE(LerpVertexFloats(prev.data(), scroll.data(), 4, 4, 0b1111, 2, 0.5f));
+  REQUIRE(LerpVertexFloats(prev.data(), scroll.data(), 4, 4, 0b1111, 0, 2, 0.5f));
   CHECK(f(scroll[3]) == 0.01f);
 }
 
@@ -387,7 +404,7 @@ TEST_CASE("frame_interp lerps a particle that outran its own size") {
     prev.insert(prev.end(), {be(x), be(y), be(0.5f + x * 0.1f)});
     cur.insert(cur.end(), {be(x + 1.5f), be(y + 0.25f), be(0.5f + x * 0.1f)});
   }
-  REQUIRE(LerpVertexFloats(prev.data(), cur.data(), 4, 3, 0b111, 2, 0.5f));
+  REQUIRE(LerpVertexFloats(prev.data(), cur.data(), 4, 3, 0b111, 0, 2, 0.5f));
   CHECK(f(cur[0]) == 0.75f);
 }
 

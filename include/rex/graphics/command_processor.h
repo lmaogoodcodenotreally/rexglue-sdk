@@ -301,12 +301,16 @@ class CommandProcessor {
   uint64_t interp_stat_ticks_ = 0;     // real swap intervals summed, the guest tick check
   uint32_t interp_stat_slow_ = 0;      // real swap intervals over 17.5 ms
   uint32_t interp_stat_cuts_ = 0;      // frames not interpolated: most draws jumped
+  uint32_t interp_stat_skips_ = 0;     // frames not interpolated: no time left in the tick
+  // The budget: host ticks the CP worked (not waited) on the real frame, and
+  // what an in-between frame (pairing + replay) recently cost.
+  uint64_t interp_swap_end_ = 0, interp_swap_end_wait_ = 0, interp_cost_ = 0;
   // CPU-written float vertex streams of each draw (CPU-skinned meshes), by
   // recorded-stream packet, with a copy of their data, for this and the
   // previous frame; the replay draws them lerped like the constants.
   struct InterpVertexStream {
     uint32_t packet, binding, start, bytes, stride_words, endian;
-    uint64_t float_words;
+    uint64_t float_words, byte_words;
     size_t data;  // dword offset in the frame's data
   };
   std::vector<InterpVertexStream> interp_vs_cur_, interp_vs_prev_;
@@ -319,9 +323,9 @@ class CommandProcessor {
   uint64_t interp_vs_stat_[5] = {};
   uint64_t interp_pk_stat_[2] = {};  // TEMP DIAGNOSTIC: constant loads from memory, inline
   // TEMP DIAGNOSTIC: host ticks spent in vertex record, vertex replay, the
-  // replay, Parse + Interpolate; and the CP thread's non-waiting time.
+  // replay, Parse + Interpolate.
   uint64_t interp_budget_[4] = {};
-  uint64_t interp_wait_ticks_ = 0;
+  uint64_t interp_wait_ticks_ = 0;  // host ticks the CP thread waited, ever
   struct InterpBudgetScope {
     uint64_t& sum;
     uint64_t start;

@@ -1089,6 +1089,20 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
       SwapWithInterpolation(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
     } else {
       IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+      // TEMP DIAGNOSTIC: the same pacing line as frame_interp's, for comparison.
+      static uint64_t last = 0, sum = 0, slow = 0, frames = 0;
+      const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+      const uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
+      if (last && now - last < freq) {
+        sum += now - last;
+        slow += (now - last) * 2000 > freq * 35;
+        if (++frames == 600) {
+          REXGPU_INFO("swap pacing (no interp): 600 real frames in {} ms, {} over 17.5 ms",
+                      sum * 1000 / freq, slow);
+          sum = slow = frames = 0;
+        }
+      }
+      last = now;
     }
   }
 
@@ -1266,10 +1280,42 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
   const uint64_t interval = now - interp_last_swap_;
   const uint64_t period = std::clamp<uint64_t>(interval, freq / 60, freq / 30);
   interp_last_swap_ = now;
+  static uint64_t g_prev_real = 0, g_prev_cost = 0;  // TEMP DIAGNOSTIC: the guard's inputs
+  {  // TEMP DIAGNOSTIC: where a late frame's time went (since the previous swap).
+    static uint64_t last_budget[4] = {}, last_wait = 0;
+    static uint32_t logged = 0;
+    if (interval < freq && interval * 2000 > freq * 35 && logged < 400) {
+      ++logged;
+      auto us = [&](uint64_t ticks) { return ticks * 1000000 / freq; };
+      REXGPU_INFO("LATE frame {} us (frame before: real {} us, cost estimate {} us): "
+                  "vertex record {}, vertex replay {}, replay {}, parse {}, waiting {}, draws {}",
+                  interval * 1000000 / freq, g_prev_real * 1000000 / freq,
+                  g_prev_cost * 1000000 / freq,
+                  us(interp_budget_[0] - last_budget[0]),
+                  us(interp_budget_[1] - last_budget[1]), us(interp_budget_[2] - last_budget[2]),
+                  us(interp_budget_[3] - last_budget[3]), us(interp_wait_ticks_ - last_wait),
+                  interp_parsed_prev_.segments.size());
+    }
+    std::copy(std::begin(interp_budget_), std::end(interp_budget_), last_budget);
+    last_wait = interp_wait_ticks_;
+  }
 
-  const uint64_t parse_start = rex::chrono::Clock::QueryHostTickCount();  // TEMP DIAGNOSTIC
+  // What the CP worked on the real frame since the previous swap was done.
+  const uint64_t since = now - std::min(now, interp_swap_end_);
+  const uint64_t real_work = since - std::min(since, interp_wait_ticks_ - interp_swap_end_wait_);
+  g_prev_real = real_work;  // TEMP DIAGNOSTIC
+  g_prev_cost = interp_cost_;  // TEMP DIAGNOSTIC
+  const uint64_t parse_start = rex::chrono::Clock::QueryHostTickCount();
   frame_interp::Parse(interp_cur_.data(), interp_cur_.size(), interp_parsed_cur_);
   bool interpolate = enabled && interp_have_prev_ && !interp_cur_.empty();
+  // The guest's next tick must not wait for the CP: when the real frame
+  // left no room for an in-between one (the heaviest scenes), this frame
+  // shows without it rather than slow the game.
+  if (interpolate && real_work + interp_cost_ > period - period / 16) {
+    interpolate = false;
+    ++interp_stat_skips_;
+    interp_cost_ -= interp_cost_ / 16;  // an estimate from a heavier scene fades
+  }
   frame_interp::Stats stats;
   struct ParseBudget {  // TEMP DIAGNOSTIC: Parse + Interpolate
     uint64_t& sum;
@@ -1309,6 +1355,23 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
         }
       }
       ++dump_index;
+    }
+    // TEMP DIAGNOSTIC: REX_INTERP_DUMP_ALL=<frames> writes every frame's stream.
+    static int dump_all_left = [] {
+      const char* v = std::getenv("REX_INTERP_DUMP_ALL");
+      return v ? std::atoi(v) : 0;
+    }();
+    if (dump_all_left > 0) {
+      static int all_index = 0;
+      --dump_all_left;
+      REXGPU_INFO("IDUMP all {} segments {} matched {} lerped {} jumped {} cut {}", all_index,
+                  stats.segments, stats.matched, stats.lerped, stats.jumped, cut);
+      const std::string path = fmt::format(
+          "C:/Users/User/AppData/Local/Temp/opencode/iall/f_{}.bin", all_index++);
+      if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(interp_cur_.data(), 4, interp_cur_.size(), f);
+        std::fclose(f);
+      }
     }
     interp_stat_cuts_ += cut;
     interpolate = !cut && HoldSwapTexture();
@@ -1351,32 +1414,35 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
                     interp_pk_stat_[1] / 6);
         std::fill(std::begin(interp_vs_stat_), std::end(interp_vs_stat_), 0);
         std::fill(std::begin(interp_pk_stat_), std::end(interp_pk_stat_), 0);
-        REXGPU_INFO("frame_interp: replay state check: {} draws, {} with other fetch constants, "
-                    "{} with other render state (dump frames only)",
+        REXGPU_INFO("frame_interp: replay state check (dump frames): {} draws, {} with other fetch "
+                    "constants, {} with other render state",
                     interp_state_stat_[0], interp_state_stat_[1], interp_state_stat_[2]);
         std::fill(std::begin(interp_state_stat_), std::end(interp_state_stat_), 0);
         // TEMP DIAGNOSTIC: GPU thread budget, us per real frame (16667 = all of a 60 Hz tick).
+        static uint64_t window_wait = 0;
         auto us = [&](uint64_t ticks) { return ticks * 1000000 / freq / 600; };
         REXGPU_INFO("frame_interp: budget us/frame: vertex record {}, vertex replay {}, replay {}, "
                     "parse {}, restores {}, busy {}",
                     us(interp_budget_[0]), us(interp_budget_[1]), us(interp_budget_[2]),
                     us(interp_budget_[3]), us(shared_memory->interp_restore_ticks_),
-                    us(interp_stat_ticks_ - std::min(interp_stat_ticks_, interp_wait_ticks_)));
+                    us(interp_stat_ticks_ -
+                       std::min(interp_stat_ticks_, interp_wait_ticks_ - window_wait)));
         std::fill(std::begin(interp_budget_), std::end(interp_budget_), 0);
         shared_memory->interp_restore_ticks_ = 0;
-        interp_wait_ticks_ = 0;
+        window_wait = interp_wait_ticks_;
       }
       REXGPU_INFO(
-          "frame_interp: per frame {} draws, {} paired, {} lerped, {} jumped; {} cut frames; 600 "
-          "real frames in {} ms (10000 = 60 Hz), {} over 17.5 ms",
+          "frame_interp: per frame {} draws, {} paired, {} lerped, {} jumped; {} cut frames, {} "
+          "out of time; 600 real frames in {} ms (10000 = 60 Hz), {} over 17.5 ms",
           interp_stats_.segments / 600, interp_stats_.matched / 600, interp_stats_.lerped / 600,
-          interp_stats_.jumped / 600, interp_stat_cuts_, interp_stat_ticks_ * 1000 / freq,
-          interp_stat_slow_);
+          interp_stats_.jumped / 600, interp_stat_cuts_, interp_stat_skips_,
+          interp_stat_ticks_ * 1000 / freq, interp_stat_slow_);
       interp_stats_ = {};
       interp_stat_frames_ = 0;
       interp_stat_ticks_ = 0;
       interp_stat_slow_ = 0;
       interp_stat_cuts_ = 0;
+      interp_stat_skips_ = 0;
     }
   }
 
@@ -1400,6 +1466,12 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
     interp_start_bin_select_ = bin_select_;
     interp_start_bin_mask_ = bin_mask_;
   }
+  interp_swap_end_ = rex::chrono::Clock::QueryHostTickCount();
+  interp_swap_end_wait_ = interp_wait_ticks_;
+  if (interpolate) {  // the whole swap: pairing, replay, and submitting and showing both frames
+    const uint64_t cost = interp_swap_end_ - now;
+    interp_cost_ = interp_cost_ ? (interp_cost_ * 7 + cost) / 8 : cost;
+  }
   if (SharedMemory* shared_memory = InterpSharedMemory()) {
     shared_memory->InterpEndFrame();
     shared_memory->interp_recording_ = enabled;
@@ -1419,7 +1491,7 @@ CommandProcessor::InterpBudgetScope::~InterpBudgetScope() {
 
 void CommandProcessor::InterpCheckDrawState() {
   SharedMemory* shared_memory = InterpSharedMemory();
-  if (!interp_recording_ || !shared_memory) {
+  if (!interp_recording_ || !shared_memory || !shared_memory->interp_dump_) {
     return;
   }
   constexpr uint32_t kFetchFirst = 0x4800, kFetchCount = 32 * 6;
@@ -1513,6 +1585,7 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
              q != interp_vs_prev_.end() && q->packet == pair->second; ++q) {
           if (q->binding == s->binding && q->bytes == s->bytes &&
               q->stride_words == s->stride_words && q->float_words == s->float_words &&
+              q->byte_words == s->byte_words &&
               q->endian == s->endian) {
             p = &*q;
             break;
@@ -1551,7 +1624,8 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
       const uint32_t begin = first * s->stride_words, end = last * s->stride_words;
       interp_vs_scratch_.assign(cur + begin, cur + end);
       if (!frame_interp::LerpVertexFloats(prev + begin, interp_vs_scratch_.data(), last - first,
-                                          s->stride_words, s->float_words, s->endian, 0.5f)) {
+                                          s->stride_words, s->float_words, s->byte_words,
+                                          s->endian, 0.5f)) {
         ++interp_vs_stat_[4];
         if (shared_memory->interp_dump_) {  // TEMP DIAGNOSTIC
           // The first word that failed: outside the float mask, or a jump.
@@ -1612,9 +1686,13 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
     if (!binding.stride_words || binding.stride_words > 64) {
       continue;
     }
-    uint64_t float_words = 0;
+    uint64_t float_words = 0, byte_words = 0;
     for (const Shader::VertexBinding::Attribute& attribute : binding.attributes) {
       const auto& a = attribute.fetch_instr.attributes;
+      if (a.data_format == xenos::VertexFormat::k_8_8_8_8 && a.offset >= 0 &&
+          uint32_t(a.offset) < binding.stride_words) {
+        byte_words |= uint64_t(1) << a.offset;
+      }
       uint32_t count = 0;
       switch (a.data_format) {
         case xenos::VertexFormat::k_32_FLOAT:
@@ -1672,12 +1750,18 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
       std::memcpy(interp_vs_data_cur_.data() + copy->second, guest, lerp_bytes);
     }
     if (shared_memory->interp_dump_) {  // TEMP DIAGNOSTIC
-      REXGPU_INFO("IDUMP vstream pkt={} b={} at {:08X} bytes {} stride {} mask {:X}", packet,
-                  binding.binding_index, start, lerp_bytes, binding.stride_words, float_words);
+      std::string formats;  // offset:format of each attribute
+      for (const Shader::VertexBinding::Attribute& attribute : binding.attributes) {
+        formats += fmt::format(" {}:{}", int32_t(attribute.fetch_instr.attributes.offset),
+                               uint32_t(attribute.fetch_instr.attributes.data_format));
+      }
+      REXGPU_INFO("IDUMP vstream pkt={} b={} at {:08X} bytes {} stride {} mask {:X} attrs{}",
+                  packet, binding.binding_index, start, lerp_bytes, binding.stride_words,
+                  float_words, formats);
     }
     interp_vs_cur_.push_back({packet, uint32_t(binding.binding_index), start, lerp_bytes,
                               binding.stride_words, uint32_t(fetch.endian), float_words,
-                              copy->second});
+                              byte_words, copy->second});
   }
 }
 
