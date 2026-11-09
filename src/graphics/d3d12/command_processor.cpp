@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -75,6 +76,11 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_readback_some_async, true, "GPU/D3D12",
+                    "readback_resolve = some: copy misses into guest memory once the GPU is done "
+                    "instead of stalling the queue for each one (fighter texture baking)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
@@ -1666,6 +1672,7 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  ReleasePendingReadbacks();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -3024,10 +3031,42 @@ bool D3D12CommandProcessor::IssueCopy() {
   return IssueCopy_ReadbackResolvePath();
 }
 
+namespace {
+// Where the time of a readback resolve goes, summed and logged at most once a
+// second while readback misses happen. Fighters appearing trigger bursts of
+// first-time resolves (fighter texture baking), each one a miss.
+struct ReadbackTiming {
+  using Clock = std::chrono::steady_clock;
+  Clock::time_point window_start = Clock::now();
+  uint32_t resolves = 0, misses = 0, created = 0;
+  size_t pending = 0;  // deferred copies not yet in guest memory, at log time
+  double resolve_ms = 0, create_ms = 0, await_ms = 0;
+  static double Ms(Clock::time_point since) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - since).count();
+  }
+  void MaybeLog(size_t pending_now) {
+    if (Ms(window_start) < 1000.0) return;
+    pending = pending_now;
+    if (misses) {
+      REXGPU_INFO("Readback timing (1 s): {} resolves {:.1f} ms, {} misses awaited {:.1f} ms, "
+                  "{} buffers created {:.1f} ms, {} copies pending",
+                  resolves, resolve_ms, misses, await_ms, created, create_ms, pending);
+    }
+    *this = ReadbackTiming{};
+  }
+};
+ReadbackTiming readback_timing;  // command processor thread only
+}  // namespace
+
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
-  if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
-                                     written_length)) {
+  readback_timing.MaybeLog(pending_readbacks_.size());
+  const auto resolve_start = ReadbackTiming::Clock::now();
+  const bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                      written_address, written_length);
+  readback_timing.resolve_ms += ReadbackTiming::Ms(resolve_start);
+  ++readback_timing.resolves;
+  if (!resolved) {
     return false;
   }
 
@@ -3041,6 +3080,10 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
 
   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
   uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
+  if (!is_scaled && REXCVAR_GET(d3d12_readback_some_async) &&
+      GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve)) == ReadbackResolveMode::kSome) {
+    return IssueCopy_ReadbackSomeAsync(resolve_key, written_address, written_length);
+  }
   ReadbackBuffer& rb = readback_buffers_[resolve_key];
   rb.last_used_frame = frame_current_;
 
@@ -3048,6 +3091,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t size = AlignReadbackBufferSize(written_length);
 
   if (size > rb.sizes[write_index]) {
+    const auto create_start = ReadbackTiming::Clock::now();
+    ++readback_timing.created;
     const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
     ID3D12Device* device = provider.GetDevice();
     D3D12_RESOURCE_DESC buffer_desc;
@@ -3081,6 +3126,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       REXGPU_ERROR("Failed to persistently map resolve readback buffer");
       rb.mapped_data[write_index] = nullptr;
     }
+    readback_timing.create_ms += ReadbackTiming::Ms(create_start);
     // The other candidate owner of a DRED page-fault address: this buffer is the
     // destination of the resolve copy. Recorded so a fault VA can be attributed
     // to a resource and an offset instead of being left unexplained.
@@ -3254,7 +3300,11 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                            !rb.mapped_data[read_index])) {
     is_cache_miss = true;
     read_index = write_index;
-    if (!AwaitAllQueueOperationsCompletion()) {
+    const auto await_start = ReadbackTiming::Clock::now();
+    ++readback_timing.misses;
+    const bool awaited = AwaitAllQueueOperationsCompletion();
+    readback_timing.await_ms += ReadbackTiming::Ms(await_start);
+    if (!awaited) {
       return true;
     }
   }
@@ -3270,6 +3320,178 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
 
   rb.current_index = 1 - rb.current_index;
   return true;
+}
+
+// readback_resolve = "some" only ever writes a resolve into guest memory the
+// first time its key is seen (or after it aged out): a hit never reads the
+// copy. So a hit needs neither a buffer nor a GPU copy, and a miss needs its
+// bytes in guest memory, not a stall. Previously every miss created a readback
+// buffer (~6.5 ms) and drained the whole queue (~14 ms); fighters appearing
+// produce ~48 misses a second (texture baking), so the command processor spent
+// 0.7-1 s of every second stalled. Now the copy goes into a pooled buffer and
+// CompletePendingReadbacks writes it into guest memory once the GPU is done.
+bool D3D12CommandProcessor::IssueCopy_ReadbackSomeAsync(uint64_t resolve_key,
+                                                        uint32_t written_address,
+                                                        uint32_t written_length) {
+  // The map entry is only the "seen within kReadbackBufferEvictionAgeFrames"
+  // record now; EvictOldReadbackBuffers ages it out as before.
+  auto [it, inserted] = readback_buffers_.try_emplace(resolve_key);
+  it->second.last_used_frame = frame_current_;
+  if (!inserted) {
+    return true;
+  }
+  ++readback_timing.misses;
+
+  // Same guard as the synchronous path: past the shared memory buffer the copy
+  // would fault on the GPU instead of failing on the CPU.
+  if (uint64_t(written_address) + uint64_t(written_length) >
+      uint64_t(rex::graphics::SharedMemory::kBufferSize)) {
+    REXGPU_ERROR("Resolve copy out of range: source 0x{:08X} + 0x{:08X} exceeds shared memory "
+                 "0x{:08X} - copy skipped",
+                 written_address, written_length, rex::graphics::SharedMemory::kBufferSize);
+    return true;
+  }
+
+  PooledReadback buffer = AcquireReadbackBuffer(AlignReadbackBufferSize(written_length));
+  if (!buffer.resource) {
+    return true;
+  }
+  shared_memory_->UseAsCopySource();
+  SubmitBarriers();
+  deferred_command_list_.D3DCopyBufferRegion(buffer.resource, buffer.offset,
+                                             shared_memory_->GetBuffer(), written_address,
+                                             written_length);
+
+  // An older pending copy sharing pages with this one is superseded: its bytes
+  // would be overwritten anyway, and writing them later would trip this copy's
+  // watch as a CPU write and drop the newer data instead.
+  // Same granularity SharedMemory watches at (its page_size_log2_ is protected).
+  const uint32_t page_shift = rex::log2_ceil(uint32_t(rex::memory::page_size()));
+  const uint32_t page_first = written_address >> page_shift;
+  const uint32_t page_last = (written_address + written_length - 1) >> page_shift;
+  {
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    for (PendingReadback* older : pending_readbacks_) {
+      if (!older->skip && page_first <= ((older->address + older->length - 1) >> page_shift) &&
+          page_last >= (older->address >> page_shift)) {
+        older->skip = true;
+      }
+    }
+  }
+
+  auto* pending = new PendingReadback;
+  pending->buffer = buffer;
+  pending->address = written_address;
+  pending->length = written_length;
+  pending->submission = GetCurrentSubmission();
+  pending->watch = shared_memory_->WatchMemoryRange(
+      written_address, written_length, &PendingReadbackWatchCallback, this, pending, 0);
+  pending_readbacks_.push_back(pending);
+  return true;
+}
+
+// Called with the global critical region held; the handle is invalid afterwards.
+void D3D12CommandProcessor::PendingReadbackWatchCallback(
+    const std::unique_lock<std::recursive_mutex>& global_lock, void* context, void* data,
+    uint64_t argument, bool invalidated_by_gpu) {
+  auto* pending = static_cast<PendingReadback*>(data);
+  pending->watch = nullptr;
+  // A later resolve over the same range is ordered after this one (FIFO, and a
+  // newer miss supersedes it), so only a CPU write means "do not copy".
+  if (!invalidated_by_gpu) {
+    pending->skip = true;
+  }
+}
+
+void D3D12CommandProcessor::CompletePendingReadbacks() {
+  while (!pending_readbacks_.empty()) {
+    PendingReadback* pending = pending_readbacks_.front();
+    if (pending->submission > submission_completed_) {
+      break;
+    }
+    pending_readbacks_.pop_front();
+    bool skip;
+    {
+      // Unwatch and read the flag under the lock the callback runs under, so the
+      // handle cannot die between the check and the unwatch.
+      auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+      if (pending->watch) {
+        shared_memory_->UnwatchMemoryRange(pending->watch);
+        pending->watch = nullptr;
+      }
+      skip = pending->skip;
+    }
+    if (!skip) {
+      // Outside the lock, like the synchronous path: this write faults on the
+      // protected pages and the invalidation handler takes its own locks.
+      if (uint8_t* destination = memory_->TranslatePhysical(pending->address)) {
+        std::memcpy(destination, pending->buffer.mapped, pending->length);
+      }
+    }
+    // The GPU finished this submission, so the slot is free right away.
+    readback_pool_.push_back(pending->buffer);
+    delete pending;
+  }
+}
+
+void D3D12CommandProcessor::ReleasePendingReadbacks() {
+  {
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    for (PendingReadback* pending : pending_readbacks_) {
+      if (pending->watch) {
+        shared_memory_->UnwatchMemoryRange(pending->watch);
+      }
+    }
+  }
+  for (PendingReadback* pending : pending_readbacks_) {
+    delete pending;
+  }
+  pending_readbacks_.clear();
+  readback_pool_.clear();
+  for (ID3D12Resource* slab : readback_slabs_) {
+    slab->Unmap(0, nullptr);
+    slab->Release();
+  }
+  readback_slabs_.clear();
+}
+
+D3D12CommandProcessor::PooledReadback D3D12CommandProcessor::AcquireReadbackBuffer(uint32_t size) {
+  for (size_t i = 0; i < readback_pool_.size(); ++i) {
+    if (readback_pool_[i].size == size) {
+      PooledReadback slot = readback_pool_[i];
+      readback_pool_[i] = readback_pool_.back();
+      readback_pool_.pop_back();
+      return slot;
+    }
+  }
+  const auto create_start = ReadbackTiming::Clock::now();
+  ++readback_timing.created;
+  const uint32_t slot_count = std::max(kReadbackSlabSize / size, 1u);
+  const uint64_t slab_size = uint64_t(slot_count) * size;
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, slab_size, D3D12_RESOURCE_FLAG_NONE);
+  ID3D12Resource* slab = nullptr;
+  if (FAILED(provider.GetDevice()->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+          &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&slab)))) {
+    REXGPU_ERROR("Failed to create a {} MB readback slab", slab_size >> 20);
+    return {};
+  }
+  void* mapped = nullptr;
+  D3D12_RANGE read_range = {0, SIZE_T(slab_size)};
+  if (FAILED(slab->Map(0, &read_range, &mapped))) {
+    REXGPU_ERROR("Failed to map a readback slab");
+    slab->Release();
+    return {};
+  }
+  readback_slabs_.push_back(slab);
+  for (uint32_t i = 1; i < slot_count; ++i) {
+    readback_pool_.push_back(
+        {slab, uint64_t(i) * size, static_cast<uint8_t*>(mapped) + uint64_t(i) * size, size});
+  }
+  readback_timing.create_ms += ReadbackTiming::Ms(create_start);
+  return {slab, 0, mapped, size};
 }
 
 void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
@@ -3450,6 +3672,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // await the availability of the current frame.
   CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
                                         : 0);
+  CompletePendingReadbacks();
   // TODO(Triang3l): If failed to await (completed submission < awaited frame
   // submission), do something like dropping the draw command that wanted to
   // open the frame.

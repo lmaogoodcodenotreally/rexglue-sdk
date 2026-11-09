@@ -387,6 +387,38 @@ class D3D12CommandProcessor : public CommandProcessor {
   };
   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
 
+  // "some" readback without a queue stall per miss. A miss copies into a pooled
+  // buffer and the bytes reach guest memory once the GPU has finished that
+  // submission (CompletePendingReadbacks), unless the CPU wrote the range first.
+  struct PooledReadback {  // a slot in a readback slab
+    ID3D12Resource* resource = nullptr;  // the slab, owned by readback_slabs_
+    uint64_t offset = 0;
+    void* mapped = nullptr;  // already at offset
+    uint32_t size = 0;
+  };
+  struct PendingReadback {
+    PooledReadback buffer;
+    uint32_t address = 0, length = 0;
+    uint64_t submission = 0;
+    SharedMemory::WatchHandle watch = nullptr;  // nulled by the callback (handle dies with it)
+    bool skip = false;  // CPU wrote the range, or a newer miss covers it
+  };
+  bool IssueCopy_ReadbackSomeAsync(uint64_t resolve_key, uint32_t written_address,
+                                   uint32_t written_length);
+  void CompletePendingReadbacks();
+  void ReleasePendingReadbacks();  // shutdown: drop without copying
+  PooledReadback AcquireReadbackBuffer(uint32_t size);
+  static void PendingReadbackWatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                           void* context, void* data, uint64_t argument,
+                                           bool invalidated_by_gpu);
+  // One committed resource per slot cost ~7 ms each, and a fighter scene can
+  // queue 200+ copies before the GPU catches up. Slabs are kept until shutdown,
+  // so memory stays at the peak number of copies in flight.
+  static constexpr uint32_t kReadbackSlabSize = 16 * 1024 * 1024;
+  std::deque<PendingReadback*> pending_readbacks_;  // FIFO, submissions non-decreasing
+  std::vector<PooledReadback> readback_pool_;       // free slots; GPU is done with all of them
+  std::vector<ID3D12Resource*> readback_slabs_;
+
   // Hand a resource to the deferred-deletion queue instead of releasing it now.
   //
   // A deferred command list stores raw ID3D12Resource* with no AddRef, and a
