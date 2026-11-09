@@ -932,10 +932,26 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
   uint32_t unused_host_suspend_count = 0;
 
 #if REX_PLATFORM_WIN32
-  uint8_t previous_suspend_count =
-      reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count)->fetch_sub(1);
+  // Resuming a thread that is not suspended changes nothing, as on the console
+  // (and as the Linux branch below already does): a plain fetch_sub wrapped the
+  // count 0 -> 255, so the next suspend was lost, and the host thread was resumed
+  // anyway. From UFC3MONS (MIT), sdk-modified/beta12/runtime/xthread.cpp, "A15".
+  auto& suspend_count = *reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count);
+  uint8_t previous_suspend_count = suspend_count.load(std::memory_order_relaxed);
+  while (previous_suspend_count &&
+         !suspend_count.compare_exchange_weak(previous_suspend_count,
+                                              uint8_t(previous_suspend_count - 1))) {
+  }
   if (out_suspend_count) {
     *out_suspend_count = previous_suspend_count;
+  }
+  if (!previous_suspend_count) {
+    static std::atomic<uint64_t> running_resumes{0};
+    const uint64_t n = ++running_resumes;
+    if ((n & (n - 1)) == 0) {  // log at 1, 2, 4, 8, ...
+      REXSYS_WARN("Resume of a running thread ignored (count {})", n);
+    }
+    return X_STATUS_SUCCESS;
   }
   return thread_->Resume(&unused_host_suspend_count) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
 #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
