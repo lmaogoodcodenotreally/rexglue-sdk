@@ -60,7 +60,8 @@ ContentPackage::~ContentPackage() {
 }
 
 void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_path) {
-  if (!std::filesystem::exists(header_path)) {
+  std::error_code ec;  // long paths must not throw out of the kernel (from UFC3MONS, MIT)
+  if (!std::filesystem::exists(header_path, ec)) {
     return;
   }
 
@@ -69,8 +70,8 @@ void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_p
     return;
   }
 
-  auto file_size = std::filesystem::file_size(header_path);
-  if (file_size < sizeof(XCONTENT_AGGREGATE_DATA) + sizeof(license_)) {
+  auto file_size = std::filesystem::file_size(header_path, ec);
+  if (ec || file_size < sizeof(XCONTENT_AGGREGATE_DATA) + sizeof(license_)) {
     fclose(file);
     return;
   }
@@ -228,7 +229,8 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
   auto header_file_path = ResolvePackageHeaderPath(file_name, xuid, title_id, content_type);
   constexpr uint32_t header_size = sizeof(XCONTENT_AGGREGATE_DATA);
 
-  if (!std::filesystem::exists(header_file_path)) {
+  std::error_code ec;  // long paths must not throw out of the kernel (from UFC3MONS, MIT)
+  if (!std::filesystem::exists(header_file_path, ec)) {
     return X_ERROR_FILE_NOT_FOUND;
   }
 
@@ -237,8 +239,8 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
     return X_ERROR_FILE_NOT_FOUND;
   }
 
-  auto file_size = std::filesystem::file_size(header_file_path);
-  if (file_size < header_size) {
+  auto file_size = std::filesystem::file_size(header_file_path, ec);
+  if (ec || file_size < header_size) {
     fclose(file);
     return X_ERROR_FILE_NOT_FOUND;
   }
