@@ -9,9 +9,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
+#include <string_view>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
@@ -35,6 +38,126 @@ namespace {
 
 // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
 constexpr uint32_t kRumbleDurationMs = 0xFFFF;
+
+const char* JoystickTypeName(SDL_JoystickType t) {
+  switch (t) {
+    case SDL_JOYSTICK_TYPE_UNKNOWN:
+      return "Unknown";
+    case SDL_JOYSTICK_TYPE_GAMEPAD:
+      return "Gamepad";
+    case SDL_JOYSTICK_TYPE_WHEEL:
+      return "Wheel";
+    case SDL_JOYSTICK_TYPE_ARCADE_STICK:
+      return "ArcadeStick";
+    case SDL_JOYSTICK_TYPE_FLIGHT_STICK:
+      return "FlightStick";
+    case SDL_JOYSTICK_TYPE_DANCE_PAD:
+      return "DancePad";
+    case SDL_JOYSTICK_TYPE_GUITAR:
+      return "Guitar";
+    case SDL_JOYSTICK_TYPE_DRUM_KIT:
+      return "DrumKit";
+    case SDL_JOYSTICK_TYPE_ARCADE_PAD:
+      return "ArcadePad";
+    case SDL_JOYSTICK_TYPE_THROTTLE:
+      return "Throttle";
+    default:
+      return "?";
+  }
+}
+
+const char* XInputSubTypeName(uint8_t s) {
+  switch (s) {
+    case XINPUT_DEVSUBTYPE_GAMEPAD:
+      return "GAMEPAD";
+    case XINPUT_DEVSUBTYPE_WHEEL:
+      return "WHEEL";
+    case XINPUT_DEVSUBTYPE_ARCADE_STICK:
+      return "ARCADE_STICK";
+    case XINPUT_DEVSUBTYPE_FLIGHT_STICK:
+      return "FLIGHT_STICK";
+    case XINPUT_DEVSUBTYPE_DANCE_PAD:
+      return "DANCE_PAD";
+    case XINPUT_DEVSUBTYPE_GUITAR:
+      return "GUITAR";
+    case XINPUT_DEVSUBTYPE_GUITAR_ALTERNATE:
+      return "GUITAR_ALTERNATE";
+    case XINPUT_DEVSUBTYPE_DRUM_KIT:
+      return "DRUM_KIT";
+    case XINPUT_DEVSUBTYPE_GUITAR_BASS:
+      return "GUITAR_BASS";
+    case XINPUT_DEVSUBTYPE_ARCADE_PAD:
+      return "ARCADE_PAD";
+    default:
+      return "?";
+  }
+}
+
+// 'needle' must be lowercase ASCII.
+bool NameContainsCI(const char* name, std::string_view needle) {
+  if (!name || needle.empty()) {
+    return false;
+  }
+  const std::string_view haystack(name);
+  return std::search(
+             haystack.begin(), haystack.end(), needle.begin(), needle.end(), [](char a, char b) {
+               return std::tolower(static_cast<unsigned char>(a)) == static_cast<unsigned char>(b);
+             }) != haystack.end();
+}
+
+// SDL_JoystickType numbering diverges from XINPUT_DEVSUBTYPE_* past value 6,
+// so it cannot simply be cast.
+uint8_t SdlTypeToXInputSubType(SDL_JoystickType t, const char* name) {
+  switch (t) {
+    case SDL_JOYSTICK_TYPE_GAMEPAD:
+      // SDL's XInput backend bakes the SubType into the device name, e.g.
+      // "XInput Guitar #1".
+      if (NameContainsCI(name, "guitar")) {
+        return XINPUT_DEVSUBTYPE_GUITAR;
+      }
+      if (NameContainsCI(name, "drum")) {
+        return XINPUT_DEVSUBTYPE_DRUM_KIT;
+      }
+      if (NameContainsCI(name, "wheel")) {
+        return XINPUT_DEVSUBTYPE_WHEEL;
+      }
+      if (NameContainsCI(name, "dancepad") || NameContainsCI(name, "dance pad")) {
+        return XINPUT_DEVSUBTYPE_DANCE_PAD;
+      }
+      if (NameContainsCI(name, "flightstick") || NameContainsCI(name, "flight stick") ||
+          NameContainsCI(name, "hotas")) {
+        return XINPUT_DEVSUBTYPE_FLIGHT_STICK;
+      }
+      if (NameContainsCI(name, "arcadepad") || NameContainsCI(name, "arcade pad")) {
+        return XINPUT_DEVSUBTYPE_ARCADE_PAD;
+      }
+      if (NameContainsCI(name, "arcade")) {
+        return XINPUT_DEVSUBTYPE_ARCADE_STICK;
+      }
+      return XINPUT_DEVSUBTYPE_GAMEPAD;
+    case SDL_JOYSTICK_TYPE_WHEEL:
+      return XINPUT_DEVSUBTYPE_WHEEL;
+    case SDL_JOYSTICK_TYPE_ARCADE_STICK:
+      return XINPUT_DEVSUBTYPE_ARCADE_STICK;
+    case SDL_JOYSTICK_TYPE_FLIGHT_STICK:
+      return XINPUT_DEVSUBTYPE_FLIGHT_STICK;
+    case SDL_JOYSTICK_TYPE_DANCE_PAD:
+      return XINPUT_DEVSUBTYPE_DANCE_PAD;
+    case SDL_JOYSTICK_TYPE_GUITAR:
+      return XINPUT_DEVSUBTYPE_GUITAR;
+    case SDL_JOYSTICK_TYPE_DRUM_KIT:
+      return XINPUT_DEVSUBTYPE_DRUM_KIT;
+    case SDL_JOYSTICK_TYPE_ARCADE_PAD:
+      return XINPUT_DEVSUBTYPE_ARCADE_PAD;
+    default:
+      return XINPUT_DEVSUBTYPE_GAMEPAD;
+  }
+}
+
+uint8_t GamepadSubType(SDL_Gamepad* gamepad) {
+  return SdlTypeToXInputSubType(SDL_GetJoystickType(SDL_GetGamepadJoystick(gamepad)),
+                                SDL_GetGamepadName(gamepad));
+}
 
 }  // namespace
 
@@ -121,7 +244,7 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
               SDL_AddGamepadMappingsFromFile(REXCVAR_GET(hid_mappings_file).c_str());
           if (mappings_result < 0) {
             REXLOG_ERROR("SDL GameControllerDB: error loading file '{}': {}.",
-                         REXCVAR_GET(hid_mappings_file), mappings_result);
+                         REXCVAR_GET(hid_mappings_file), SDL_GetError());
           } else {
             REXLOG_INFO("SDL GameControllerDB: loaded {} mappings.", mappings_result);
           }
@@ -171,8 +294,13 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
   for (const auto& controller : controllers_) {
     DeviceInfo info;
     info.id = controller.id;
-    info.name = controller.name;
-    info.guid = controller.guid;
+    const char* name = SDL_GetGamepadName(controller.sdl);
+    info.name = name ? name : "";
+    char guid_text[33] = {};
+    SDL_GUIDToString(SDL_GetJoystickGUID(SDL_GetGamepadJoystick(controller.sdl)), guid_text,
+                     static_cast<int>(sizeof(guid_text)));
+    info.guid = guid_text;
+    info.subtype = GamepadSubType(controller.sdl);
     info.synthetic = false;
     out.push_back(info);
   }
@@ -448,6 +576,9 @@ std::unique_lock<std::mutex> SDLInputDriver::DrainAndLock() {
 
 void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
   switch (event.type) {
+    case SDL_EVENT_JOYSTICK_ADDED:
+      OnJoystickDeviceAddedLocked(event);
+      break;
     case SDL_EVENT_GAMEPAD_ADDED: {
       const SDL_JoystickID which = event.gdevice.which;
       PostToWorker([this, which]() { OpenPadOnWorker(which); });
@@ -585,6 +716,35 @@ void SDLInputDriver::ClosePadOnWorker(SDL_JoystickID instance_id) {
   REXLOG_INFO("SDL OnControllerDeviceRemoved: {} device(s) remain.", remaining.size());
 }
 
+void SDLInputDriver::OnJoystickDeviceAddedLocked(const SDL_Event& event) {
+  // Devices SDL cannot promote to a gamepad, such as some guitars and drum
+  // kits, never reach the gamepad event and would otherwise vanish silently.
+  const SDL_JoystickID id = event.jdevice.which;
+  const char* name = SDL_GetJoystickNameForID(id);
+  char guid_text[33] = {};
+  SDL_GUIDToString(SDL_GetJoystickGUIDForID(id), guid_text, static_cast<int>(sizeof(guid_text)));
+  const bool is_gamepad = SDL_IsGamepad(id);
+  REXLOG_INFO(
+      "SDL JoystickAdded: \"{}\", VendorID(0x{:04X}), ProductID(0x{:04X}), GUID({}), "
+      "HasGamepadMapping({})",
+      name ? name : "?", SDL_GetJoystickVendorForID(id), SDL_GetJoystickProductForID(id), guid_text,
+      is_gamepad);
+  if (!is_gamepad) {
+    REXLOG_WARN(
+        "SDL JoystickAdded: \"{}\" has no gamepad mapping, so it will not be usable. Add one to "
+        "the file named by --hid_mappings_file.",
+        name ? name : "?");
+  }
+}
+
+void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
+  OpenPadOnWorker(event.gdevice.which);
+}
+
+void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
+  ClosePadOnWorker(event.gdevice.which);
+}
+
 void SDLInputDriver::FlushRumbleOnWorker() {
   // Cleared first so a guest call landing mid-flush queues another pass.
   rumble_queued_ = false;
@@ -718,7 +878,7 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
   static_assert(SDL_GAMEPAD_BUTTON_SOUTH == 0);
   static_assert(SDL_GAMEPAD_BUTTON_DPAD_RIGHT == 14);
 
-  auto idx = GetControllerIndexFromInstanceID(event.gdevice.which);
+  auto idx = GetControllerIndexFromInstanceID(event.gbutton.which);
   if (!idx) {
     // The pad can be removed between the event being posted and drained.
     return;
@@ -789,9 +949,16 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
   // should not be a problem, when in doubt disable the RAWINPUT driver via hint
   // (env var).
 
-  if (SDL_GetJoystickConnectionState(SDL_GetGamepadJoystick(state.sdl)) ==
-      SDL_JOYSTICK_CONNECTION_WIRELESS) {
+  SDL_Joystick* joystick = SDL_GetGamepadJoystick(state.sdl);
+  if (SDL_GetJoystickConnectionState(joystick) == SDL_JOYSTICK_CONNECTION_WIRELESS) {
     cap_flags |= X_INPUT_CAPS_WIRELESS;
+  } else {
+    // Backends leaving the connection state UNKNOWN still report power.
+    const SDL_PowerState power_state = SDL_GetJoystickPowerInfo(joystick, nullptr);
+    if (power_state == SDL_POWERSTATE_ON_BATTERY || power_state == SDL_POWERSTATE_CHARGING ||
+        power_state == SDL_POWERSTATE_CHARGED) {
+      cap_flags |= X_INPUT_CAPS_WIRELESS;
+    }
   }
 
   // Check if all navigational buttons are present
@@ -807,8 +974,8 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
   }
 
   auto& c = state.caps;
-  c.type = 0x01;      // XINPUT_DEVTYPE_GAMEPAD
-  c.sub_type = 0x01;  // XINPUT_DEVSUBTYPE_GAMEPAD
+  c.type = XINPUT_DEVTYPE_GAMEPAD;
+  c.sub_type = GamepadSubType(state.sdl);
   c.flags = cap_flags;
   c.gamepad.buttons = 0xF3FF | (REXCVAR_GET(guide_button) ? X_INPUT_GAMEPAD_GUIDE : 0x0);
   c.gamepad.left_trigger = 0xFF;

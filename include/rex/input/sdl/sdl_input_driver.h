@@ -110,6 +110,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void ClosePadOnWorker(SDL_JoystickID instance_id);
   void FlushRumbleOnWorker();
   void RefreshCapsOnWorker();
+  void OnJoystickDeviceAddedLocked(const SDL_Event& event);
+  void OnControllerDeviceAddedLocked(const SDL_Event& event);
+  void OnControllerDeviceRemovedLocked(const SDL_Event& event);
   void OnControllerDeviceAxisMotionLocked(const SDL_Event& event);
   void OnControllerDeviceButtonChangedLocked(const SDL_Event& event);
 
