@@ -184,11 +184,14 @@ bool ReXApp::SetupEnvironment() {
     log_level_str = "trace";
 
   auto category_levels = rex::ParseCategoryLevelsFromConfig(config_path_);
-  auto log_config = rex::BuildLogConfig(log_file_cvar.empty() ? nullptr : log_file_cvar.c_str(),
-                                        log_level_str, category_levels);
+  // v0.10.1: BuildLogConfig takes (cli_level, category_levels); the log file is
+  // assigned afterwards, as src/rexglue/main.cpp does.
+  auto log_config = rex::BuildLogConfig(log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
     log_config.log_dir = (exe_dir / "logs").string();
+  } else {
+    log_config.log_file = log_file_cvar;
   }
 
   rex::InitLogging(log_config);
@@ -354,7 +357,9 @@ bool ReXApp::SetupPresentation() {
   }
 
   // Create window
-  window_ = rex::ui::Window::Create(app_context(), GetName(), 1280, 720);
+  // v0.10.1: Create() resolves the logical size itself from the window_width /
+  // window_height cvars, falling back to the current video mode.
+  window_ = rex::ui::Window::Create(app_context(), GetName());
   if (!window_) {
     REXLOG_ERROR("Failed to create window");
     return false;

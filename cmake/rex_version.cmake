@@ -193,3 +193,35 @@ function(rex_resolve_version out_var)
         BRANCH_NAME "${branch_name}")
     set(${out_var} "${result}" PARENT_SCOPE)
 endfunction()
+
+#==========================================================
+# rexglue_add_version_resource(<target> [DESCRIPTION <text>])
+#
+# Embeds a Win32 VERSIONINFO resource in a shipped SDK binary. Restored from
+# 9dea59f ("build: embed a version resource in shipped SDK binaries"), which
+# was lost from this file in a later merge while its three call sites
+# (src/graphics, src/rexglue, src/system) stayed - so configuring the SDK from
+# a clean tree failed with "Unknown CMake command".
+#
+# Set REXGLUE_DISABLE_VERSION_RESOURCE to skip it (the DOA4 lean preset does).
+#==========================================================
+function(rexglue_add_version_resource target_name)
+    if(NOT WIN32 OR REXGLUE_DISABLE_VERSION_RESOURCE)
+        return()
+    endif()
+    cmake_parse_arguments(PARSE_ARGV 1 ARG "" "DESCRIPTION" "")
+    get_target_property(_type ${target_name} TYPE)
+    if(_type STREQUAL "EXECUTABLE")
+        set(REX_RC_FILETYPE 0x1)
+    else()
+        set(REX_RC_FILETYPE 0x2)
+    endif()
+    set(REX_RC_FILE_VERSION
+        "${REXGLUE_DERIVED_MAJOR},${REXGLUE_DERIVED_MINOR},${REXGLUE_DERIVED_PATCH},${REXGLUE_DERIVED_TWEAK}")
+    set(REX_RC_VERSION_STRING "${REXGLUE_FULL_VERSION}")
+    set(REX_RC_TARGET "${target_name}")
+    set(REX_RC_DESCRIPTION "${ARG_DESCRIPTION}")
+    set(_rc_file "${CMAKE_CURRENT_BINARY_DIR}/rexglue_rc/${target_name}.rc")
+    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/version.rc.in" "${_rc_file}" @ONLY)
+    target_sources(${target_name} PRIVATE "${_rc_file}")
+endfunction()
