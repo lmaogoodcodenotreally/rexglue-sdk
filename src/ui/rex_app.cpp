@@ -108,17 +108,21 @@ bool ReXApp::OnInitialize() {
 bool ReXApp::SetupEnvironment() {
   auto exe_dir = rex::filesystem::GetExecutableFolder();
 
+  // cvar strings hold UTF-8 (the entry point converts the wide command line).
+  // Assigning one straight to a std::filesystem::path decodes it in the system
+  // ANSI codepage on Windows, so an accented path turned into a directory that
+  // does not exist. rex::to_path() does the UTF-8 -> UTF-16 conversion.
   std::filesystem::path game_dir;
   std::string game_data_cvar = REXCVAR_GET(game_data_root);
   if (!game_data_cvar.empty()) {
-    game_dir = game_data_cvar;
+    game_dir = rex::to_path(game_data_cvar);
   }
 
   // User data: cvar override, or platform user directory
   std::filesystem::path user_dir;
   std::string user_data_cvar = REXCVAR_GET(user_data_root);
   if (!user_data_cvar.empty()) {
-    user_dir = user_data_cvar;
+    user_dir = rex::to_path(user_data_cvar);
   } else {
     user_dir = rex::filesystem::GetUserFolder() / GetName();
   }
@@ -127,14 +131,14 @@ bool ReXApp::SetupEnvironment() {
   std::filesystem::path update_dir;
   std::string update_data_cvar = REXCVAR_GET(update_data_root);
   if (!update_data_cvar.empty()) {
-    update_dir = update_data_cvar;
+    update_dir = rex::to_path(update_data_cvar);
   }
 
   // Cache: cvar override, or user_dir/cache
   std::filesystem::path cache_dir;
   std::string cache_root_cvar = REXCVAR_GET(cache_root);
   if (!cache_root_cvar.empty()) {
-    cache_dir = cache_root_cvar;
+    cache_dir = rex::to_path(cache_root_cvar);
   } else {
     cache_dir = user_dir / "cache";
   }
@@ -142,7 +146,7 @@ bool ReXApp::SetupEnvironment() {
   std::filesystem::path metadata_dir;
   std::string metadata_root_cvar = REXCVAR_GET(metadata_root);
   if (!metadata_root_cvar.empty()) {
-    metadata_dir = metadata_root_cvar;
+    metadata_dir = rex::to_path(metadata_root_cvar);
   }
 
   PathConfig path_config{game_dir,  user_dir,     update_dir,
@@ -164,7 +168,7 @@ bool ReXApp::SetupEnvironment() {
   // game_data_root was ignored. Take it now (relative = beside the exe), else
   // fall back to a game\ folder beside the exe.
   if (resolved_defaults_.game_data_root.empty()) {
-    std::filesystem::path config_game_dir = REXCVAR_GET(game_data_root);
+    std::filesystem::path config_game_dir = rex::to_path(REXCVAR_GET(game_data_root));
     if (config_game_dir.empty() && std::filesystem::is_directory(exe_dir / "game")) {
       config_game_dir = "game";
     }
