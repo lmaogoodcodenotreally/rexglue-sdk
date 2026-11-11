@@ -18,6 +18,7 @@
 #include <utility>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
@@ -31,6 +32,10 @@
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+REXCVAR_DEFINE_BOOL(d3d12_texture_heaps, true, "GPU/D3D12",
+                    "Place textures in shared heaps instead of one allocation per texture")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::d3d12 {
 
@@ -1427,6 +1432,12 @@ D3D12TextureCache::D3D12Texture::~D3D12Texture() {
   for (const auto& descriptor_pair : srv_descriptors_) {
     d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
   }
+  // TextureCache only destroys a texture after its last submission completed,
+  // so these blocks can be reused immediately.
+  for (uint32_t i = 0; heap_slot_.heap && i < heap_slot_.count; ++i) {
+    assert_true(heap_slot_.heap->used[heap_slot_.first + i]);
+    heap_slot_.heap->used[heap_slot_.first + i] = false;
+  }
 }
 
 bool D3D12TextureCache::IsDecompressionNeeded(xenos::TextureFormat format, uint32_t width,
@@ -1548,13 +1559,76 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   ID3D12Device* device = provider.GetDevice();
   // Assuming untiling will be the next operation.
   D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COPY_DEST;
-  Microsoft::WRL::ComPtr<ID3D12Resource> resource;
-  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+  TextureHeapSlot heap_slot;
+  Microsoft::WRL::ComPtr<ID3D12Resource> resource =
+      REXCVAR_GET(d3d12_texture_heaps) ? CreatePlacedTexture(desc, resource_state, heap_slot)
+                                       : nullptr;
+  if (!resource &&
+      FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
                                              provider.GetHeapFlagCreateNotZeroed(), &desc,
                                              resource_state, nullptr, IID_PPV_ARGS(&resource)))) {
     return nullptr;
   }
-  return std::unique_ptr<Texture>(new D3D12Texture(*this, key, resource.Get(), resource_state));
+  auto texture = std::make_unique<D3D12Texture>(*this, key, resource.Get(), resource_state);
+  texture->set_heap_slot(heap_slot);
+  return texture;
+}
+
+Microsoft::WRL::ComPtr<ID3D12Resource> D3D12TextureCache::CreatePlacedTexture(
+    const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state, TextureHeapSlot& slot) {
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  const D3D12_RESOURCE_ALLOCATION_INFO info = device->GetResourceAllocationInfo(0, 1, &desc);
+  if (info.SizeInBytes == UINT64_MAX || info.SizeInBytes > kTextureHeapMaxPlacedSize ||
+      info.Alignment > kTextureHeapBlockSize) {
+    return nullptr;
+  }
+  const uint32_t count =
+      uint32_t((info.SizeInBytes + kTextureHeapBlockSize - 1) / kTextureHeapBlockSize);
+
+  // First fit over the free blocks.
+  TextureHeap* heap = nullptr;
+  uint32_t first = 0;
+  for (auto& candidate : texture_heaps_) {
+    uint32_t run = 0;
+    for (uint32_t i = 0; i < kTextureHeapBlocks && !heap; ++i) {
+      run = candidate->used[i] ? 0 : run + 1;
+      if (run == count) {
+        heap = candidate.get();
+        first = i + 1 - count;
+      }
+    }
+    if (heap) break;
+  }
+  if (!heap) {
+    D3D12_HEAP_DESC heap_desc = {};
+    heap_desc.SizeInBytes = uint64_t(kTextureHeapBlocks) * kTextureHeapBlockSize;
+    heap_desc.Properties = ui::d3d12::util::kHeapPropertiesDefault;
+    heap_desc.Flags =
+        D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | provider.GetHeapFlagCreateNotZeroed();
+    auto created = std::make_unique<TextureHeap>();
+    if (FAILED(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&created->heap)))) {
+      REXGPU_ERROR("Failed to create a texture heap");
+      return nullptr;
+    }
+    heap = created.get();
+    texture_heaps_.push_back(std::move(created));
+    REXGPU_INFO("Texture heap {} created ({} MB in total)", texture_heaps_.size(),
+                texture_heaps_.size() * (heap_desc.SizeInBytes >> 20));
+  }
+
+  Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+  if (FAILED(device->CreatePlacedResource(heap->heap.Get(),
+                                          uint64_t(first) * kTextureHeapBlockSize, &desc, state,
+                                          nullptr, IID_PPV_ARGS(&resource)))) {
+    return nullptr;
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    assert_false(heap->used[first + i]);
+    heap->used[first + i] = true;
+  }
+  slot = {heap, first, count};
+  return resource;
 }
 
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,

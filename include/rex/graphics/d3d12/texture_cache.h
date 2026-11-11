@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <bitset>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -223,6 +224,25 @@ class D3D12TextureCache final : public TextureCache {
     uint32_t swizzle;
   };
 
+  // Textures placed in shared heaps. A committed resource per texture blocks the
+  // command processor in the kernel for ~7 ms each until the allocation is ready;
+  // fighter scenes create hundreds at once (a 2.9 s frame was 90% this wait).
+  static constexpr uint32_t kTextureHeapBlockSize = 64 * 1024;
+  static constexpr uint32_t kTextureHeapBlocks = 1024;  // 64 MB heaps
+  static constexpr uint64_t kTextureHeapMaxPlacedSize = 16 * 1024 * 1024;
+  struct TextureHeap {
+    Microsoft::WRL::ComPtr<ID3D12Heap> heap;
+    std::bitset<kTextureHeapBlocks> used;
+  };
+  struct TextureHeapSlot {
+    TextureHeap* heap = nullptr;  // null: committed resource
+    uint32_t first = 0, count = 0;
+  };
+  // Null if the texture cannot be placed; the caller falls back to committed.
+  Microsoft::WRL::ComPtr<ID3D12Resource> CreatePlacedTexture(const D3D12_RESOURCE_DESC& desc,
+                                                             D3D12_RESOURCE_STATES state,
+                                                             TextureHeapSlot& slot);
+
   class D3D12Texture final : public Texture {
    public:
     union SRVDescriptorKey {
@@ -252,6 +272,7 @@ class D3D12TextureCache final : public TextureCache {
     ~D3D12Texture();
 
     ID3D12Resource* resource() const { return resource_.Get(); }
+    void set_heap_slot(const TextureHeapSlot& slot) { heap_slot_ = slot; }
 
     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
       D3D12_RESOURCE_STATES old_state = resource_state_;
@@ -271,6 +292,7 @@ class D3D12TextureCache final : public TextureCache {
    private:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
+    TextureHeapSlot heap_slot_;
     std::unique_ptr<D3D12Texture> texture_3d_as_2d_;
 
     // For bindful - indices in the non-shader-visible descriptor cache for
@@ -527,6 +549,7 @@ class D3D12TextureCache final : public TextureCache {
                 "two 2 GB buffers");
   // Resident portions of the tiled buffer.
   std::vector<Microsoft::WRL::ComPtr<ID3D12Heap>> scaled_resolve_heaps_;
+  std::vector<std::unique_ptr<TextureHeap>> texture_heaps_;  // command processor thread only
   // Number of currently resident portions of the tiled buffer, for profiling.
   uint32_t scaled_resolve_heap_count_ = 0;
   // Current scaled resolve state.
