@@ -14,10 +14,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -479,6 +482,27 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
+
+  // d3d12_async_submission: a worker records each ended submission's deferred
+  // command list into command_list_ and executes it, so the driver's recording
+  // overlaps this thread's translation. Submissions keep their order; a swap
+  // (the presenter signals its own fence right after) and direct queue
+  // signals wait for the worker to drain.
+  struct SubmitJob {
+    std::unique_ptr<DeferredCommandList> list;
+    ID3D12CommandAllocator* allocator;
+    uint64_t fence_value;
+  };
+  void SubmitWorkerMain();
+  void DrainSubmitWorker();
+  void StopSubmitWorker();
+  std::thread submit_thread_;
+  std::mutex submit_mutex_;
+  std::condition_variable submit_cv_, submit_done_cv_;
+  std::deque<SubmitJob> submit_queue_;
+  std::vector<std::unique_ptr<DeferredCommandList>> submit_free_lists_;
+  uint32_t submit_pending_ = 0;
+  bool submit_stop_ = false;
 
   bool debug_markers_enabled_ = false;
 

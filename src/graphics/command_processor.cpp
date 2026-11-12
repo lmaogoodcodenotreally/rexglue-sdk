@@ -50,6 +50,10 @@ REXCVAR_DEFINE_BOOL(frame_interp, false, "GPU",
                     "constants halfway to the previous frame and present that between real "
                     "frames (2x the displayed frame rate; the guest's own tick is unchanged).");
 
+REXCVAR_DEFINE_BOOL(frame_interp_diag, false, "GPU",
+                    "Frame interpolation diagnostics: detailed logs of late frames, unpaired "
+                    "and jumped vertex streams, and one frame in 600 in full.");
+
 REXCVAR_DEFINE_BOOL(precise_vsync, true, "GPU",
                     "Precise frame pacing: deadline-paced vblank generation + event-driven "
                     "wake (WaitOnAddress) for WAIT_REG_MEM memory polls. Off = legacy "
@@ -1334,7 +1338,14 @@ void CommandProcessor::ReplayInterpolatedFrame() {
   memory::RingBuffer reader(reinterpret_cast<uint8_t*>(interp_work_.data()),
                             interp_work_.size() * sizeof(uint32_t));
   reader.set_write_offset(interp_work_.size() * sizeof(uint32_t));
+  size_t submitted_at = 0;
   do {
+    // Hand the replay to the host GPU in pieces, as the guest's own buffer
+    // ends do for real frames, so recording them overlaps the rest.
+    if (reader.read_offset() - submitted_at >= 64 * 1024) {
+      submitted_at = reader.read_offset();
+      OnPrimaryBufferEnd();
+    }
     if (shared_memory) {
       shared_memory->interp_packet_ = uint32_t(reader.read_offset() / sizeof(uint32_t));
       shared_memory->InterpApplyUploads(shared_memory->interp_packet_);
@@ -1381,7 +1392,8 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
   {  // TEMP DIAGNOSTIC: where a late frame's time went (since the previous swap).
     static uint64_t last_budget[4] = {}, last_wait = 0;
     static uint32_t logged = 0;
-    if (interval < freq && interval * 2000 > freq * 35 && logged < 400) {
+    if (REXCVAR_GET(frame_interp_diag) && interval < freq && interval * 2000 > freq * 35 &&
+        logged < 400) {
       ++logged;
       auto us = [&](uint64_t ticks) { return ticks * 1000000 / freq; };
       REXGPU_INFO("LATE frame {} us (frame before: real {} us, cost estimate {} us): "
@@ -1431,48 +1443,9 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
     // 1 in 15. A missed cut flashes the whole frame, a false one just shows
     // the real frame once.
     const bool cut = stats.jumped * 8 > stats.matched;
-    // TEMP DIAGNOSTIC: also dump frames where a copy of a mesh jumped (at
-    // most one a second, 40 a run).
-    static uint32_t suspect_dumps = 0, suspect_wait = 0;
-    suspect_wait -= suspect_wait != 0;
-    const bool suspect = stats.suspect && !cut && !suspect_wait && suspect_dumps < 40;
-    if (suspect) {
-      ++suspect_dumps;
-      suspect_wait = 60;
-    }
-    if (SharedMemory* sm = InterpSharedMemory(); sm && (sm->interp_dump_ || suspect)) {
-      REXGPU_INFO("IDUMP swap segments {} matched {} lerped {} jumped {} suspect {} cut {}",
-                  stats.segments, stats.matched, stats.lerped, stats.jumped, stats.suspect, cut);
-      // TEMP DIAGNOSTIC: both raw streams, for offline pairing analysis.
-      static int dump_index = 0;
-      const std::pair<const char*, const std::vector<uint32_t>*> files[] = {
-          {"prev", &interp_prev_}, {"cur", &interp_cur_}};
-      for (const auto& [name, data] : files) {
-        const std::string path =
-            fmt::format("C:/Users/User/AppData/Local/Temp/opencode/istream_{}_{}.bin", dump_index, name);
-        if (FILE* f = std::fopen(path.c_str(), "wb")) {
-          std::fwrite(data->data(), 4, data->size(), f);
-          std::fclose(f);
-        }
-      }
-      ++dump_index;
-    }
-    // TEMP DIAGNOSTIC: REX_INTERP_DUMP_ALL=<frames> writes every frame's stream.
-    static int dump_all_left = [] {
-      const char* v = std::getenv("REX_INTERP_DUMP_ALL");
-      return v ? std::atoi(v) : 0;
-    }();
-    if (dump_all_left > 0) {
-      static int all_index = 0;
-      --dump_all_left;
-      REXGPU_INFO("IDUMP all {} segments {} matched {} lerped {} jumped {} cut {}", all_index,
-                  stats.segments, stats.matched, stats.lerped, stats.jumped, cut);
-      const std::string path = fmt::format(
-          "C:/Users/User/AppData/Local/Temp/opencode/iall/f_{}.bin", all_index++);
-      if (FILE* f = std::fopen(path.c_str(), "wb")) {
-        std::fwrite(interp_cur_.data(), 4, interp_cur_.size(), f);
-        std::fclose(f);
-      }
+    if (SharedMemory* sm = InterpSharedMemory(); sm && sm->interp_dump_) {
+      REXGPU_INFO("IDUMP swap segments {} matched {} lerped {} jumped {} cut {}", stats.segments,
+                  stats.matched, stats.lerped, stats.jumped, cut);
     }
     interp_stat_cuts_ += cut;
     interpolate = !cut && HoldSwapTexture();
@@ -1584,7 +1557,8 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
     shared_memory->InterpEndFrame();
     shared_memory->interp_recording_ = enabled;
     // TEMP DIAGNOSTIC: the next frame and its replay, once per stats window.
-    shared_memory->interp_dump_ = enabled && interp_stat_frames_ == 300;
+    shared_memory->interp_dump_ =
+        enabled && REXCVAR_GET(frame_interp_diag) && interp_stat_frames_ == 300;
   if (shared_memory->interp_dump_) {
       REXGPU_INFO("IDUMP begin");
     }
@@ -1684,7 +1658,7 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
   if (interp_replaying_) {
     static int vs_diag_left = 0;  // TEMP DIAGNOSTIC: streams left unlerped, 100 per window
     if (interp_stat_frames_ == 0) {
-      vs_diag_left = 100;
+      vs_diag_left = REXCVAR_GET(frame_interp_diag) ? 100 : 0;
     }
     auto pair = std::lower_bound(interp_pairs_.begin(), interp_pairs_.end(),
                                  std::make_pair(packet, uint32_t(0)));
@@ -1807,17 +1781,6 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
                       s->start, p->start, s->bytes, s->stride_words, s->float_words, first, last, bad, (begin + bad) / s->stride_words,
                       (begin + bad) % s->stride_words, bad < end - begin ? pw[bad] : 0,
                       bad < end - begin ? cw[bad] : 0);
-          // TEMP DIAGNOSTIC: the first 40 jumped streams, prev then cur, whole.
-          static int vj_files = 0;
-          if (vj_files < 40) {
-            if (FILE* f = std::fopen(fmt::format("C:/Users/User/AppData/Local/Temp/opencode/vj/"
-                                                 "{}_{:X}_s{}.bin", vj_files++, s->start,
-                                                 s->stride_words).c_str(), "wb")) {
-              std::fwrite(prev, 4, words, f);
-              std::fwrite(cur, 4, words, f);
-              std::fclose(f);
-            }
-          }
           // TEMP DIAGNOSTIC: the whole failing vertex and the one before, as floats.
           if (bad < end - begin) {
             const uint32_t v0 = bad / s->stride_words;

@@ -852,7 +852,6 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
     }
     if (jumped) {
       ++stats.jumped;
-      stats.suspect += copies[i] > 2;  // TEMP DIAGNOSTIC
       if (!sure[i] || copies[i] > 1) {
         borrow(seg, nullptr);
         continue;
