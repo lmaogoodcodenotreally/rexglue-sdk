@@ -964,9 +964,10 @@ bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
         }
         continue;
       }
+      if (prev[i] == cur[i]) continue;
       const float c = load(cur[i]);
       if (!std::isfinite(c)) continue;
-      if (prev[i] != cur[i]) {
+      {
         const float p = load(prev[i]);
         if (!std::isfinite(p)) continue;
         if (Jumped(c, p)) {
@@ -984,6 +985,20 @@ bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
         changed |= uint64_t(1) << w;
         moved[w] = std::max(moved[w], std::abs(c - p));
       }
+    }
+  }
+  // The extents over the vertices, only of the words the rules below judge.
+  const uint64_t judged =
+      ((float_words & ~changed) ? changed : 0) | (changed & packed.uv_words);
+  for (uint32_t v = 0, next_cleared = 0; judged && v < vertices; ++v) {
+    if (next_cleared < cleared.size() && cleared[next_cleared] == v) {
+      ++next_cleared;
+      continue;
+    }
+    for (uint64_t m = judged; m; m &= m - 1) {
+      const uint32_t w = uint32_t(std::countr_zero(m));
+      const float c = load(cur[v * stride_words + w]);
+      if (!std::isfinite(c)) continue;
       lo[w] = std::min(lo[w], c);
       hi[w] = std::max(hi[w], c);
     }

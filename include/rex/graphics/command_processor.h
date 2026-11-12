@@ -286,6 +286,11 @@ class CommandProcessor {
 
   // Frame interpolation state (CP thread only).
   bool interp_recording_ = false;  // frame_interp, sampled at each swap
+  // A swap whose pairing and replay wait for the guest's fences after it
+  // (RunPendingInterpSwap): frontbuffer ptr, width, height.
+  bool interp_swap_pending_ = false;
+  uint32_t interp_swap_args_[3] = {};
+  void RunPendingInterpSwap();
   bool interp_replaying_ = false;
   bool interp_have_prev_ = false;
   bool interp_held_pending_ = false;

@@ -678,6 +678,9 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
       break;
     }
   } while (reader.read_count());
+  if (interp_swap_pending_) {  // the guest's next commands are not in yet
+    RunPendingInterpSwap();
+  }
 
   {
     // TEMP DIAGNOSTIC: submission/fence/present work at end-of-buffer.
@@ -724,7 +727,21 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
   } while (reader.read_count());
 }
 
+void CommandProcessor::RunPendingInterpSwap() {
+  interp_swap_pending_ = false;
+  SwapWithInterpolation(interp_swap_args_[0], interp_swap_args_[1], interp_swap_args_[2]);
+}
+
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  if (interp_swap_pending_) {
+    memory::RingBuffer peek = *reader;
+    const uint32_t next = peek.ReadAndSwap<uint32_t>();
+    const bool fence = next >> 30 == 3 && !(next & 1) &&
+                       ((next >> 8) & 0x7F) == PM4_EVENT_WRITE_SHD;
+    if (next && next >> 30 != 2 && !fence) {
+      RunPendingInterpSwap();
+    }
+  }
   // TEMP DIAGNOSTIC: one count per packet dispatch (incl. zero-padded words),
   // to compute per-packet overhead for the retail perf partition.
   PERF_counter_inc(kGpuPackets);
@@ -1177,7 +1194,16 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   {
     ScopedUsCounter gpu_present_scope(rex::perf::CounterId::kGpuPresentUs);  // TEMP DIAGNOSTIC
     if (REXCVAR_GET(frame_interp) || interp_recording_) {
-      SwapWithInterpolation(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+      // The guest's fences right after the swap (EVENT_WRITE_SHD, past the
+      // NOP padding that ends the swap's indirect buffer) go first: its main
+      // thread polls them, so they must not wait out the pairing and replay.
+      // They land in this frame's stream, whose fences the replay skips.
+      ++counter_;
+      interp_swap_pending_ = true;
+      interp_swap_args_[0] = frontbuffer_ptr;
+      interp_swap_args_[1] = frontbuffer_width;
+      interp_swap_args_[2] = frontbuffer_height;
+      return true;
     } else {
       IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
       if (CaptureWanted(++g_capture_swap)) {  // TEMP DIAGNOSTIC
