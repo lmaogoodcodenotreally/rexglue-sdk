@@ -374,6 +374,11 @@ class Presenter {
   // Requests (re)painting with the UI if there's UI to draw.
   void RequestUIPaintFromUIThread();
 
+  // Whether the guest has refreshed its output in the last 100 ms. While it
+  // has, UI-only repaints wait for the next guest frame instead of the next
+  // vblank (WaitForUITickFromUIThread).
+  bool IsGuestOutputRefreshing() const;
+
  protected:
   enum class PaintResult {
     kPresented,
@@ -976,6 +981,8 @@ class Presenter {
   // Accessible only by refreshing, whether the last refresh contained an image
   // rather than being blank.
   bool guest_output_active_last_refresh_ = false;
+  // Host tick of the last guest output refresh, for IsGuestOutputRefreshing.
+  std::atomic<uint64_t> guest_output_last_refresh_tick_{0};
 
   // Ordered by the Z order, and then by the time of addition.
   // Note: All the iteration logic involving this Z ordering must be the same as
@@ -994,6 +1001,9 @@ class Presenter {
   bool is_in_ui_thread_paint_ = false;
   bool request_guest_output_paint_after_current_ui_thread_paint_;
   bool request_ui_paint_after_current_ui_thread_paint_;
+  // A UI drawer asked for a repaint (RequestUIPaintFromUIThread) since the last
+  // UI tick wait; only such repaints wait for the next guest frame.
+  bool ui_repaint_requested_by_drawer_ = false;
 
   // Platform-specific, but implementation-agnostic parts, primarily for
   // limiting of the frame rate of the UI to avoid drawing the UI at extreme

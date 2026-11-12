@@ -452,7 +452,11 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
     // loop.
     const bool drew_visible_output =
         draw_data && draw_data->CmdListsCount > 0 && draw_data->TotalVtxCount > 0;
-    if (drew_visible_output && presenter_) {
+    bool continuous = false;
+    for (const ImGuiDialog* dialog : dialogs_) {
+      continuous = continuous || dialog->WantsContinuousRepaint();
+    }
+    if (drew_visible_output && continuous && presenter_) {
       presenter_->RequestUIPaintFromUIThread();
     }
   }

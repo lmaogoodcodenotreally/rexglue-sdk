@@ -15,6 +15,7 @@
 #include <utility>
 
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
@@ -613,6 +614,9 @@ bool Presenter::RefreshGuestOutput(
     guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
   }
 
+  guest_output_last_refresh_tick_.store(rex::chrono::Clock::QueryHostTickCount(),
+                                        std::memory_order_relaxed);
+
   // Trigger the presentation on the host.
   PaintResult paint_result = PaintResult::kNotPresented;
   {
@@ -767,6 +771,7 @@ void Presenter::RemoveUIDrawerFromUIThread(UIDrawer* drawer) {
 }
 
 void Presenter::RequestUIPaintFromUIThread() {
+  ui_repaint_requested_by_drawer_ = true;
   if (is_in_ui_thread_paint_) {
     // The paint request will be done once in the end of PaintFromUIThread
     // according to the actual state at the moment that happens. It's common for
@@ -783,6 +788,14 @@ void Presenter::RequestUIPaintFromUIThread() {
     // met.
     window_->RequestPaint();
   }
+}
+
+bool Presenter::IsGuestOutputRefreshing() const {
+  // 100 ms: still live at 10 fps, so continuous repaints resume only on a real
+  // stall (loading, a paused or hung guest).
+  const uint64_t last = guest_output_last_refresh_tick_.load(std::memory_order_relaxed);
+  return last && rex::chrono::Clock::QueryHostTickCount() - last <
+                     rex::chrono::Clock::QueryHostTickFrequency() / 10;
 }
 
 bool Presenter::InitializeCommonSurfaceIndependent() {
@@ -1578,6 +1591,8 @@ void Presenter::UpdateUITicksNeededFromUIThread() {
 
 void Presenter::WaitForUITickFromUIThread() {
 #if REX_PLATFORM_WIN32
+  const bool drawer_repaint = ui_repaint_requested_by_drawer_;
+  ui_repaint_requested_by_drawer_ = false;
   if (!AreUITicksNeededFromUIThread()) {
     return;
   }
@@ -1593,6 +1608,23 @@ void Presenter::WaitForUITickFromUIThread() {
     if (!AreDXGIUITicksWaitable(dxgi_ui_tick_lock)) {
       return;
     }
+    if (IsGuestOutputRefreshing()) {
+      if (!drawer_repaint) {
+        // A leftover paint request whose guest frame an earlier paint already
+        // took. Paint it now: waiting here would keep the UI thread parked one
+        // paint ahead, handling input events only once per guest frame.
+        return;
+      }
+      // A UI-only repaint while the guest is live: wait for its next frame
+      // (which forces the tick) rather than present at the display rate. Each
+      // extra present waits for a free back buffer on the queue the guest
+      // renders on: a 60 fps guest dropped to 48 with any ImGui window open on
+      // a 144 Hz display. Vblank pacing resumes once the guest stalls.
+      dxgi_ui_tick_signal_condition_.wait_for(dxgi_ui_tick_lock, std::chrono::milliseconds(20));
+      last_vblank_before_wait = dxgi_ui_tick_last_vblank_;
+      dxgi_ui_tick_last_draw_ = std::max(dxgi_ui_tick_last_draw_, last_vblank_before_wait);
+      continue;
+    }
     if (dxgi_ui_tick_last_vblank_ > dxgi_ui_tick_last_draw_) {
       // If there have been multiple vblanks during the wait for some reason,
       // next time draw the UI immediately.
@@ -1607,8 +1639,13 @@ void Presenter::WaitForUITickFromUIThread() {
 
 void Presenter::ForceUIThreadPaintTick() {
 #if REX_PLATFORM_WIN32
-  std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
-  dxgi_ui_tick_force_requested_ = true;
+  {
+    std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+    dxgi_ui_tick_force_requested_ = true;
+  }
+  // Wake a paint already waiting for a tick: a new guest frame must not wait
+  // for the next vblank (or for the guest-frame wait above).
+  dxgi_ui_tick_signal_condition_.notify_all();
 #endif  // XE_PLATFORM
 }
 

@@ -338,7 +338,7 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
   std::vector<uint32_t> match(cur.segments.size(), kNone);
   std::vector<bool> used(prev.segments.size());
   std::vector<bool> sure(cur.segments.size());  // its signature's count did not change
-  std::vector<uint32_t> copies(cur.segments.size());  // TEMP DIAGNOSTIC: draws of its signature
+  std::vector<uint32_t> copies(cur.segments.size());  // draws of its key, where it had copies
   std::vector<uint32_t> mark(kAluEnd - kAluFirst), mark_at(kAluEnd - kAluFirst);
   uint32_t mark_stamp = 0;
   // The cur draw's ALU constants, by register, for `distance` to a draw with
@@ -756,6 +756,15 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
       return same_layout ? prev.alu_offset[pseg.alu_begin + e] + d
                          : prev_at[cur.alu_reg[seg.alu_begin + e] + d - kAluFirst];
     };
+    // Between copies of one draw, a whole number that changed alone in its
+    // vec4 (the rest bit-equal) is a count or an index, not motion: MK's
+    // seagulls divide the vertex index by their mesh's vertex count (c200.x,
+    // 122 or 126 by mesh) to find the instance, so a value in between pulls
+    // every vertex from another bird. The pairing joined two different
+    // meshes: drawn as is. A lone draw keeps lerping (a world row moving
+    // along one axis can be whole numbers too).
+    bool restructured = false;
+    auto whole = [](float v) { return v == std::trunc(v) && std::abs(v) >= 2.0f; };
     // pass 0: the jump check; 1: the write pass, recorded for borrowing; 2: not recorded.
     ++moved_stamp;
     bool moved_any = false;
@@ -798,6 +807,16 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
           const float c = std::bit_cast<float>(cb), p = std::bit_cast<float>(pb);
           if (!std::isfinite(c) || !std::isfinite(p)) continue;
           if (!pass) {
+            if (!restructured && copies[i] > 1 && whole(c) && whole(p)) {
+              const uint32_t lane = (cur.alu_reg[seg.alu_begin + e] + d) % 4;
+              bool alone = d >= lane && d - lane + 4 <= count;
+              for (uint32_t k = 0; alone && k < 4; ++k) {
+                const uint32_t other = prev_of(e, d - lane + k);
+                alone = k == lane || (other != kUnwritten &&
+                                      Load(prev_be, other) == Load(cur_be, co + d - lane + k));
+              }
+              restructured = alone;
+            }
             if (std::abs(c - p) > 0.05f) {
               moved_at[(cur.alu_reg[seg.alu_begin + e] + d - kAluFirst) / 4] = moved_stamp;
               moved_any = true;
@@ -820,14 +839,21 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
       }
       return clean;
     };
-    // A sure pairing is the same draw, so a jump there is fast motion (a
-    // strike, a spin) and lerping keeps the model whole; a guessed pairing
-    // that jumped is likely another draw: drawn as is.
+    // A sure pairing of a lone draw is the same draw, so a jump there is fast
+    // motion (a strike, a spin) and lerping keeps the model whole; a guessed
+    // pairing that jumped is likely another draw: drawn as is. So is a copy
+    // that jumped: as many copies in both frames does not make it the same
+    // object (BO's static props blinked halfway to another copy).
     const bool jumped = !visit(0);
+    if (restructured) {
+      ++stats.jumped;
+      borrow(seg, nullptr);
+      continue;
+    }
     if (jumped) {
       ++stats.jumped;
       stats.suspect += copies[i] > 2;  // TEMP DIAGNOSTIC
-      if (!sure[i]) {
+      if (!sure[i] || copies[i] > 1) {
         borrow(seg, nullptr);
         continue;
       }
@@ -900,7 +926,7 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
 
 bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
                       uint32_t stride_words, uint64_t float_words, const PackedWords& packed,
-                      uint32_t endian, float t) {
+                      uint32_t endian, float t, uint32_t group) {
   const auto e = xenos::Endian(endian);
   auto load = [e](uint32_t word) { return std::bit_cast<float>(xenos::GpuSwap(word, e)); };
   // Instance data (debris: a rigid 3x4 matrix per "vertex") turns as
@@ -971,6 +997,31 @@ bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
   for (uint64_t m = changed; switched && m; m &= m - 1) {
     const uint32_t w = uint32_t(std::countr_zero(m));
     switched = hi[w] > lo[w] && moved[w] >= hi[w] - lo[w];
+  }
+  // The same while it slides (menu description text: each glyph moves to its
+  // new place and letter in one tick): a texture coordinate (a 2-float
+  // attribute) moved at least its own extent. A particle's position may
+  // outrun its size; its texture coordinate stays.
+  for (uint64_t m = changed & packed.uv_words; !switched && m; m &= m - 1) {
+    const uint32_t w = uint32_t(std::countr_zero(m));
+    switched = hi[w] > lo[w] && moved[w] >= hi[w] - lo[w];
+  }
+  // Over a whole string of glyphs the extent spans the atlas: each glyph
+  // (primitive) is judged on its own.
+  const uint64_t uv_changed = changed & packed.uv_words;
+  for (uint32_t g = 0; group > 1 && uv_changed && !switched && g + group <= vertices; g += group) {
+    for (uint64_t m = uv_changed; !switched && m; m &= m - 1) {
+      const uint32_t w = uint32_t(std::countr_zero(m));
+      float glo = std::numeric_limits<float>::infinity(), ghi = -glo, gmoved = 0;
+      for (uint32_t v = g; v < g + group; ++v) {
+        const float c = load(cur[v * stride_words + w]), p = load(prev[v * stride_words + w]);
+        if (!std::isfinite(c) || !std::isfinite(p)) continue;
+        glo = std::min(glo, c);
+        ghi = std::max(ghi, c);
+        gmoved = std::max(gmoved, std::abs(c - p));
+      }
+      switched = ghi > glo && gmoved >= ghi - glo;
+    }
   }
   if (switched) {
     return false;

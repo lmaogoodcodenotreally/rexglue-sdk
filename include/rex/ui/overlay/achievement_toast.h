@@ -35,6 +35,10 @@ class AchievementToastDialog : public AchievementNotificationDialog {
   // Thread-safe: safe to call from any thread, including guest threads.
   void Push(const rex::system::AchievementEvent& event) override;
 
+  // Always registered: continuous only while a toast fades, or any other
+  // visible dialog would inherit display-rate repaints from it.
+  bool WantsContinuousRepaint() const override { return showing_; }
+
  protected:
   void OnDraw(ImGuiIO& io) override;
 
@@ -49,6 +53,7 @@ class AchievementToastDialog : public AchievementNotificationDialog {
 
   std::mutex mutex_;
   std::deque<PendingToast> queue_;
+  bool showing_ = false;  // UI thread only, set by OnDraw
   AchievementIconCache icon_cache_;
 };
 

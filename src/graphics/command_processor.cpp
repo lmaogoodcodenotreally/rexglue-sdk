@@ -1425,8 +1425,12 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
     stats = frame_interp::Interpolate(interp_prev_.data(), interp_parsed_prev_,
                                       interp_work_.data(), interp_parsed_cur_, 0.5f,
                                       &interp_pairs_);
-    // Most paired draws jumped: a camera cut or scene change, nothing to blend.
-    const bool cut = stats.jumped * 4 > stats.matched;
+    // Many paired draws jumped: a camera cut or scene change, nothing to blend.
+    // Few draws write the camera (the rest inherit it), so a cut can show as
+    // 1 in 6 jumped (BO's fight intro: 341 of 2108); busy fights stay under
+    // 1 in 15. A missed cut flashes the whole frame, a false one just shows
+    // the real frame once.
+    const bool cut = stats.jumped * 8 > stats.matched;
     // TEMP DIAGNOSTIC: also dump frames where a copy of a mesh jumped (at
     // most one a second, 40 a run).
     static uint32_t suspect_dumps = 0, suspect_wait = 0;
@@ -1738,34 +1742,38 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
                                          std::make_reverse_iterator(prev + words))
                                .first -
                            rcur);
-      const uint32_t first = first_word / s->stride_words;
-      const uint32_t last = std::min(vertices, (last_word + s->stride_words - 1) / s->stride_words);
+      // Independent primitives (particle quads, text glyphs: auto-indexed).
+      reg::VGT_DRAW_INITIATOR init;
+      init.value = register_file_->values[XE_GPU_REG_VGT_DRAW_INITIATOR];
+      uint32_t group = 0;
+      if (init.source_select == xenos::SourceSelect::kAutoIndex) {
+        switch (init.prim_type) {
+          case xenos::PrimitiveType::kPointList:
+            group = 1;
+            break;
+          case xenos::PrimitiveType::kTriangleList:
+          case xenos::PrimitiveType::kRectangleList:
+            group = 3;
+            break;
+          case xenos::PrimitiveType::kQuadList:
+            group = 4;
+            break;
+          default:
+            break;
+        }
+      }
+      // Whole primitives, so LerpVertexFloats can judge each on its own.
+      const uint32_t g = std::max(group, 1u);
+      const uint32_t first = first_word / s->stride_words / g * g;
+      const uint32_t last = std::min(
+          vertices, ((last_word + s->stride_words - 1) / s->stride_words + g - 1) / g * g);
       const uint32_t begin = first * s->stride_words, end = last * s->stride_words;
       interp_vs_scratch_.assign(cur + begin, cur + end);
       if (!frame_interp::LerpVertexFloats(prev + begin, interp_vs_scratch_.data(), last - first,
                                           s->stride_words, s->float_words, s->packed,
-                                          s->endian, 0.5f)) {
-        // Independent primitives (particle quads, auto-indexed) whose list
-        // shifted as particles were born and died pair one by one.
-        reg::VGT_DRAW_INITIATOR init;
-        init.value = register_file_->values[XE_GPU_REG_VGT_DRAW_INITIATOR];
-        uint32_t group = 0;
-        if (init.source_select == xenos::SourceSelect::kAutoIndex) {
-          switch (init.prim_type) {
-            case xenos::PrimitiveType::kPointList:
-              group = 1;
-              break;
-            case xenos::PrimitiveType::kTriangleList:
-            case xenos::PrimitiveType::kRectangleList:
-              group = 3;
-              break;
-            case xenos::PrimitiveType::kQuadList:
-              group = 4;
-              break;
-            default:
-              break;
-          }
-        }
+                                          s->endian, 0.5f, group)) {
+        // Independent primitives whose list shifted as particles were born
+        // and died pair one by one.
         if (group) {
           interp_vs_scratch_.assign(cur, cur + words);
           if (frame_interp::LerpPrimitives(prev, vertices, interp_vs_scratch_.data(), vertices,
@@ -1871,6 +1879,9 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
           break;
         case xenos::VertexFormat::k_32_32_FLOAT:
           count = 2;
+          if (a.offset >= 0 && uint32_t(a.offset) + 1 < binding.stride_words) {
+            packed.uv_words |= uint64_t(3) << a.offset;
+          }
           break;
         case xenos::VertexFormat::k_32_32_32_FLOAT:
           count = 3;

@@ -47,7 +47,8 @@ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
         break;
       }
     }
-    if (queue_.empty()) {
+    showing_ = !queue_.empty();
+    if (!showing_) {
       return;
     }
     toast = queue_.front();

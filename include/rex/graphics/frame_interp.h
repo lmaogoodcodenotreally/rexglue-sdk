@@ -64,7 +64,11 @@ void Parse(const uint32_t* stream_be, size_t dword_count, ParsedFrame& out);
 // frames wrote the same layout, else by register. A constant that moved by
 // more than half its magnitude (floor 2) counts the segment as jumped (camera
 // cuts are told by those); where the pairing was a guess - the signature's
-// count changed - the segment then keeps `cur`, as two different draws.
+// count changed - the segment then keeps `cur`, as two different draws. So
+// does a pairing between copies of one draw where a whole number (|v| >= 2)
+// changed alone in its vec4: a count or index (an instanced mesh's vertex
+// count), so another mesh. So does a copy (a key drawn more than once)
+// whose pairing jumped: as many copies in both frames is not the same object.
 // A segment kept as `cur` (unpaired, or such a guess), or a sure pairing that
 // jumped, takes the lerped value of each whole vec4 it writes bit-equal to
 // what the last cleanly lerped segment wrote to that register (the shared
@@ -81,6 +85,7 @@ struct PackedWords {
   uint64_t words = 0;                // bit k: word k is packed
   uint64_t is_signed = 0;            // ...with signed lanes
   std::array<uint8_t, 64> format{};  // ...as this xenos::VertexFormat
+  uint64_t uv_words = 0;             // bit k: word k is in a 2-float attribute (texcoord)
   bool operator==(const PackedWords&) const = default;
 };
 
@@ -95,10 +100,12 @@ struct PackedWords {
 // differs, or a float jumped as Interpolate's constants would, or a sprite
 // switched rather than moved (every float that changed jumped by its own
 // whole extent while another word stayed: a texture coordinate picking
-// another atlas cell under a quad standing still).
+// another atlas cell under a quad standing still, or a texture coordinate
+// (`packed.uv_words`) doing so while its quad slides - judged per primitive
+// of `group` vertices when the draw is of independent ones, else as a whole).
 bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
                       uint32_t stride_words, uint64_t float_words, const PackedWords& packed,
-                      uint32_t endian, float t);
+                      uint32_t endian, float t, uint32_t group = 0);
 
 // For a draw of independent primitives of `group` vertices each (particle
 // quads) whose list shifted as particles were born and died, so that the

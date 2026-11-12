@@ -39,6 +39,12 @@ class ImGuiDialog {
 
   void Draw();
 
+  // Whether the presenter should repaint at the display rate while this dialog
+  // shows something (animations, mouse hover). A passive overlay returns false
+  // and is repainted only when the guest output refreshes, which avoids
+  // re-presenting the whole frame at the monitor's refresh rate.
+  virtual bool WantsContinuousRepaint() const { return true; }
+
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);
 

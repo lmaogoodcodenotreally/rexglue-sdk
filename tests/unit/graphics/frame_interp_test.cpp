@@ -240,6 +240,55 @@ TEST_CASE("frame_interp leaves a guessed pairing whose constants jumped") {
   CHECK(cur.Float(x) == 100.0f);
 }
 
+TEST_CASE("frame_interp draws as is a copy paired onto another mesh") {
+  // MK seagulls: c1.x is the mesh's vertex count the shader divides the vertex
+  // index by; a copy whose nearest pair is another mesh must not show 124.
+  Stream prev, cur;
+  for (float pos : {0.5f, 5.5f}) {
+    prev.Shaders(0x1000, 0x2000);
+    prev.Constants(0x4000, {pos, pos, pos, 1, 122, 0, 0, 0});
+    prev.Draw(0x11);
+  }
+  cur.Shaders(0x1000, 0x2000);
+  cur.Constants(0x4000, {0.7f, 0.7f, 0.7f, 1, 126, 0, 0, 0});  // switched mesh
+  const size_t x = cur.be.size() - 8;
+  cur.Draw(0x11);
+  cur.Shaders(0x1000, 0x2000);
+  cur.Constants(0x4000, {5.7f, 5.7f, 5.7f, 1, 122, 0, 0, 0});
+  const size_t y = cur.be.size() - 8;
+  cur.Draw(0x11);
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  std::vector<std::pair<uint32_t, uint32_t>> pairs;
+  Stats s = Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f, &pairs);
+  CHECK(s.jumped == 1);
+  CHECK(cur.Float(x + 4) == 126.0f);
+  CHECK(cur.Float(x + 0) == 0.7f);  // the whole draw as recorded
+  CHECK(std::abs(cur.Float(y + 0) - 5.6f) < 1e-5f);  // the other copy lerps
+  CHECK(pairs.size() == 2);         // that copy and the tail: x's vertex data is not lerped
+}
+
+TEST_CASE("frame_interp lerps whole numbers that move with their row") {
+  Stream prev, cur;
+  prev.Shaders(0x1000, 0x2000);
+  prev.Constants(0x4000, {100, 40, 0, 1});  // a quad's pixel position
+  prev.Draw(0x11);
+  cur.Shaders(0x1000, 0x2000);
+  cur.Constants(0x4000, {108, 44, 0, 1});
+  size_t x = cur.be.size() - 4;
+  cur.Draw(0x11);
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Stats s = Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  CHECK(s.jumped == 0);
+  CHECK(cur.Float(x + 0) == 104.0f);
+  CHECK(cur.Float(x + 1) == 42.0f);
+}
+
 TEST_CASE("frame_interp gives a new draw the lerped camera it shares") {
   Stream prev, cur;
   prev.Shaders(0x1000, 0x2000);
@@ -332,6 +381,30 @@ TEST_CASE("frame_interp lerps a sure pairing through fast motion") {
   CHECK(s.jumped == 1);  // still counted, for cut detection
   CHECK(s.lerped == 2);
   CHECK(cur.Float(x) == 0.0f);
+}
+
+TEST_CASE("frame_interp draws as is a copy whose sure pairing jumped") {
+  // Two props of one mesh, as many in both frames, both far from where either
+  // was: the pairing is sure by count, but a jump means another object - in
+  // between it would blink halfway to the other copy.
+  auto prop = [](Stream& s, float x) {
+    s.Shaders(0x1000, 0x2000);
+    s.Constants(0x4000, {x, 1});
+    s.Draw(0x11);
+  };
+  Stream prev, cur;
+  prop(prev, 0);
+  prop(prev, 100);
+  prop(cur, 50);
+  size_t first = cur.be.size() - 4;
+  prop(cur, 150);
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Stats s = Interpolate(prev.be.data(), pp, cur.be.data(), pc, 0.5f);
+  CHECK(s.jumped == 1);  // 100 -> 150 is motion
+  CHECK(cur.Float(first) == 50.0f);  // not 25
 }
 
 PackedWords Packed(uint32_t word, xenos::VertexFormat format) {
@@ -489,6 +562,42 @@ TEST_CASE("frame_interp keeps a sprite that switched atlas cells") {
   quad(0.02f, scroll);
   REQUIRE(LerpVertexFloats(prev.data(), scroll.data(), 4, 4, 0b1111, {}, 2, 0.5f));
   CHECK(f(scroll[3]) == 0.01f);
+}
+
+TEST_CASE("frame_interp keeps a glyph that slid and switched letters") {
+  // A text quad (x, y, z, u, v; u v a 2-float attribute) moving 8 px (under
+  // its width) while u picks another letter: the in-between would sample the
+  // atlas between the two letters. Sliding with its letter kept lerps.
+  auto be = [](float f) { return std::byteswap(std::bit_cast<uint32_t>(f)); };
+  auto f = [](uint32_t w) { return std::bit_cast<float>(std::byteswap(w)); };
+  auto quad = [&](float x0, float u0, std::vector<uint32_t>& out) {
+    for (int k = 0; k < 4; ++k) {
+      const float dx = k == 1 || k == 2 ? 1.0f : 0.0f, dy = k >= 2 ? 1.0f : 0.0f;
+      out.insert(out.end(), {be(x0 + 16 * dx), be(611 + 32 * dy), be(0.0f), be(u0 + 0.0625f * dx),
+                             be(0.125f + 0.125f * dy)});
+    }
+  };
+  PackedWords uv;
+  uv.uv_words = 0b11000;
+  std::vector<uint32_t> prev, letter, slide;
+  quad(300, 0.25f, prev);
+  quad(308, 0.5f, letter);
+  REQUIRE(!LerpVertexFloats(prev.data(), letter.data(), 4, 5, 0b11111, uv, 2, 0.5f));
+  CHECK(f(letter[0]) == 308.0f);
+  quad(308, 0.25f, slide);
+  REQUIRE(LerpVertexFloats(prev.data(), slide.data(), 4, 5, 0b11111, uv, 2, 0.5f));
+  CHECK(f(slide[0]) == 304.0f);
+  // In a string the extent of u spans the atlas: one glyph of two switching
+  // letters is caught only per glyph (a quad list's 4 vertices).
+  std::vector<uint32_t> two, two_next, whole;
+  quad(300, 0.0f, two);
+  quad(316, 0.5f, two);
+  quad(304, 0.0f, two_next);
+  quad(320, 0.25f, two_next);
+  whole = two_next;
+  CHECK(LerpVertexFloats(two.data(), whole.data(), 8, 5, 0b11111, uv, 2, 0.5f));
+  REQUIRE(!LerpVertexFloats(two.data(), two_next.data(), 8, 5, 0b11111, uv, 2, 0.5f, 4));
+  CHECK(f(two_next[0]) == 304.0f);
 }
 
 TEST_CASE("frame_interp lerps a particle that outran its own size") {
