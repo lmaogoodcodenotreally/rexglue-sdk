@@ -79,6 +79,7 @@ if(REXGLUE_USE_D3D12)
         d3d12/command_processor.cpp
         d3d12/primitive_processor.cpp
         d3d12/render_target_cache.cpp
+        d3d12/render_target_cache_ssao.cpp
         d3d12/shader.cpp
         d3d12/shared_memory.cpp
         d3d12/texture_cache.cpp

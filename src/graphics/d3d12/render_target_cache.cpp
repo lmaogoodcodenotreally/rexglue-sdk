@@ -960,6 +960,7 @@ bool D3D12RenderTargetCache::Initialize() {
 }
 
 void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
+  SsaoShutdown();
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
@@ -1183,6 +1184,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   }
 
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  SsaoFlushIfLeavingSurface(texture_cache);
 
   // Copying.
   bool copied = false;
@@ -1317,6 +1319,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
+          SsaoNoteResolve(resolve_info);
         }
       } else {
         REXGPU_ERROR(

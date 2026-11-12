@@ -104,6 +104,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   static DXGI_FORMAT GetDepthSRVDepthDXGIFormat(xenos::DepthRenderTargetFormat format);
   static DXGI_FORMAT GetDepthSRVStencilDXGIFormat(xenos::DepthRenderTargetFormat format);
 
+  // Ambient occlusion (ssao_strength) on the resolved main scene, run once the
+  // GPU leaves the surface the scene was resolved from (render_target_cache_ssao.cpp).
+  void SsaoFlushIfLeavingSurface(D3D12TextureCache& texture_cache);
+
  protected:
   uint32_t GetMaxRenderTargetWidth() const override { return D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION; }
   uint32_t GetMaxRenderTargetHeight() const override {
@@ -178,6 +182,28 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // Parameter 1 - destination (shared memory or a part of it).
   // Parameter 2 - source (EDRAM).
   ID3D12RootSignature* resolve_copy_root_signature_ = nullptr;
+
+  // Pending scene resolves for ambient occlusion: a raw depth copy, then a
+  // color copy, from the same surface and to same-sized textures (several of
+  // each with predicated tiling).
+  struct SsaoPending {
+    bool depth = false;
+    bool color = false;
+    uint32_t surface_info = 0;  // RB_SURFACE_INFO
+    uint32_t dest_pitch = 0;  // RB_COPY_DEST_PITCH
+    uint32_t depth_base = 0, color_base = 0;
+    uint32_t depth_endian = 0, color_endian = 0;
+    bool depth_float24 = false, depth_reversed = false;
+  };
+  SsaoPending ssao_;
+  ID3D12PipelineState* ssao_ao_pipeline_ = nullptr;
+  ID3D12PipelineState* ssao_apply_pipeline_ = nullptr;
+  ID3D12Resource* ssao_texture_ = nullptr;
+  uint32_t ssao_texture_width_ = 0, ssao_texture_height_ = 0;
+  D3D12_RESOURCE_STATES ssao_texture_state_ = D3D12_RESOURCE_STATE_COMMON;
+  void SsaoNoteResolve(const draw_util::ResolveInfo& resolve_info);
+  void SsaoRun(D3D12TextureCache& texture_cache);
+  void SsaoShutdown();
   struct ResolveCopyShaderCode {
     const void* unscaled;
     size_t unscaled_size;

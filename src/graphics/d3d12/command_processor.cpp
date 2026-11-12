@@ -2484,6 +2484,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!BeginSubmission(true)) {
     return false;
   }
+  render_target_cache_->SsaoFlushIfLeavingSurface(*texture_cache_);
   PERF_counter_add(kGpuEntryUs, rex::perf::PerfNowUs() - gpu_entry_t0);  // TEMP DIAGNOSTIC
 
   // Process primitives.
