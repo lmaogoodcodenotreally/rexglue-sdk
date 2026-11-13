@@ -12,6 +12,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <tuple>
 
@@ -733,9 +734,33 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
     }
   };
 
+  // For rotation blocks a draw writes only part of, per ALU register as of
+  // the draw being lerped: the value the guest last set (stream order, raw)
+  // and the prev offset the draw that set it was paired with (kUnwritten:
+  // unknown), so a draw turns the bone it inherits as its writer turned it.
+  // Unset registers have no prev offset either.
+  std::vector<uint32_t> state_cur(kAluEnd - kAluFirst), state_prev(kAluEnd - kAluFirst, kUnwritten);
+  auto record = [&](const ParsedFrame::Segment& seg, const ParsedFrame::Segment* pseg,
+                    bool same_layout) {
+    for (uint32_t e = 0; e < seg.alu_end - seg.alu_begin; ++e) {
+      const uint32_t reg = cur.alu_reg[seg.alu_begin + e] - kAluFirst;
+      const uint32_t n = cur.alu_count[seg.alu_begin + e];
+      std::copy_n(cur_be + cur.alu_offset[seg.alu_begin + e], n, &state_cur[reg]);
+      uint32_t* sp = &state_prev[reg];
+      if (!pseg) {
+        std::fill_n(sp, n, kUnwritten);
+      } else if (same_layout) {
+        std::iota(sp, sp + n, prev.alu_offset[pseg->alu_begin + e]);
+      } else {
+        std::copy_n(&prev_at[reg], n, sp);
+      }
+    }
+  };
+  std::vector<uint32_t> rows;
   for (uint32_t i = 0; i < cur.segments.size(); ++i) {
     const auto& seg = cur.segments[i];
     if (match[i] == kNone) {  // new draw this frame
+      record(seg, nullptr, false);
       borrow(seg, nullptr);
       continue;
     }
@@ -756,6 +781,7 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
       return same_layout ? prev.alu_offset[pseg.alu_begin + e] + d
                          : prev_at[cur.alu_reg[seg.alu_begin + e] + d - kAluFirst];
     };
+    record(seg, &pseg, same_layout);  // before any lerp: cur_be holds this draw as the guest set it
     // Between copies of one draw, a whole number that changed alone in its
     // vec4 (the rest bit-equal) is a count or an index, not motion: MK's
     // seagulls divide the vertex index by their mesh's vertex count (c200.x,
@@ -767,7 +793,7 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
     auto whole = [](float v) { return v == std::trunc(v) && std::abs(v) >= 2.0f; };
     // pass 0: the jump check; 1: the write pass, recorded for borrowing; 2: not recorded.
     ++moved_stamp;
-    bool moved_any = false;
+    rows.clear();  // the vec4 rows of this draw that moved visibly
     auto visit = [&](int pass) {
       size_t next_turned = 0;
       bool clean = true;
@@ -776,11 +802,15 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
         uint64_t* rec = &lerped[cur.alu_reg[seg.alu_begin + e] - kAluFirst];
         const uint32_t count = cur.alu_count[seg.alu_begin + e];
         for (uint32_t d = 0; d < count; ++d) {
-          // Most constants did not change: skipped in bulk (recorded as they are).
-          if (same_layout && (!pass || turned.empty())) {
+          // Most constants did not change: skipped in bulk (recorded as they
+          // are), up to the next turned one.
+          if (same_layout) {
             const uint32_t* c0 = cur_be + co;
+            const uint32_t end = pass && next_turned < turned.size()
+                                     ? std::min(count, turned[next_turned].first - co)
+                                     : count;
             const uint32_t to = uint32_t(
-                std::mismatch(c0 + d, c0 + count, prev_be + prev_of(e, 0) + d).first - c0);
+                std::mismatch(c0 + d, c0 + end, prev_be + prev_of(e, 0) + d).first - c0);
             for (; pass == 1 && d < to; ++d) {
               const uint32_t cb = Load(cur_be, co + d);
               rec[d] = uint64_t(cb) << 32 | cb;
@@ -817,9 +847,10 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
               }
               restructured = alone;
             }
-            if (std::abs(c - p) > 0.05f) {
-              moved_at[(cur.alu_reg[seg.alu_begin + e] + d - kAluFirst) / 4] = moved_stamp;
-              moved_any = true;
+            if (const uint32_t row = (cur.alu_reg[seg.alu_begin + e] + d - kAluFirst) / 4;
+                std::abs(c - p) > 0.05f && moved_at[row] != moved_stamp) {
+              moved_at[row] = moved_stamp;
+              rows.push_back(row);
             }
             if (Jumped(c, p)) {
               if (rec[d] == ~0ull || uint32_t(rec[d] >> 32) != cb || trivial(cb)) {
@@ -866,22 +897,24 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
         }
       }
     }
-    // Rigid 3x3 blocks (world, bone matrices) that visibly turned lerp as
-    // rotations. shortcut: blocks within one write run, starting on a vec4;
-    // a matrix split across runs lerps per element.
+    // Rigid 3x3 blocks (world, bone matrices: three vec4 rows) that visibly
+    // turned lerp as rotations. The game uploads only the rows that changed
+    // since its previous draw, so a draw may write part of a bone (DOA4's
+    // bones are 4 rows from c50 while uploads start on c48 or c64): the rows
+    // it does not write are taken as the guest set them - this frame's and the
+    // paired draw's - so every draw turns a shared bone alike, writing the
+    // rows it owns. Lerping those per element instead tore limbs apart.
+    // Only blocks with a row the draw writes that moved visibly turn: rows it
+    // owns of a block that turned elsewhere are on its axis, which the turn keeps.
     turned.clear();
-    for (uint32_t e = 0; moved_any && e < seg.alu_end - seg.alu_begin; ++e) {
-      const uint32_t reg = cur.alu_reg[seg.alu_begin + e], count = cur.alu_count[seg.alu_begin + e];
-      const uint32_t co = cur.alu_offset[seg.alu_begin + e];
-      for (uint32_t d = (4 - reg % 4) % 4; d + 11 <= count; d += 4) {
-        const uint32_t row = (reg + d - kAluFirst) / 4;
-        if (moved_at[row] != moved_stamp && moved_at[row + 1] != moved_stamp &&
-            moved_at[row + 2] != moved_stamp) {
-          continue;
-        }
+    std::sort(rows.begin(), rows.end());
+    uint32_t next_free = 0;  // rows before it belong to a block already found
+    for (const uint32_t touched : rows) {
+      for (uint32_t row = touched >= 2 ? touched - 2 : 0; row <= touched; ++row) {
+        if (row < next_free || (row + 3) * 4 > kAluEnd - kAluFirst) continue;
         float p[11], c[11], out[11];
         for (uint32_t k = 0; k < 11; ++k) {
-          c[k] = std::bit_cast<float>(Load(cur_be, co + d + k));
+          c[k] = std::bit_cast<float>(std::byteswap(state_cur[row * 4 + k]));
         }
         // Most windows are no rigid block: told by its first two rows alone.
         const float len0 = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
@@ -893,24 +926,30 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
         float moved = 0;
         bool known = true;
         for (uint32_t k = 0; k < 11 && known; ++k) {
-          const uint32_t po = prev_of(e, d + k);
+          if (k % 4 == 3) continue;
+          const uint32_t po = state_prev[row * 4 + k];
           known = po != kUnwritten;
-          if (known && k % 4 != 3) {
+          if (known) {
             p[k] = std::bit_cast<float>(Load(prev_be, po));
             moved = std::max(moved, std::abs(c[k] - p[k]));
           }
         }
         // Under ~6 degrees the per-element lerp shrinks it by under 0.2%.
-        if (!known || !(moved * moved > 0.01f * len0) ||
-            !LerpRotation(p, c, t, out)) {
+        if (!known || !(moved * moved > 0.01f * len0) || !LerpRotation(p, c, t, out)) {
           continue;
         }
+        mark_cur(seg);  // mark[r] == mark_stamp: written here, at mark_at[r]
         for (uint32_t k = 0; k < 11; ++k) {
-          if (k % 4 != 3) turned.emplace_back(co + d + k, std::bit_cast<uint32_t>(out[k]));
+          const uint32_t r = row * 4 + k;
+          if (k % 4 != 3 && mark[r] == mark_stamp) {
+            turned.emplace_back(mark_at[r], std::bit_cast<uint32_t>(out[k]));
+          }
         }
-        d += 8;  // past the block's other rows
+        next_free = row + 3;
       }
     }
+    // visit() takes them in stream order.
+    std::sort(turned.begin(), turned.end());
     ++stats.lerped;
     visit(redo ? 2 : 1);
     if (redo) {
