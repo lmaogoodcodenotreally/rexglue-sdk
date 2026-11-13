@@ -50,6 +50,11 @@ REXCVAR_DEFINE_BOOL(frame_interp, false, "GPU",
                     "constants halfway to the previous frame and present that between real "
                     "frames (2x the displayed frame rate; the guest's own tick is unchanged).");
 
+REXCVAR_DEFINE_INT32(frame_interp_fps, 0, "GPU",
+                     "Frame interpolation target frame rate: 0 = the monitor's refresh rate. "
+                     "Each guest frame gets as many in-between frames as fit (1 to 3), never "
+                     "fewer than one, and fewer when the host has no time for them.");
+
 REXCVAR_DEFINE_BOOL(frame_interp_diag, false, "GPU",
                     "Frame interpolation diagnostics: detailed logs of late frames, unpaired "
                     "and jumped vertex streams, and one frame in 600 in full.");
@@ -1322,14 +1327,24 @@ void CommandProcessor::RecordPacket(const memory::RingBuffer& reader) {
 }
 
 void CommandProcessor::ServiceHeldSwap(bool force) {
-  if (!interp_held_pending_ ||
-      (!force && rex::chrono::Clock::QueryHostTickCount() < interp_held_deadline_)) {
-    return;
-  }
-  interp_held_pending_ = false;
-  PresentHeldSwapTexture(interp_held_width_, interp_held_height_);
-  if (CaptureWanted(g_capture_swap)) {  // TEMP DIAGNOSTIC
-    CaptureGuest(graphics_system_, "r", g_capture_swap);
+  while (interp_held_pending_) {
+    if (force) {
+      interp_held_next_ = interp_held_count_ - 1;
+    }
+    const InterpHeld& held = interp_held_[interp_held_next_];
+    if (!force && rex::chrono::Clock::QueryHostTickCount() < held.deadline) {
+      return;
+    }
+    interp_held_pending_ = ++interp_held_next_ < interp_held_count_;
+    if (!force) {  // TEMP DIAGNOSTIC: how late held frames go out
+      ++interp_stat_held_;
+      interp_stat_late_ += rex::chrono::Clock::QueryHostTickCount() - held.deadline;
+    }
+    PresentHeldSwapTexture(held.slot, interp_held_width_, interp_held_height_);
+    if (CaptureWanted(g_capture_swap)) {  // TEMP DIAGNOSTIC
+      CaptureGuest(graphics_system_, held.slot ? fmt::format("i{}", held.slot).c_str() : "r",
+                   g_capture_swap);
+    }
   }
 }
 
@@ -1443,10 +1458,44 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
   const uint64_t parse_start = rex::chrono::Clock::QueryHostTickCount();
   frame_interp::Parse(interp_cur_.data(), interp_cur_.size(), interp_parsed_cur_);
   bool interpolate = enabled && interp_have_prev_ && !interp_cur_.empty();
-  // The guest's next tick must not wait for the CP: when the real frame
-  // left no room for an in-between one (the heaviest scenes), this frame
-  // shows without it rather than slow the game.
-  if (interpolate && real_work + interp_cost_ > period - period / 16) {
+  // Frames to show for this guest frame, the real one included: the display's
+  // refresh over the guest's tick (2.4 for 60 Hz on 144 Hz, as 2 and 3 in
+  // turn), at least 2 as ever.
+  uint32_t presents = 1, most_presents = 1;
+  uint64_t extra_ticks = 0;  // the in-between frames after the first
+  uint64_t first_replay = 0;
+  if (interpolate) {
+    double fps = REXCVAR_GET(frame_interp_fps);
+    if (fps <= 0.0) {
+      ui::Presenter* presenter = graphics_system_ ? graphics_system_->presenter() : nullptr;
+      fps = presenter ? presenter->host_refresh_hz() : 0.0;
+    }
+    const double per_frame =
+        std::clamp(fps * double(period) / double(freq), 2.0, double(kInterpMaxPresents));
+    most_presents = uint32_t(std::ceil(per_frame - 1e-3));
+    // The guest's next tick must not wait for the CP: in-between frames the
+    // real frame left no room for (all of them in the heaviest scenes) are
+    // not made rather than slow the game. The first in-between frame costs the
+    // parse and pairing too; each more one its lerp and replay.
+    const uint64_t extra = interp_extra_cost_ ? interp_extra_cost_ : interp_cost_;
+    while (most_presents > 1 && real_work + interp_cost_ + extra * (most_presents - 2) >
+                                    period - period / 16) {
+      --most_presents;
+    }
+    interp_phase_ += per_frame;
+    const uint32_t wanted = uint32_t(interp_phase_ + 1e-3);
+    interp_phase_ = std::max(0.0, interp_phase_ - wanted);
+    presents = std::min(wanted, most_presents);
+    // TEMP DIAGNOSTIC: REX_INTERP_PRESENTS=n forces n frames per guest frame (slows the game).
+    static const int forced = [] {
+      const char* e = std::getenv("REX_INTERP_PRESENTS");
+      return e ? std::clamp(std::atoi(e), 2, int(kInterpMaxPresents)) : 0;
+    }();
+    if (forced) {
+      presents = most_presents = uint32_t(forced);
+    }
+  }
+  if (interpolate && presents == 1) {
     interpolate = false;
     ++interp_stat_skips_;
     interp_cost_ -= interp_cost_ / 16;  // an estimate from a heavier scene fades
@@ -1460,9 +1509,10 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
   std::optional<ParseBudget> parse_budget(std::in_place, interp_budget_[3], parse_start);
   if (interpolate) {
     interp_work_ = interp_cur_;
+    interp_pairing_.filled = false;
     stats = frame_interp::Interpolate(interp_prev_.data(), interp_parsed_prev_,
-                                      interp_work_.data(), interp_parsed_cur_, 0.5f,
-                                      &interp_pairs_);
+                                      interp_work_.data(), interp_parsed_cur_,
+                                      1.0f / float(presents), &interp_pairs_, &interp_pairing_);
     // Many paired draws jumped: a camera cut or scene change, nothing to blend.
     // Few draws write the camera (the rest inherit it), so a cut can show as
     // 1 in 6 jumped (BO's fight intro: 341 of 2108); busy fights stay under
@@ -1474,19 +1524,57 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
                   stats.matched, stats.lerped, stats.jumped, cut);
     }
     interp_stat_cuts_ += cut;
-    interpolate = !cut && HoldSwapTexture();
+    interpolate = !cut && HoldSwapTexture(0);
   }
   parse_budget.reset();
   ++g_capture_swap;  // TEMP DIAGNOSTIC
   if (interpolate) {
-    ReplayInterpolatedFrame();
-    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
-    if (CaptureWanted(g_capture_swap)) {  // TEMP DIAGNOSTIC
-      CaptureGuest(graphics_system_, "i", g_capture_swap);
-    }
+    // Frame j of n shows the guest frame's time j / n, at (j / n - 1 / most)
+    // of a tick after the first in-between one is ready: frames 2 and 3 to a
+    // tick in turn then keep one pace (no 1/6-tick jolt at each change).
     interp_held_width_ = frontbuffer_width;
     interp_held_height_ = frontbuffer_height;
-    interp_held_deadline_ = rex::chrono::Clock::QueryHostTickCount() + period / 2;
+    interp_held_count_ = 0;
+    interp_held_next_ = 0;
+    uint64_t ready = 0;
+    for (uint32_t j = 1; j < presents; ++j) {
+      if (j > 1) {
+        if (j == 2) {
+          extra_ticks = rex::chrono::Clock::QueryHostTickCount();
+        }
+        ServiceHeldSwap(false);
+        interp_work_ = interp_cur_;
+        frame_interp::Interpolate(interp_prev_.data(), interp_parsed_prev_, interp_work_.data(),
+                                  interp_parsed_cur_, float(j) / float(presents), nullptr,
+                                  &interp_pairing_);
+      }
+      interp_t_ = float(j) / float(presents);
+      const uint64_t replay_start = rex::chrono::Clock::QueryHostTickCount();
+      ReplayInterpolatedFrame();
+      const uint64_t done = rex::chrono::Clock::QueryHostTickCount();
+      if (j == 1) {
+        ready = done;
+        // Until more in-between frames are made, one more is taken to cost
+        // this replay and an eighth more for its lerp.
+        first_replay = (done - replay_start) * 9 / 8;
+      }
+      const uint64_t deadline =
+          ready + uint64_t(double(period) * (double(j) / presents - 1.0 / most_presents));
+      if (deadline > done && HoldSwapTexture(j)) {
+        interp_held_[interp_held_count_++] = {deadline, j};
+        interp_held_pending_ = true;
+      } else {
+        IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+        if (CaptureWanted(g_capture_swap)) {  // TEMP DIAGNOSTIC
+          CaptureGuest(graphics_system_, fmt::format("i{}", j).c_str(), g_capture_swap);
+        }
+      }
+    }
+    if (presents > 2) {
+      extra_ticks = rex::chrono::Clock::QueryHostTickCount() - extra_ticks;
+    }
+    interp_held_[interp_held_count_++] = {
+        ready + uint64_t(double(period) * (1.0 - 1.0 / most_presents)), 0};
     interp_held_pending_ = true;
   } else {
     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
@@ -1496,6 +1584,7 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
   }
 
   if (enabled) {
+    interp_stat_presents_ += interpolate ? presents : 1;  // TEMP DIAGNOSTIC
     interp_stats_.segments += stats.segments;
     interp_stats_.matched += stats.matched;
     interp_stats_.lerped += stats.lerped;
@@ -1550,6 +1639,11 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
       interp_stat_slow_ = 0;
       interp_stat_cuts_ = 0;
       interp_stat_skips_ = 0;
+      REXGPU_INFO("frame_interp: {} presents per 600 real frames; held frames late {} us on "
+                  "average",  // TEMP DIAGNOSTIC
+                  interp_stat_presents_,
+                  interp_stat_held_ ? interp_stat_late_ * 1000000 / freq / interp_stat_held_ : 0);
+      interp_stat_presents_ = interp_stat_held_ = interp_stat_late_ = 0;
     }
   }
 
@@ -1576,8 +1670,10 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
   interp_swap_end_ = rex::chrono::Clock::QueryHostTickCount();
   interp_swap_end_wait_ = interp_wait_ticks_;
   if (interpolate) {  // the whole swap: pairing, replay, and submitting and showing both frames
-    const uint64_t cost = interp_swap_end_ - now;
+    const uint64_t cost = interp_swap_end_ - now - extra_ticks;
     interp_cost_ = interp_cost_ ? (interp_cost_ * 7 + cost) / 8 : cost;
+    const uint64_t each = presents > 2 ? extra_ticks / (presents - 2) : first_replay;
+    interp_extra_cost_ = interp_extra_cost_ ? (interp_extra_cost_ * 7 + each) / 8 : each;
   }
   if (SharedMemory* shared_memory = InterpSharedMemory()) {
     shared_memory->InterpEndFrame();
@@ -1617,6 +1713,9 @@ void CommandProcessor::InterpCheckDrawState() {
                                   regs + kStateFirst + kStateCount);
     }
     return;
+  }
+  while (interp_state_next_ && interp_states_[interp_state_next_ - 1].packet >= packet) {
+    --interp_state_next_;  // the next replay of the same frame
   }
   while (interp_state_next_ < interp_states_.size() &&
          interp_states_[interp_state_next_].packet < packet) {
@@ -1771,14 +1870,14 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
       interp_vs_scratch_.assign(cur + begin, cur + end);
       if (!frame_interp::LerpVertexFloats(prev + begin, interp_vs_scratch_.data(), last - first,
                                           s->stride_words, s->float_words, s->packed,
-                                          s->endian, 0.5f, group)) {
+                                          s->endian, interp_t_, group)) {
         // Independent primitives whose list shifted as particles were born
         // and died pair one by one.
         if (group) {
           interp_vs_scratch_.assign(cur, cur + words);
           if (frame_interp::LerpPrimitives(prev, vertices, interp_vs_scratch_.data(), vertices,
                                            group, s->stride_words, s->float_words, s->packed,
-                                           s->endian, 0.5f)) {
+                                           s->endian, interp_t_)) {
             shared_memory->InterpWrite(s->start, interp_vs_scratch_.data(), words * 4);
             interp_vs_written_.push_back(s->start);
             interp_vs_stat_[2] += (words * 4) >> 10;

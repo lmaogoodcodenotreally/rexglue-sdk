@@ -74,9 +74,19 @@ void Parse(const uint32_t* stream_be, size_t dword_count, ParsedFrame& out);
 // camera, a light switched to another source), unless it is all 0 / +-1.
 // `lerped_pairs`, if given, receives (cur packet, prev packet) of every lerped
 // segment, in stream order.
+// `pairing`, if given, keeps the draw pairing (which does not depend on t): an
+// empty one is filled, a filled one is reused, for more in-between frames of
+// the same two frames (with `cur_be` the recorded stream again each time).
+struct Pairing {
+  std::vector<uint32_t> match;  // per cur segment: the prev segment, or UINT32_MAX
+  std::vector<bool> sure;
+  std::vector<uint32_t> copies;
+  bool filled = false;
+};
 Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cur_be,
                   const ParsedFrame& cur, float t,
-                  std::vector<std::pair<uint32_t, uint32_t>>* lerped_pairs = nullptr);
+                  std::vector<std::pair<uint32_t, uint32_t>>* lerped_pairs = nullptr,
+                  Pairing* pairing = nullptr);
 
 // The words of a vertex that hold packed values rather than one float32, by
 // the fetch format of the attribute there.

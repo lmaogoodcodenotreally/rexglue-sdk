@@ -180,15 +180,19 @@ class CommandProcessor {
   virtual void OnPrimaryBufferEnd() {}
 
   // Frame interpolation (frame_interp cvar, see frame_interp.h). The backend
-  // copies the current swap source aside (HoldSwapTexture) and later presents
-  // that copy (PresentHeldSwapTexture) as the real frame.
-  virtual bool HoldSwapTexture() { return false; }
+  // copies the current swap source aside into a slot (HoldSwapTexture) and
+  // later presents that copy (PresentHeldSwapTexture): slot 0 holds the real
+  // frame, the others in-between frames waiting for their time.
+  static constexpr uint32_t kInterpMaxPresents = 4;  // per guest frame, the real one included
+  virtual bool HoldSwapTexture(uint32_t slot) { return false; }
   virtual SharedMemory* InterpSharedMemory() { return nullptr; }
-  virtual void PresentHeldSwapTexture(uint32_t frontbuffer_width, uint32_t frontbuffer_height) {}
+  virtual void PresentHeldSwapTexture(uint32_t slot, uint32_t frontbuffer_width,
+                                      uint32_t frontbuffer_height) {}
   void SwapWithInterpolation(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                              uint32_t frontbuffer_height);
   void ReplayInterpolatedFrame();
-  // Presents the held real frame once its time has come (or now if `force`).
+  // Presents the held frames once their time has come (or the real one now if
+  // `force`, dropping in-between ones that are too late).
   void ServiceHeldSwap(bool force);
   void RecordPacket(const memory::RingBuffer& reader);
   bool IsReplaySkippedRegister(uint32_t index);
@@ -293,8 +297,16 @@ class CommandProcessor {
   void RunPendingInterpSwap();
   bool interp_replaying_ = false;
   bool interp_have_prev_ = false;
-  bool interp_held_pending_ = false;
-  uint64_t interp_held_deadline_ = 0;  // host ticks
+  bool interp_held_pending_ = false;  // interp_held_next_ < interp_held_count_
+  struct InterpHeld {
+    uint64_t deadline;  // host ticks
+    uint32_t slot;
+  };
+  InterpHeld interp_held_[kInterpMaxPresents - 1] = {};  // in present order, the real frame last
+  uint32_t interp_held_count_ = 0, interp_held_next_ = 0;
+  double interp_phase_ = 0.0;
+  uint64_t interp_extra_cost_ = 0;  // host ticks of an in-between frame after the first
+  float interp_t_ = 0.5f;  // the replay's point between the previous and current frame  // the fraction of a present carried to the next guest frame
   uint64_t interp_last_swap_ = 0;      // host ticks of the previous real swap
   uint64_t interp_period_ = 0;         // host ticks of the guest's tick (60 or 30 Hz)
   uint32_t interp_held_width_ = 0, interp_held_height_ = 0;
@@ -302,12 +314,14 @@ class CommandProcessor {
   std::vector<uint32_t> interp_start_regs_;  // registers when the frame's recording began
   uint64_t interp_start_bin_select_ = 0, interp_start_bin_mask_ = 0;
   frame_interp::ParsedFrame interp_parsed_cur_, interp_parsed_prev_;
+  frame_interp::Pairing interp_pairing_;  // of the current two frames, for each in-between one
   frame_interp::Stats interp_stats_;
   uint32_t interp_stat_frames_ = 0;
   uint64_t interp_stat_ticks_ = 0;     // real swap intervals summed, the guest tick check
   uint32_t interp_stat_slow_ = 0;      // real swap intervals over 17.5 ms
   uint32_t interp_stat_cuts_ = 0;      // frames not interpolated: most draws jumped
-  uint32_t interp_stat_skips_ = 0;     // frames not interpolated: no time left in the tick
+  uint32_t interp_stat_skips_ = 0;
+  uint64_t interp_stat_presents_ = 0, interp_stat_held_ = 0, interp_stat_late_ = 0;  // TEMP DIAGNOSTIC     // frames not interpolated: no time left in the tick
   // The budget: host ticks the CP worked (not waited) on the real frame, and
   // what an in-between frame (pairing + replay) recently cost.
   uint64_t interp_swap_end_ = 0, interp_swap_end_wait_ = 0, interp_cost_ = 0;

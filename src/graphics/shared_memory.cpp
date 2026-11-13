@@ -604,6 +604,7 @@ void SharedMemory::InterpEndReplay() {
     }
   }
   std::fill(interp_restored_.begin(), interp_restored_.end(), 0);
+  interp_upload_next_ = 0;  // for the next replay of the same frame
 }
 
 const uint32_t* SharedMemory::InterpResolveRect(uint32_t address) {

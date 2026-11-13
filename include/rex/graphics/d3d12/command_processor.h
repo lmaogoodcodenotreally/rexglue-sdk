@@ -213,9 +213,10 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
-  bool HoldSwapTexture() override;
+  bool HoldSwapTexture(uint32_t slot) override;
   SharedMemory* InterpSharedMemory() override { return shared_memory_.get(); }
-  void PresentHeldSwapTexture(uint32_t frontbuffer_width, uint32_t frontbuffer_height) override;
+  void PresentHeldSwapTexture(uint32_t slot, uint32_t frontbuffer_width,
+                              uint32_t frontbuffer_height) override;
 
   void OnPrimaryBufferEnd() override;
 
@@ -685,11 +686,14 @@ class D3D12CommandProcessor : public CommandProcessor {
                          uint32_t frontbuffer_width, uint32_t frontbuffer_height);
   // Frame interpolation: the real frame's swap source, copied aside while the
   // in-between frame is presented. Kept in NON_PIXEL_SHADER_RESOURCE state.
-  Microsoft::WRL::ComPtr<ID3D12Resource> held_swap_texture_;
-  uint64_t held_swap_texture_submission_ = 0;
-  D3D12_SHADER_RESOURCE_VIEW_DESC held_swap_srv_desc_{};
-  xenos::TextureFormat held_swap_format_{};
-  uint32_t held_swap_width_unscaled_ = 0, held_swap_height_unscaled_ = 0;
+  struct HeldSwap {
+    Microsoft::WRL::ComPtr<ID3D12Resource> texture;
+    uint64_t submission = 0;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    xenos::TextureFormat format{};
+    uint32_t width_unscaled = 0, height_unscaled = 0;
+  };
+  HeldSwap held_swaps_[kInterpMaxPresents];
 
   // Unsubmitted barrier batch.
   std::vector<D3D12_RESOURCE_BARRIER> barriers_;

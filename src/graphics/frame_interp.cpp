@@ -321,7 +321,7 @@ void Parse(const uint32_t* be, size_t n, ParsedFrame& out) {
 
 Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cur_be,
                   const ParsedFrame& cur, float t,
-                  std::vector<std::pair<uint32_t, uint32_t>>* lerped_pairs) {
+                  std::vector<std::pair<uint32_t, uint32_t>>* lerped_pairs, Pairing* pairing) {
   Stats stats;
   if (lerped_pairs) {
     lerped_pairs->clear();
@@ -336,10 +336,18 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
   // a static prop's are equal - ties going to the same occurrence (the same
   // pass), else to the nearest in stream order.
   constexpr uint32_t kNone = UINT32_MAX;
-  std::vector<uint32_t> match(cur.segments.size(), kNone);
+  Pairing own_pairing;
+  Pairing& pr = pairing ? *pairing : own_pairing;
+  const bool reuse = pr.filled;
+  if (!reuse) {
+    pr.match.assign(cur.segments.size(), kNone);
+    pr.sure.assign(cur.segments.size(), false);
+    pr.copies.assign(cur.segments.size(), 0);
+  }
+  std::vector<uint32_t>& match = pr.match;
   std::vector<bool> used(prev.segments.size());
-  std::vector<bool> sure(cur.segments.size());  // its signature's count did not change
-  std::vector<uint32_t> copies(cur.segments.size());  // draws of its key, where it had copies
+  std::vector<bool>& sure = pr.sure;  // its signature's count did not change
+  std::vector<uint32_t>& copies = pr.copies;  // draws of its key, where it had copies
   std::vector<uint32_t> mark(kAluEnd - kAluFirst), mark_at(kAluEnd - kAluFirst);
   uint32_t mark_stamp = 0;
   // The cur draw's ALU constants, by register, for `distance` to a draw with
@@ -571,18 +579,20 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
   // Copies as many in both frames are the same objects: within a key they
   // pair surely. Where the count changed, the pairings left are guesses (one
   // object came into view at one end of a row while another left).
-  pair_by(&ParsedFrame::Segment::signature, true);
-  // Then by what a draw shows from textures the frame rendered itself: the
-  // textures it sets besides can change with the draw order (an icon drawn
-  // first re-sets a texture the others inherit).
-  pair_by(&ParsedFrame::Segment::content, true);
-  // Then by the draw alone: which textures a draw sets itself depends on what
-  // the draw before it left bound, which changes when draws are re-sorted, and
-  // a fighter's face shows another texture with each expression.
-  pair_by(&ParsedFrame::Segment::draw, true);
-  // Last by the shaders alone, as guesses: one mesh may be drawn from new
-  // index data each tick, but other meshes share its shaders too.
-  pair_by(&ParsedFrame::Segment::shaders, false);
+  if (!reuse) {
+    pair_by(&ParsedFrame::Segment::signature, true);
+    // Then by what a draw shows from textures the frame rendered itself: the
+    // textures it sets besides can change with the draw order (an icon drawn
+    // first re-sets a texture the others inherit).
+    pair_by(&ParsedFrame::Segment::content, true);
+    // Then by the draw alone: which textures a draw sets itself depends on what
+    // the draw before it left bound, which changes when draws are re-sorted, and
+    // a fighter's face shows another texture with each expression.
+    pair_by(&ParsedFrame::Segment::draw, true);
+    // Last by the shaders alone, as guesses: one mesh may be drawn from new
+    // index data each tick, but other meshes share its shaders too.
+    pair_by(&ParsedFrame::Segment::shaders, false);
+  }
   // The game uploads only the constant ranges that changed since its previous
   // draw, so one draw can split its writes differently between frames: those
   // pair by register, with the value the previous frame's draw saw - the last
@@ -655,7 +665,7 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
   // so their signatures: each paired with the other's previous draw. Within a
   // draw whose copies carry several signatures, two pairings that are nearer
   // swapped, by the constants each draw saw, are swapped.
-  {
+  if (!reuse) {
     std::vector<std::pair<uint64_t, uint32_t>> group;  // draw, cur draw
     for (uint32_t i = 0; i < cur.segments.size(); ++i) {
       if (match[i] != kNone) {
@@ -707,6 +717,7 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
   // to another source (draws that carried that source last frame lerp it
   // cleanly) must not blend two sources. Per ALU register: that draw's value
   // as recorded << 32 | as lerped (all ones, a NaN never borrowed: unset).
+  pr.filled = true;
   std::vector<uint64_t> lerped(kAluEnd - kAluFirst, ~0ull);
   std::vector<uint32_t> saved;  // a jumped draw's constants before its lerp
   std::vector<std::pair<uint32_t, uint32_t>> turned;  // cur offset, value: rotation entries

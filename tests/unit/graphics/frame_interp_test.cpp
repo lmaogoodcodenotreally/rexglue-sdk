@@ -719,3 +719,39 @@ TEST_CASE("frame_interp lerps particle quads whose list shifted") {
   CHECK(x(2) == 10.2f);
   CHECK(x(3) == 20.2f);
 }
+
+TEST_CASE("frame_interp reuses its pairing for more in-between frames") {
+  // The rickshaws above, at 1/3 and 2/3 of the tick (144 Hz from 60 Hz): the
+  // pairing kept from the first in-between frame lerps the second alike.
+  auto rickshaw = [](Stream& s, bool binds, float x) {
+    s.Shaders(0x1000, 0x2000);
+    if (binds) {
+      s.Put((1u << 16) | 0x4800);
+      s.Put(0x2);
+      s.Put(0xA0000000);
+    }
+    s.Constants(0x4000, {x, 0, 0, 1});
+    s.Draw(0x11);
+  };
+  Stream prev, cur;
+  rickshaw(prev, true, 10);
+  rickshaw(prev, false, 13);
+  rickshaw(cur, true, 16);
+  const size_t b = cur.be.size() - 6;
+  rickshaw(cur, false, 7);
+  const size_t a = cur.be.size() - 6;
+
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Pairing pairing;
+  Stream first = cur;
+  Interpolate(prev.be.data(), pp, first.be.data(), pc, 1.0f / 3, nullptr, &pairing);
+  CHECK(pairing.filled);
+  CHECK(first.Float(b) == 14.0f);  // each with itself
+  CHECK(first.Float(a) == 9.0f);
+  Stream second = cur;
+  Interpolate(prev.be.data(), pp, second.be.data(), pc, 2.0f / 3, nullptr, &pairing);
+  CHECK(second.Float(b) == 15.0f);
+  CHECK(second.Float(a) == 8.0f);
+}

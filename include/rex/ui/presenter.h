@@ -379,6 +379,9 @@ class Presenter {
   // vblank (WaitForUITickFromUIThread).
   bool IsGuestOutputRefreshing() const;
 
+  // The refresh rate of the monitor the window is on, in Hz (0 if unknown).
+  uint32_t host_refresh_hz() const { return host_refresh_hz_.load(std::memory_order_relaxed); }
+
  protected:
   enum class PaintResult {
     kPresented,
@@ -1025,6 +1028,7 @@ class Presenter {
   // information such as the DXGI output if the monitor hasn't actually been
   // changed in the current state change (such as window positioning changes).
   HMONITOR surface_win32_monitor_ = nullptr;
+  std::atomic<uint32_t> host_refresh_hz_{0};
 
   // Requiring the lowest version of DXGI for IDXGIOutput::WaitForVBlank, which
   // is available even on Windows Vista, but for IDXGIFactory1::IsCurrent,

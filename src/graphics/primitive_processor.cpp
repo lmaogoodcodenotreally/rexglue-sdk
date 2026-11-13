@@ -285,6 +285,9 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
   }
   if (shared_memory_.interp_replay_) {
     const uint32_t packet = shared_memory_.interp_packet_;
+    while (interp_result_next_ && interp_results_[interp_result_next_ - 1].first >= packet) {
+      --interp_result_next_;  // the next replay of the same frame
+    }
     while (interp_result_next_ < interp_results_.size() &&
            interp_results_[interp_result_next_].first < packet) {
       ++interp_result_next_;

@@ -1455,6 +1455,21 @@ void Presenter::UpdateSurfaceMonitorFromUIThread(bool old_monitor_potentially_di
   }
   if (old_monitor_potentially_disconnected || surface_win32_monitor_ != surface_new_win32_monitor) {
     surface_win32_monitor_ = surface_new_win32_monitor;
+    // shortcut: read on monitor changes only, so a refresh rate changed in the
+    // display settings without moving the window applies after a restart.
+    uint32_t refresh_hz = 0;
+    MONITORINFOEXW monitor_info = {};
+    monitor_info.cbSize = sizeof(monitor_info);
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    if (surface_new_win32_monitor && GetMonitorInfoW(surface_new_win32_monitor, &monitor_info) &&
+        EnumDisplaySettingsW(monitor_info.szDevice, ENUM_CURRENT_SETTINGS, &mode) &&
+        mode.dmDisplayFrequency > 1) {  // 0 and 1 mean the hardware default
+      refresh_hz = mode.dmDisplayFrequency;
+    }
+    if (host_refresh_hz_.exchange(refresh_hz, std::memory_order_relaxed) != refresh_hz) {
+      REXLOG_INFO("Presenter: display refresh rate {} Hz", refresh_hz);
+    }
     if (dxgi_ui_tick_factory_ && !dxgi_ui_tick_factory_->IsCurrent()) {
       // If a monitor has been newly connected, it won't appear in the old
       // factory, need to recreate it.

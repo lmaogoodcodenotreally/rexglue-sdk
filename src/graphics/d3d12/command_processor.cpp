@@ -1993,7 +1993,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                     frontbuffer_height);
 }
 
-bool D3D12CommandProcessor::HoldSwapTexture() {
+bool D3D12CommandProcessor::HoldSwapTexture(uint32_t slot) {
+  HeldSwap& held = held_swaps_[slot];
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -2006,25 +2007,25 @@ bool D3D12CommandProcessor::HoldSwapTexture() {
     return false;
   }
   D3D12_RESOURCE_DESC desc = source->GetDesc();
-  if (held_swap_texture_) {
-    D3D12_RESOURCE_DESC held_desc = held_swap_texture_->GetDesc();
+  if (held.texture) {
+    D3D12_RESOURCE_DESC held_desc = held.texture->GetDesc();
     if (held_desc.Width != desc.Width || held_desc.Height != desc.Height ||
         held_desc.Format != desc.Format) {
-      if (submission_completed_ < held_swap_texture_submission_ &&
-          EnqueueResourceDeletion(held_swap_texture_submission_, held_swap_texture_.Get())) {
-        held_swap_texture_->AddRef();
+      if (submission_completed_ < held.submission &&
+          EnqueueResourceDeletion(held.submission, held.texture.Get())) {
+        held.texture->AddRef();
       }
-      held_swap_texture_.Reset();
+      held.texture.Reset();
     }
   }
-  if (!held_swap_texture_) {
+  if (!held.texture) {
     desc.Alignment = 0;
     desc.Flags = D3D12_RESOURCE_FLAG_NONE;
     const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
     if (FAILED(provider.GetDevice()->CreateCommittedResource(
             &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(), &desc,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-            IID_PPV_ARGS(&held_swap_texture_)))) {
+            IID_PPV_ARGS(&held.texture)))) {
       REXGPU_ERROR("frame_interp: failed to create the held swap texture");
       return false;
     }
@@ -2032,33 +2033,34 @@ bool D3D12CommandProcessor::HoldSwapTexture() {
   // RequestSwapTexture left the source in NON_PIXEL_SHADER_RESOURCE.
   PushTransitionBarrier(source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         D3D12_RESOURCE_STATE_COPY_SOURCE);
-  PushTransitionBarrier(held_swap_texture_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+  PushTransitionBarrier(held.texture.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         D3D12_RESOURCE_STATE_COPY_DEST);
   SubmitBarriers();
-  deferred_command_list_.D3DCopyResource(held_swap_texture_.Get(), source);
+  deferred_command_list_.D3DCopyResource(held.texture.Get(), source);
   PushTransitionBarrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-  PushTransitionBarrier(held_swap_texture_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+  PushTransitionBarrier(held.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-  held_swap_texture_submission_ = submission_current_;
-  held_swap_srv_desc_ = srv_desc;
-  held_swap_format_ = format;
-  held_swap_width_unscaled_ = width_unscaled;
-  held_swap_height_unscaled_ = height_unscaled;
+  held.submission = submission_current_;
+  held.srv_desc = srv_desc;
+  held.format = format;
+  held.width_unscaled = width_unscaled;
+  held.height_unscaled = height_unscaled;
   return true;
 }
 
-void D3D12CommandProcessor::PresentHeldSwapTexture(uint32_t frontbuffer_width,
+void D3D12CommandProcessor::PresentHeldSwapTexture(uint32_t slot, uint32_t frontbuffer_width,
                                                    uint32_t frontbuffer_height) {
+  HeldSwap& held = held_swaps_[slot];
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
-  if (!held_swap_texture_ || !graphics_system_ || !graphics_system_->presenter() ||
+  if (!held.texture || !graphics_system_ || !graphics_system_->presenter() ||
       !BeginSubmission(true)) {
     return;
   }
-  held_swap_texture_submission_ = submission_current_;
-  PresentSwapSource(held_swap_texture_.Get(), held_swap_srv_desc_, held_swap_format_,
-                    held_swap_width_unscaled_, held_swap_height_unscaled_, frontbuffer_width,
+  held.submission = submission_current_;
+  PresentSwapSource(held.texture.Get(), held.srv_desc, held.format,
+                    held.width_unscaled, held.height_unscaled, frontbuffer_width,
                     frontbuffer_height);
 }
 
