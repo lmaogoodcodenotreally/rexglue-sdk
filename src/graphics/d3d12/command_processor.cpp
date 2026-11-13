@@ -2904,6 +2904,67 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  // High-resolution shadows: the shadow caster pass is drawn again, larger.
+  if (!memexport_used && render_target_cache_->IsShadowEnabled()) {
+    uint32_t sampled_bases[32];
+    uint32_t sampled_count = 0;
+    uint32_t sampled_remaining = used_texture_mask, sampled_index;
+    while (rex::bit_scan_forward(sampled_remaining, &sampled_index)) {
+      sampled_remaining &= ~(uint32_t(1) << sampled_index);
+      sampled_bases[sampled_count++] = uint32_t(regs.GetTextureFetch(sampled_index).base_address)
+                                       << 12;
+    }
+    uint32_t shadow_factor = render_target_cache_->ShadowMirrorDraw(
+        bound_depth_and_color_render_target_bits, bound_depth_and_color_render_target_formats,
+        scissor, sampled_bases, sampled_count);
+    if (shadow_factor) {
+      // The host viewport grows with the resolution scale (and would exceed the
+      // Direct3D 12 bounds if just scaled), so it's derived again for the
+      // shadow target, with its NDC transformation in one-use system constants.
+      draw_util::ViewportInfo shadow_viewport_info;
+      draw_util::GetHostViewportInfo(regs, shadow_factor, shadow_factor, true,
+                                     D3D12_VIEWPORT_BOUNDS_MAX, D3D12_VIEWPORT_BOUNDS_MAX, false,
+                                     normalized_depth_control, convert_z_to_float24,
+                                     host_render_targets_used, ps_writes_depth,
+                                     shadow_viewport_info);
+      D3D12_VIEWPORT shadow_viewport;
+      shadow_viewport.TopLeftX = float(shadow_viewport_info.xy_offset[0]);
+      shadow_viewport.TopLeftY = float(shadow_viewport_info.xy_offset[1]);
+      shadow_viewport.Width = float(shadow_viewport_info.xy_extent[0]);
+      shadow_viewport.Height = float(shadow_viewport_info.xy_extent[1]);
+      shadow_viewport.MinDepth = shadow_viewport_info.z_min;
+      shadow_viewport.MaxDepth = shadow_viewport_info.z_max;
+      SetViewport(shadow_viewport);
+      D3D12_GPU_VIRTUAL_ADDRESS shadow_system_constants_address;
+      auto shadow_system_constants = reinterpret_cast<decltype(system_constants_)*>(
+          constant_buffer_pool_->Request(frame_current_, sizeof(system_constants_),
+                                         D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr,
+                                         nullptr, &shadow_system_constants_address));
+      if (shadow_system_constants) {
+        std::memcpy(shadow_system_constants, &system_constants_, sizeof(system_constants_));
+        std::memcpy(shadow_system_constants->ndc_scale, shadow_viewport_info.ndc_scale,
+                    sizeof(shadow_viewport_info.ndc_scale));
+        std::memcpy(shadow_system_constants->ndc_offset, shadow_viewport_info.ndc_offset,
+                    sizeof(shadow_viewport_info.ndc_offset));
+        uint32_t root_parameter_system_constants = bindless_resources_used_
+                                                       ? kRootParameter_Bindless_SystemConstants
+                                                       : kRootParameter_Bindful_SystemConstants;
+        deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+            root_parameter_system_constants, shadow_system_constants_address);
+        // The next draw binds the guest system constants again.
+        current_graphics_root_up_to_date_ &= ~(1u << root_parameter_system_constants);
+        if (primitive_processing_result.index_buffer_type ==
+            PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+          deferred_command_list_.D3DDrawInstanced(
+              primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
+        } else {
+          deferred_command_list_.D3DDrawIndexedInstanced(
+              primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+        }
+      }
+    }
+  }
+
   if (memexport_used) {
     // Make sure this memexporting draw is ordered with other work using shared
     // memory as a UAV.
@@ -4588,6 +4649,15 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   }
 
   assert_true(sampler_count_vertex + sampler_count_pixel <= kSamplerHeapSize);
+
+  // A new high-resolution stand-in replaces descriptors whose keys didn't change.
+  if (hires_override_generation_written_ != texture_cache_->hires_override_generation()) {
+    hires_override_generation_written_ = texture_cache_->hires_override_generation();
+    cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+    cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+    bindful_textures_written_vertex_ = false;
+    bindful_textures_written_pixel_ = false;
+  }
 
   if (bindless_resources_used_) {
     //

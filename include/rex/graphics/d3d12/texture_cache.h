@@ -113,6 +113,17 @@ class D3D12TextureCache final : public TextureCache {
                                     D3D12_CPU_DESCRIPTOR_HANDLE handle);
   uint32_t GetActiveTextureBindlessSRVIndex(const D3D12Shader::TextureBinding& host_shader_binding);
 
+  // A higher-resolution stand-in for a resolved 2D texture (shadow_quality):
+  // unsigned 2D fetches of the guest texture at base with these dimensions
+  // sample resource instead. The resource must stay alive for the session and
+  // be in a shader resource state when sampled. Bindings already written keep
+  // their old descriptors until the generation is checked.
+  void SetHiResOverride(uint32_t base, uint32_t width, uint32_t height, ID3D12Resource* resource,
+                        DXGI_FORMAT format);
+  // Drops the stand-in for base, if any (the guest wrote that texture itself).
+  void ClearHiResOverride(uint32_t base);
+  uint32_t hires_override_generation() const { return hires_override_generation_; }
+
   SamplerParameters GetSamplerParameters(const D3D12Shader::SamplerBinding& binding) const;
   void WriteSampler(SamplerParameters parameters, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
@@ -454,6 +465,21 @@ class D3D12TextureCache final : public TextureCache {
                                          bool is_signed, uint32_t host_swizzle);
   void ReleaseTextureDescriptor(uint32_t descriptor_index);
   D3D12_CPU_DESCRIPTOR_HANDLE GetTextureDescriptorCPUHandle(uint32_t descriptor_index) const;
+  // A new cached (bindful) or bindless descriptor slot, UINT32_MAX if failed.
+  uint32_t AllocateTextureDescriptor();
+
+  struct HiResOverride {
+    uint32_t base, width, height;
+    ID3D12Resource* resource;
+    DXGI_FORMAT format;
+    // host_swizzle -> descriptor index.
+    std::vector<std::pair<uint32_t, uint32_t>> descriptors;
+  };
+  std::vector<HiResOverride> hires_overrides_;
+  uint32_t hires_override_generation_ = 0;
+  // The stand-in descriptor for a binding, or UINT32_MAX if it has none.
+  uint32_t GetHiResOverrideDescriptor(const TextureBinding& binding,
+                                      const D3D12Shader::TextureBinding& host_shader_binding);
 
   size_t GetScaledResolveBufferCount() const {
     assert_true(IsDrawResolutionScaled());

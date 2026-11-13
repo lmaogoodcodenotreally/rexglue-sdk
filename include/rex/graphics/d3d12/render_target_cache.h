@@ -108,6 +108,17 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // GPU leaves the surface the scene was resolved from (render_target_cache_ssao.cpp).
   void SsaoFlushIfLeavingSurface(D3D12TextureCache& texture_cache);
 
+  // High-resolution projected shadows (shadow_quality,
+  // render_target_cache_shadow.cpp). After each guest draw: returns the
+  // resolution scale (non-zero) if the same draw must be issued again now, with
+  // the viewport for that scale, into the high-resolution copy of the shadow
+  // caster pass this method has just bound (with its scissor). sampled_bases
+  // are the bases of the textures the draw fetches.
+  uint32_t ShadowMirrorDraw(uint32_t bound_render_targets, const uint32_t* bound_formats,
+                            const draw_util::Scissor& scissor_scaled,
+                            const uint32_t* sampled_bases, uint32_t sampled_count);
+  bool IsShadowEnabled() const;
+
  protected:
   uint32_t GetMaxRenderTargetWidth() const override { return D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION; }
   uint32_t GetMaxRenderTargetHeight() const override {
@@ -204,6 +215,49 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void SsaoNoteResolve(const draw_util::ResolveInfo& resolve_info);
   void SsaoRun(D3D12TextureCache& texture_cache);
   void SsaoShutdown();
+
+  // High-resolution projected shadows: the caster pass (textureless draws into
+  // a small 8888 + depth surface) is drawn again into shadow_.color/depth at
+  // shadow_.factor times the guest resolution; the pass that blurs its resolved
+  // texture is replaced by a Gaussian blur of that copy, and the blurred
+  // texture's guest address samples the result instead.
+  struct ShadowTexture {
+    ID3D12Resource* resource = nullptr;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+  };
+  struct ShadowState {
+    uint32_t factor = 0;  // 0 = not set up yet
+    uint32_t size = 0;    // width and height of color/depth in texels
+    DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN;
+    xenos::DepthRenderTargetFormat depth_format = xenos::DepthRenderTargetFormat::kD24S8;
+    ShadowTexture color, depth, blur_temp;
+    ID3D12DescriptorHeap* rtv_heap = nullptr;
+    ID3D12DescriptorHeap* dsv_heap = nullptr;
+    ID3D12PipelineState* blur_pipeline = nullptr;
+    // The caster pass being mirrored: its surface, and draws so far.
+    uint32_t pass_surface_info = 0, pass_color_info = 0, pass_depth_info = 0;
+    uint32_t pass_draws = 0;
+    // Guest texture the copy currently holds (resolved from the caster pass).
+    uint32_t holds_base = 0;
+    // Draws on the caster surface sampled holds_base since its last resolve
+    // (the game's blur of the casters).
+    bool pass_blurs = false;
+    // The game blurred holds_base in place; its next copy is the blurred mask.
+    bool holds_blurred = false;
+    // Last resolve clear values of the caster surface.
+    uint32_t clear_color = 0, clear_depth = 0;
+    bool clear_known = false;
+    // Blurred results by guest base.
+    std::vector<std::pair<uint32_t, ShadowTexture>> results;
+  };
+  ShadowState shadow_;
+  bool ShadowEnsureResources(uint32_t surface_pitch, DXGI_FORMAT color_format,
+                             xenos::DepthRenderTargetFormat depth_format);
+  void ShadowTransition(ShadowTexture& texture, D3D12_RESOURCE_STATES state);
+  void ShadowNoteResolve(const draw_util::ResolveInfo& resolve_info, bool copied,
+                         D3D12TextureCache& texture_cache);
+  void ShadowBlur(const draw_util::ResolveInfo& resolve_info, D3D12TextureCache& texture_cache);
+  void ShadowShutdown();
   struct ResolveCopyShaderCode {
     const void* unscaled;
     size_t unscaled_size;

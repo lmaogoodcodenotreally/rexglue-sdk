@@ -804,6 +804,71 @@ void D3D12TextureCache::WriteActiveTextureSRVKeys(
   }
 }
 
+void D3D12TextureCache::SetHiResOverride(uint32_t base, uint32_t width, uint32_t height,
+                                         ID3D12Resource* resource, DXGI_FORMAT format) {
+  for (HiResOverride& o : hires_overrides_) {
+    if (o.base == base && o.width == width && o.height == height) {
+      if (o.resource == resource) {
+        return;
+      }
+      // shortcut: the old descriptors are leaked, fine for the few stand-ins a
+      // game creates; release them if stand-ins ever get replaced often.
+      o.resource = resource;
+      o.format = format;
+      o.descriptors.clear();
+      ++hires_override_generation_;
+      return;
+    }
+  }
+  hires_overrides_.push_back({base, width, height, resource, format, {}});
+  ++hires_override_generation_;
+}
+
+void D3D12TextureCache::ClearHiResOverride(uint32_t base) {
+  for (auto it = hires_overrides_.begin(); it != hires_overrides_.end(); ++it) {
+    if (it->base == base) {
+      hires_overrides_.erase(it);
+      ++hires_override_generation_;
+      return;
+    }
+  }
+}
+
+uint32_t D3D12TextureCache::GetHiResOverrideDescriptor(
+    const TextureBinding& binding, const D3D12Shader::TextureBinding& host_shader_binding) {
+  if (host_shader_binding.is_signed || host_shader_binding.dimension != xenos::FetchOpDimension::k2D ||
+      binding.key.dimension != xenos::DataDimension::k2DOrStacked) {
+    return UINT32_MAX;
+  }
+  for (HiResOverride& o : hires_overrides_) {
+    if (o.base >> 12 != binding.key.base_page || o.width != binding.key.width_minus_1 + 1 ||
+        o.height != binding.key.height_minus_1 + 1) {
+      continue;
+    }
+    for (const auto& d : o.descriptors) {
+      if (d.first == binding.host_swizzle) {
+        return d.second;
+      }
+    }
+    uint32_t descriptor_index = AllocateTextureDescriptor();
+    if (descriptor_index == UINT32_MAX) {
+      return UINT32_MAX;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+    desc.Format = o.format;
+    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    desc.Shader4ComponentMapping =
+        binding.host_swizzle | D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+    desc.Texture2DArray.MipLevels = 1;
+    desc.Texture2DArray.ArraySize = 1;
+    command_processor_.GetD3D12Provider().GetDevice()->CreateShaderResourceView(
+        o.resource, &desc, GetTextureDescriptorCPUHandle(descriptor_index));
+    o.descriptors.emplace_back(binding.host_swizzle, descriptor_index);
+    return descriptor_index;
+  }
+  return UINT32_MAX;
+}
+
 void D3D12TextureCache::WriteActiveTextureBindfulSRV(
     const D3D12Shader::TextureBinding& host_shader_binding, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
   assert_false(bindless_resources_used_);
@@ -811,6 +876,15 @@ void D3D12TextureCache::WriteActiveTextureBindfulSRV(
   Texture* texture = nullptr;
   uint32_t fetch_constant_index = host_shader_binding.fetch_constant;
   const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (binding && !hires_overrides_.empty()) {
+    uint32_t hires_descriptor_index = GetHiResOverrideDescriptor(*binding, host_shader_binding);
+    if (hires_descriptor_index != UINT32_MAX) {
+      command_processor_.GetD3D12Provider().GetDevice()->CopyDescriptorsSimple(
+          1, handle, GetTextureDescriptorCPUHandle(hires_descriptor_index),
+          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      return;
+    }
+  }
   if (binding && AreDimensionsCompatible(host_shader_binding.dimension, binding->key.dimension)) {
     bool force_special_view = binding->key.dimension == xenos::DataDimension::k3D &&
                               (host_shader_binding.dimension == xenos::FetchOpDimension::k1D ||
@@ -883,6 +957,12 @@ uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
   uint32_t descriptor_index = UINT32_MAX;
   uint32_t fetch_constant_index = host_shader_binding.fetch_constant;
   const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (binding && !hires_overrides_.empty()) {
+    uint32_t hires_descriptor_index = GetHiResOverrideDescriptor(*binding, host_shader_binding);
+    if (hires_descriptor_index != UINT32_MAX) {
+      return hires_descriptor_index;
+    }
+  }
   if (binding && AreDimensionsCompatible(host_shader_binding.dimension, binding->key.dimension)) {
     bool force_special_view = binding->key.dimension == xenos::DataDimension::k3D &&
                               (host_shader_binding.dimension == xenos::FetchOpDimension::k1D ||
@@ -2319,6 +2399,18 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
       host_swizzle | D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
 
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  uint32_t descriptor_index = AllocateTextureDescriptor();
+  if (descriptor_index == UINT32_MAX) {
+    return UINT32_MAX;
+  }
+  device->CreateShaderResourceView(resource_for_view, &desc,
+                                   GetTextureDescriptorCPUHandle(descriptor_index));
+  texture.AddSRVDescriptorIndex(descriptor_key, descriptor_index);
+  return descriptor_index;
+}
+
+uint32_t D3D12TextureCache::AllocateTextureDescriptor() {
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
   uint32_t descriptor_index;
   if (bindless_resources_used_) {
     descriptor_index = command_processor_.RequestPersistentViewBindlessDescriptor();
@@ -2358,9 +2450,6 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
       descriptor_index = srv_descriptor_cache_allocated_++;
     }
   }
-  device->CreateShaderResourceView(resource_for_view, &desc,
-                                   GetTextureDescriptorCPUHandle(descriptor_index));
-  texture.AddSRVDescriptorIndex(descriptor_key, descriptor_index);
   return descriptor_index;
 }
 

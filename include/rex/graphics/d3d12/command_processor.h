@@ -802,6 +802,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool bindful_textures_written_pixel_;
   bool bindful_samplers_written_vertex_;
   bool bindful_samplers_written_pixel_;
+  // Texture cache stand-in generation the written texture bindings reflect.
+  uint32_t hires_override_generation_written_ = 0;
   // Layout UIDs and last texture and sampler bindings written to the current
   // descriptor heaps (for bindful) or descriptor index constant buffer (for
   // bindless) with the last used descriptor layout. Valid only when:

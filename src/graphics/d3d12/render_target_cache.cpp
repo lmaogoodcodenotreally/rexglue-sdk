@@ -960,6 +960,7 @@ bool D3D12RenderTargetCache::Initialize() {
 }
 
 void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
+  ShadowShutdown();
   SsaoShutdown();
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
@@ -1419,6 +1420,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     cleared = true;
   }
 
+  ShadowNoteResolve(resolve_info, written_length_out != 0, texture_cache);
   return copied && cleared;
 }
 
