@@ -254,7 +254,7 @@ void CommandProcessor::WorkerThreadMain() {
       uint32_t loop_count = 0;
       do {
         // If we spin around too much, revert to a "low-power" state.
-        if (loop_count > 500) {
+        if (loop_count > 500 && !HeldSwapDueSoon()) {
           const int wait_time_ms = interp_held_pending_ ? 1 : 5;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
@@ -1327,6 +1327,13 @@ void CommandProcessor::RecordPacket(const memory::RingBuffer& reader) {
   copy.Read(reinterpret_cast<uint8_t*>(interp_cur_.data() + at), dwords * sizeof(uint32_t));
 }
 
+bool CommandProcessor::HeldSwapDueSoon() const {
+  return interp_held_pending_ &&
+         interp_held_[interp_held_next_].deadline <
+             rex::chrono::Clock::QueryHostTickCount() +
+                 rex::chrono::Clock::QueryHostTickFrequency() / 500;
+}
+
 void CommandProcessor::ServiceHeldSwap(bool force) {
   while (interp_held_pending_) {
     if (force) {
@@ -2142,18 +2149,19 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       if (wait >= 0x100) {
         PrepareForWait();
         const uint64_t wait_start = rex::chrono::Clock::QueryHostTickCount();  // TEMP DIAGNOSTIC
-        if (!REXCVAR_GET(vsync)) {
+        // Held frames pending: sleep no more than 1 ms, none when one is due.
+        const uint32_t wait_ms = interp_held_pending_ ? 1 : wait / 0x100;
+        if (!REXCVAR_GET(vsync) || HeldSwapDueSoon()) {
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
-        } else if (wait_guard.addr &&
-                   wait_wake::Wait(wait_guard.addr, wait / 0x100 * 1000)) {
+        } else if (wait_guard.addr && wait_wake::Wait(wait_guard.addr, wait_ms * 1000)) {
           // Event-driven: asleep on the polled dword itself; MarkVblank's
           // WakeAll after the guest vblank ISR returns brings us back right
           // away. The timeout is the old Sleep quantum, so any condition
           // cleared by a different writer times out exactly like before.
           waitreg_used_wake = true;
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          rex::thread::Sleep(std::chrono::milliseconds(wait_ms));
         }
         rex::thread::SyncMemory();
         interp_wait_ticks_ += rex::chrono::Clock::QueryHostTickCount() - wait_start;

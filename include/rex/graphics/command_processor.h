@@ -196,6 +196,9 @@ class CommandProcessor {
   // Presents the held frames once their time has come (or the real one now if
   // `force`, dropping in-between ones that are too late).
   void ServiceHeldSwap(bool force);
+  // A held frame is due within 2 ms: the CP's idle waits then spin instead of
+  // sleeping, as a sleep's 1 ms granularity sent it out 0-1 ms late.
+  bool HeldSwapDueSoon() const;
   void RecordPacket(const memory::RingBuffer& reader);
   bool IsReplaySkippedRegister(uint32_t index);
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
