@@ -1214,6 +1214,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
       if (CaptureWanted(++g_capture_swap)) {  // TEMP DIAGNOSTIC
         CaptureGuest(graphics_system_, "r", g_capture_swap);
       }
+      PrefetchFrameUploads();
       // TEMP DIAGNOSTIC: the same pacing line as frame_interp's, for comparison.
       static uint64_t last = 0, sum = 0, slow = 0, frames = 0;
       const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
@@ -1684,7 +1685,9 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
   if (shared_memory->interp_dump_) {
       REXGPU_INFO("IDUMP begin");
     }
+    shared_memory->interp_packet_ = 0;  // the prefetch is the next frame's first upload
   }
+  PrefetchFrameUploads();
 }
 
 CommandProcessor::InterpBudgetScope::InterpBudgetScope(uint64_t& s)

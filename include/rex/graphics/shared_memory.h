@@ -115,6 +115,18 @@ class SharedMemory {
   // After the replay: textures loaded from restored versions reload next frame.
   void InterpEndReplay();
   void InterpEndFrame();
+  // Uploads in one batch the pages draws read two frames ago that the CPU has
+  // written again since: the game's per-frame data (dynamic meshes, double-
+  // buffered) is written ahead of the frame drawing it, and fetched draw by
+  // draw it cost a copy and a barrier pair each (DOA4: ~600 a frame, ~2.7 ms
+  // of GPU time, latency-bound). Two frames ago, not the last one: a double
+  // buffer's half the last frame read is already being rewritten for the
+  // frame after next (DOA4 fights: ~700 pages a frame uploaded for nothing).
+  // Pages written again after this upload as before on demand. Call at the
+  // end of a frame, in an open submission, before the next frame's first
+  // command.
+  bool UploadPrefetchEnabled() const;
+  void PrefetchFrameUploads();
   // Resolve rectangles are read from guest memory by the CPU: the real frame
   // keeps the 6 guest dwords at `address`, its replay gets them back (null
   // when not interpolating or not kept: read guest memory as usual).
@@ -241,6 +253,13 @@ class SharedMemory {
 
   // Pages whose contents in the buffer are in sync with guest memory.
   std::vector<uint64_t> system_page_flags_valid_;
+  // Pages requested (read by the GPU) this frame, the frame before, and the
+  // one before that. Requests, not uploads: pages the prefetch uploaded but
+  // nothing read must drop out (as uploads, every page the CPU keeps writing
+  // stayed in forever: 5 GB/s).
+  std::vector<uint64_t> upload_history_[3];
+  std::vector<std::pair<uint32_t, uint32_t>> prefetch_ranges_;  // pages
+  void NoteRequested(uint32_t start, uint32_t length);  // bytes
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
   uint32_t num_system_page_flags_ = 0;

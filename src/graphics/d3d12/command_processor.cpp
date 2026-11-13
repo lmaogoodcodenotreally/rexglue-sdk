@@ -1993,11 +1993,18 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                     frontbuffer_height);
 }
 
+void D3D12CommandProcessor::PrefetchFrameUploads() {
+  if (shared_memory_ && shared_memory_->UploadPrefetchEnabled() && BeginSubmission(true)) {
+    shared_memory_->PrefetchFrameUploads();
+  }
+}
+
 bool D3D12CommandProcessor::HoldSwapTexture(uint32_t slot) {
   HeldSwap& held = held_swaps_[slot];
   if (!BeginSubmission(true)) {
     return false;
   }
+  GpuZoneScope gpu_zone(*this, GpuZone::kInterp);  // TEMP DIAGNOSTIC
   D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
   xenos::TextureFormat format;
   uint32_t width_unscaled = 0, height_unscaled = 0;
@@ -2070,6 +2077,7 @@ void D3D12CommandProcessor::PresentSwapSource(
     xenos::TextureFormat frontbuffer_format, uint32_t frontbuffer_width_unscaled,
     uint32_t frontbuffer_height_unscaled, uint32_t frontbuffer_width,
     uint32_t frontbuffer_height) {
+  GpuZoneScope gpu_zone(*this, GpuZone::kSwap);  // TEMP DIAGNOSTIC
   ui::Presenter* presenter = graphics_system_->presenter();
   D3D12_RESOURCE_DESC swap_texture_desc = swap_texture_resource->GetDesc();
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
@@ -2489,6 +2497,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   render_target_cache_->SsaoFlushIfLeavingSurface(*texture_cache_);
   PERF_counter_add(kGpuEntryUs, rex::perf::PerfNowUs() - gpu_entry_t0);  // TEMP DIAGNOSTIC
 
+  SetGpuZone(GpuZone::kSetup);
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   {
@@ -2531,6 +2540,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                    : 0;
   {
     ScopedUsCounter gpu_rt_scope(rex::perf::CounterId::kGpuRtUs);  // TEMP DIAGNOSTIC
+    GpuZoneScope gpu_zone(*this, GpuZone::kRenderTargets);  // TEMP DIAGNOSTIC
     if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                       normalized_color_mask, *vertex_shader)) {
       return false;
@@ -2586,7 +2596,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
-  texture_cache_->RequestTextures(used_texture_mask);
+  {
+    GpuZoneScope gpu_zone(*this, GpuZone::kTextures);  // TEMP DIAGNOSTIC
+    texture_cache_->RequestTextures(used_texture_mask);
+  }
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -2837,6 +2850,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     } else {
       shared_memory_->UseForReading();
     }
+    SetGpuZone(GpuZone::kDraw);  // TEMP DIAGNOSTIC
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
@@ -2896,6 +2910,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     } else {
       shared_memory_->UseForReading();
     }
+    SetGpuZone(GpuZone::kDraw);  // TEMP DIAGNOSTIC
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
@@ -2916,6 +2931,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       sampled_bases[sampled_count++] = uint32_t(regs.GetTextureFetch(sampled_index).base_address)
                                        << 12;
     }
+    SetGpuZone(GpuZone::kEffects);  // TEMP DIAGNOSTIC
     uint32_t shadow_factor = render_target_cache_->ShadowMirrorDraw(
         bound_depth_and_color_render_target_bits, bound_depth_and_color_render_target_formats,
         scissor, sampled_bases, sampled_count);
@@ -3147,6 +3163,7 @@ bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  GpuZoneScope gpu_zone(*this, GpuZone::kResolves);  // TEMP DIAGNOSTIC
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -3618,6 +3635,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // end of the submission (when async pipeline creation requests are
     // fulfilled).
     deferred_command_list_.Reset();
+    GpuTimingBeginSubmission();
 
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
@@ -3729,6 +3747,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // Submit barriers now because resources with the queued barriers may be
     // destroyed between frames.
     SubmitBarriers();
+    GpuTimingEndSubmission();
 
     ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
 

@@ -188,6 +188,8 @@ class CommandProcessor {
   virtual SharedMemory* InterpSharedMemory() { return nullptr; }
   virtual void PresentHeldSwapTexture(uint32_t slot, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {}
+  // At a frame's end: SharedMemory::PrefetchFrameUploads in an open submission.
+  virtual void PrefetchFrameUploads() {}
   void SwapWithInterpolation(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                              uint32_t frontbuffer_height);
   void ReplayInterpolatedFrame();

@@ -371,6 +371,8 @@ bool D3D12SharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  D3D12CommandProcessor::GpuZoneScope gpu_zone(
+      command_processor_, D3D12CommandProcessor::GpuZone::kUploads);  // TEMP DIAGNOSTIC
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   bool keep_versions = interp_recording_ && !interp_replay_;
   if (keep_versions) {
@@ -394,6 +396,7 @@ bool D3D12SharedMemory::UploadRanges(
     }
   }
   command_processor_.SubmitBarriers();
+  ++command_processor_.gpu_timing_upload_calls_;  // TEMP DIAGNOSTIC
   auto& command_list = command_processor_.GetDeferredCommandList();
   for (auto upload_range : upload_page_ranges) {
     uint32_t upload_range_start = upload_range.first;
@@ -432,6 +435,7 @@ bool D3D12SharedMemory::UploadRanges(
                                            UINT64(upload_buffer_size));
           InterpNoteUpload(upload_range_start, uint32_t(upload_buffer_size >> page_size_log2()),
                            interp_version_used_);
+          command_processor_.gpu_timing_version_bytes_ += upload_buffer_size;  // TEMP DIAGNOSTIC
           interp_version_used_ += upload_buffer_size;
         }
       }
@@ -439,6 +443,8 @@ bool D3D12SharedMemory::UploadRanges(
       // bytes - to compare against expected per-frame traffic and detect
       // invalidation-window amplification.
       PERF_counter_add(kGpuUpBytes, int64_t(upload_buffer_size));
+      ++command_processor_.gpu_timing_upload_copies_;  // TEMP DIAGNOSTIC
+      command_processor_.gpu_timing_upload_bytes_ += upload_buffer_size;
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                        upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));
@@ -459,6 +465,8 @@ void D3D12SharedMemory::TransitionInterpVersionBuffer(D3D12_RESOURCE_STATES new_
 }
 
 bool D3D12SharedMemory::InterpUpload(uint32_t start, const uint8_t* data, uint32_t length) {
+  D3D12CommandProcessor::GpuZoneScope gpu_zone(
+      command_processor_, D3D12CommandProcessor::GpuZone::kInterp);  // TEMP DIAGNOSTIC
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
   auto& command_list = command_processor_.GetDeferredCommandList();
@@ -482,6 +490,8 @@ bool D3D12SharedMemory::InterpUpload(uint32_t start, const uint8_t* data, uint32
 }
 
 void D3D12SharedMemory::InterpRestore(uint32_t start, uint32_t length, uint64_t version) {
+  D3D12CommandProcessor::GpuZoneScope gpu_zone(
+      command_processor_, D3D12CommandProcessor::GpuZone::kInterp);  // TEMP DIAGNOSTIC
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   TransitionInterpVersionBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
   command_processor_.SubmitBarriers();
