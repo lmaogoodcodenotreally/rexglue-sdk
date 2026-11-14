@@ -484,6 +484,37 @@ TEST_CASE("frame_interp lerps the float words of vertex data in guest byte order
   REQUIRE(f(jumped[0]) == 100.0f);
 }
 
+TEST_CASE("frame_interp lerps 8 vertices at a time as one by one") {
+  // 19 vertices (two 8-vertex spans, three on their own) of x, y, z moving
+  // and a w moving on even vertices, staying -0 on odd ones: every one
+  // lerped, -0 kept (lerped, it is +0), a non-finite word kept; one span
+  // with a jump is not lerped at all.
+  auto be = [](float f) { return std::byteswap(std::bit_cast<uint32_t>(f)); };
+  auto f = [](uint32_t w) { return std::bit_cast<float>(std::byteswap(w)); };
+  constexpr uint32_t kVertices = 19, kStride = 4;
+  std::vector<uint32_t> prev, cur;
+  for (uint32_t v = 0; v < kVertices; ++v) {
+    for (float x : {float(v), 1.0f, -1.0f, v % 2 ? -0.0f : 2.0f}) prev.push_back(be(x));
+    for (float x : {v + 1.0f, 1.5f, -1.0f, v % 2 ? -0.0f : 3.0f}) cur.push_back(be(x));
+  }
+  cur[9 * kStride + 1] = be(std::numeric_limits<float>::infinity());
+  std::vector<uint32_t> work = cur;
+  REQUIRE(LerpVertexFloats(prev.data(), work.data(), kVertices, kStride, 0xF, {}, 2, 0.5f));
+  for (uint32_t v = 0; v < kVertices; ++v) {
+    CHECK(f(work[v * kStride]) == v + 0.5f);
+    if (v % 2) {
+      CHECK(work[v * kStride + 3] == 0x00000080u);  // -0 as stored
+    } else {
+      CHECK(f(work[v * kStride + 3]) == 2.5f);
+    }
+    if (v != 9) CHECK(f(work[v * kStride + 1]) == 1.25f);
+  }
+  CHECK(work[9 * kStride + 1] == cur[9 * kStride + 1]);
+  work = cur;
+  work[12 * kStride + 2] = be(50.0f);  // a jump in the second span
+  REQUIRE(!LerpVertexFloats(prev.data(), work.data(), kVertices, kStride, 0xF, {}, 2, 0.5f));
+}
+
 TEST_CASE("frame_interp lerps a fading vertex color per byte") {
   // A text quad's 8:8:8:8 color fading out while it moves: the color lerps per
   // byte (as stored: lanes do not depend on the swap), the position as floats.

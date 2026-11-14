@@ -136,6 +136,15 @@ if(REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES)
         PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 endif()
 
+# frame_interp lerps recorded frames on the host, no guest math: strict FP
+# exceptions and dynamic rounding make every float op a constrained one,
+# which LLVM never vectorizes (its vertex lerp ran 2x slower than vectorized,
+# fmax/fmin as CRT calls). Contraction stays off, so results are the same.
+# Its own FP options: not the target's strict-FP precompiled header.
+set_source_files_properties(frame_interp.cpp PROPERTIES
+    COMPILE_OPTIONS "-ffp-exception-behavior=ignore;-fno-rounding-math;-ffp-contract=off"
+    SKIP_PRECOMPILE_HEADERS ON)
+
 # Everything PRIVATE: the plugin has no consumers. Never link the OBJECT
 # libraries (rexcore/rexui) here; rexruntime already contains those objects
 # and relinking them would duplicate global state.

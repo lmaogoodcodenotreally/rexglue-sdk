@@ -989,11 +989,13 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
   return stats;
 }
 
-bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
-                      uint32_t stride_words, uint64_t float_words, const PackedWords& packed,
-                      uint32_t endian, float t, uint32_t group) {
-  const auto e = xenos::Endian(endian);
-  auto load = [e](uint32_t word) { return std::bit_cast<float>(xenos::GpuSwap(word, e)); };
+namespace {
+// Per endianness: a swap chosen per word cost ~a third of the lerp.
+template <xenos::Endian e>
+bool LerpVertexFloatsT(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
+                       uint32_t stride_words, uint64_t float_words, const PackedWords& packed,
+                       float t, uint32_t group) {
+  auto load = [](uint32_t word) { return std::bit_cast<float>(xenos::GpuSwap(word, e)); };
   // Instance data (debris: a rigid 3x4 matrix per "vertex") turns as
   // rotations: its rotation words may swing past a jump while tumbling.
   const bool matrices = stride_words >= 11 && (float_words & 0x7FF) == 0x7FF;
@@ -1001,6 +1003,18 @@ bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
   auto rigid = [&](const uint32_t* p, const uint32_t* c) {
     for (uint32_t k = 0; k < 11; ++k) {
       rp[k] = load(p[k]);
+    }
+    // Most instance-shaped data is vertices (15 floats, most lerped words):
+    // prev rows clearly of other lengths (squared, past LerpRotation's 2%
+    // with a margin) fail its first test; no square roots for those.
+    auto sq = [&](int r) {
+      return rp[r * 4] * rp[r * 4] + rp[r * 4 + 1] * rp[r * 4 + 1] + rp[r * 4 + 2] * rp[r * 4 + 2];
+    };
+    const float s0 = sq(0), s1 = sq(1), s2 = sq(2);
+    if (s1 > 1.1f * s0 || s1 < 0.9f * s0 || s2 > 1.1f * s0 || s2 < 0.9f * s0) {
+      return false;
+    }
+    for (uint32_t k = 0; k < 11; ++k) {
       rc[k] = load(c[k]);
     }
     return LerpRotation(rp, rc, t, turned);
@@ -1016,8 +1030,30 @@ bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
   hi.fill(-std::numeric_limits<float>::infinity());
   moved.fill(0);
   uint64_t changed = 0, packed_changed = 0;
-  for (uint32_t v = 0, i = 0; v < vertices; ++v) {
-    for (uint32_t w = 0; w < stride_words; ++w, ++i) {
+  // Most vertices only moved: every word that changed is a float that did
+  // not jump, or a packed word (not half floats). Those are told and summed
+  // branch-free 8 vertices at a time (whole 8-wide vectors; word k of the
+  // span is word k % stride of its vertex), the rest word by word. Per word
+  // of the span, all ones: a float; a packed word; changed, as either.
+  // None for fewer than 8 vertices: LerpPrimitives calls this per particle
+  // (thousands a frame), where setting the span up cost more than it saved.
+  const uint32_t span = vertices >= 8 ? 8 * stride_words : 0;
+  uint32_t floats[8 * 64], packs[8 * 64], float_changed[8 * 64], pack_changed[8 * 64];
+  float span_moved[8 * 64], span_lo[8 * 64], span_hi[8 * 64];  // span_lo/hi: finite cur values
+  for (uint32_t k = 0, w = 0; k < span; ++k, w = w + 1 == stride_words ? 0 : w + 1) {
+    floats[k] = (float_words >> w) & 1 ? ~0u : 0;
+    packs[k] = !floats[k] && (packed.words >> w) & 1 &&
+                       xenos::VertexFormat(packed.format[w]) != xenos::VertexFormat::k_16_16_FLOAT
+                   ? ~0u
+                   : 0;
+    float_changed[k] = pack_changed[k] = 0;
+    span_moved[k] = 0;
+    span_lo[k] = std::numeric_limits<float>::infinity();
+    span_hi[k] = -std::numeric_limits<float>::infinity();
+  }
+  // One vertex, word by word; false: the stream is not lerped.
+  auto judge = [&](uint32_t v) {
+    for (uint32_t w = 0, i = v * stride_words; w < stride_words; ++w, ++i) {
       const bool is_float = (float_words >> w) & 1;
       if (!is_float) {
         if (prev[i] != cur[i]) {
@@ -1033,42 +1069,96 @@ bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
       if (prev[i] == cur[i]) continue;
       const float c = load(cur[i]);
       if (!std::isfinite(c)) continue;
-      {
-        const float p = load(prev[i]);
-        if (!std::isfinite(p)) continue;
-        if (Jumped(c, p)) {
-          const uint32_t* pv = prev + (i - w);
-          const uint32_t* cv = cur + (i - w);
-          if (matrices && zero(pv) != zero(cv)) {
-            cleared.push_back(v);
-            i += stride_words - w;
-            break;
-          }
-          if (!(matrices && w < 11 && w % 4 != 3 && rigid(pv, cv))) {
-            return false;
-          }
+      const float p = load(prev[i]);
+      if (!std::isfinite(p)) continue;
+      if (Jumped(c, p)) {
+        const uint32_t* pv = prev + (i - w);
+        const uint32_t* cv = cur + (i - w);
+        if (matrices && zero(pv) != zero(cv)) {
+          cleared.push_back(v);
+          return true;
         }
-        changed |= uint64_t(1) << w;
-        moved[w] = std::max(moved[w], std::abs(c - p));
+        if (!(matrices && w < 11 && w % 4 != 3 && rigid(pv, cv))) {
+          return false;
+        }
       }
+      changed |= uint64_t(1) << w;
+      moved[w] = std::max(moved[w], std::abs(c - p));
     }
-  }
-  // The extents over the vertices, only of the words the rules below judge.
-  const uint64_t judged =
-      ((float_words & ~changed) ? changed : 0) | (changed & packed.uv_words);
-  for (uint32_t v = 0, next_cleared = 0; judged && v < vertices; ++v) {
-    if (next_cleared < cleared.size() && cleared[next_cleared] == v) {
-      ++next_cleared;
+    return true;
+  };
+  // Masks, not && or a conditional store: either becomes a masked load or
+  // store, microcoded on AMD (a masked store cost ~2 ns a word on Zen 3).
+  auto mask = [](bool b) { return b ? ~0u : 0u; };
+  std::vector<uint32_t> by_word;  // the 8-vertex chunks judged word by word
+  uint32_t v = 0;
+  for (; v + 8 <= vertices; v += 8) {
+    const uint32_t* pv = prev + v * stride_words;
+    const uint32_t* cv = cur + v * stride_words;
+    uint32_t odd = 0;  // a word not moved alone
+    for (uint32_t k = 0; k < span; ++k) {
+      const float c = load(cv[k]), p = load(pv[k]);
+      const uint32_t differs = mask(pv[k] != cv[k]);
+      const uint32_t lerps = differs & floats[k] & mask(std::isfinite(c) & std::isfinite(p));
+      odd |= (differs & ~floats[k] & ~packs[k]) | (lerps & mask(Jumped(c, p)));
+    }
+    if (odd) {
+      for (uint32_t u = v; u < v + 8; ++u) {
+        if (!judge(u)) return false;
+      }
+      by_word.push_back(v);
       continue;
     }
-    for (uint64_t m = judged; m; m &= m - 1) {
-      const uint32_t w = uint32_t(std::countr_zero(m));
-      const float c = load(cur[v * stride_words + w]);
-      if (!std::isfinite(c)) continue;
-      lo[w] = std::min(lo[w], c);
-      hi[w] = std::max(hi[w], c);
+    for (uint32_t k = 0; k < span; ++k) {
+      const float c = load(cv[k]), p = load(pv[k]);
+      const uint32_t differs = mask(pv[k] != cv[k]);
+      const uint32_t lerps = differs & floats[k] & mask(std::isfinite(c) & std::isfinite(p));
+      float_changed[k] |= lerps;
+      pack_changed[k] |= differs & packs[k];
+      // fmax / fmin: std::max / std::min (no NaN here) whose select of the
+      // stored value became a masked store (see mask above). Vector code
+      // only without strict FP (see this file in CMakeLists.txt).
+      const float d = std::bit_cast<float>(std::bit_cast<uint32_t>(std::abs(c - p)) & lerps);
+      span_moved[k] = std::fmax(span_moved[k], d);
+      constexpr float inf = std::numeric_limits<float>::infinity();
+      span_lo[k] = std::fmin(span_lo[k], std::isfinite(c) ? c : inf);
+      span_hi[k] = std::fmax(span_hi[k], std::isfinite(c) ? c : -inf);
     }
   }
+  const uint32_t tail = v;
+  for (; v < vertices; ++v) {
+    if (!judge(v)) return false;
+  }
+  for (uint32_t k = 0, w = 0; k < span; ++k, w = w + 1 == stride_words ? 0 : w + 1) {
+    changed |= uint64_t(float_changed[k] & 1) << w;
+    packed_changed |= uint64_t(pack_changed[k] & 1) << w;
+    moved[w] = std::max(moved[w], span_moved[k]);
+    lo[w] = std::min(lo[w], span_lo[k]);
+    hi[w] = std::max(hi[w], span_hi[k]);
+  }
+  // The extents over the vertices, only of the words the rules below judge:
+  // of the vertices judged word by word (the rest summed above, all words;
+  // only those judged are read, and only by hi > lo and hi - lo).
+  const uint64_t judged =
+      ((float_words & ~changed) ? changed : 0) | (changed & packed.uv_words);
+  uint32_t next_cleared = 0;
+  auto extents = [&](uint32_t from, uint32_t to) {
+    for (uint32_t v = from; v < to; ++v) {
+      while (next_cleared < cleared.size() && cleared[next_cleared] < v) ++next_cleared;
+      if (next_cleared < cleared.size() && cleared[next_cleared] == v) continue;
+      for (uint64_t m = judged; m; m &= m - 1) {
+        const uint32_t w = uint32_t(std::countr_zero(m));
+        const float c = load(cur[v * stride_words + w]);
+        if (!std::isfinite(c)) continue;
+        lo[w] = std::min(lo[w], c);
+        hi[w] = std::max(hi[w], c);
+      }
+    }
+  };
+  for (uint32_t from : by_word) {
+    if (judged) extents(from, from + 8);
+  }
+  if (judged) extents(tail, vertices);
   // A sprite switched, not moved: every float word that changed (a texture
   // coordinate picking another atlas cell - a stage name, a digit) moved at
   // least its own extent over the vertices while the others (the position)
@@ -1106,35 +1196,101 @@ bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
   if (switched) {
     return false;
   }
-  for (uint32_t v = 0, next_cleared = 0; v < vertices;
-       ++v, prev += stride_words, cur += stride_words) {
-    if (next_cleared < cleared.size() && cleared[next_cleared] == v) {
+  // Per word of the span, all ones where it is lerped.
+  uint32_t lerp_span[8 * 64];
+  for (uint32_t k = 0, w = 0; k < span; ++k, w = w + 1 == stride_words ? 0 : w + 1) {
+    lerp_span[k] = (changed >> w) & 1 ? ~0u : 0;
+  }
+  auto lerp_floats = [&](const uint32_t* p, uint32_t* c, uint32_t words, const uint32_t* lerp) {
+    for (uint32_t k = 0; k < words; ++k) {
+      const float cf = load(c[k]), pf = load(p[k]);
+      const uint32_t value = xenos::GpuSwap(std::bit_cast<uint32_t>(pf + (cf - pf) * t), e);
+      // An equal word is kept: -0 would lerp to +0.
+      const uint32_t m = lerp[k] & mask((p[k] != c[k]) & std::isfinite(cf) & std::isfinite(pf));
+      c[k] = (value & m) | (c[k] & ~m);  // see mask above
+    }
+  };
+  auto lerp_packed = [&](const uint32_t* p, uint32_t* c) {
+    for (uint64_t m = packed_changed; m; m &= m - 1) {
+      const uint32_t w = uint32_t(std::countr_zero(m));
+      if (p[w] != c[w]) {
+        c[w] = LerpPacked(p[w], c[w], xenos::VertexFormat(packed.format[w]),
+                          (packed.is_signed >> w) & 1, e, t);
+      }
+    }
+  };
+  for (uint32_t v = 0, next_cleared = 0; v < vertices;) {
+    const uint32_t* pv = prev + v * stride_words;
+    uint32_t* cv = cur + v * stride_words;
+    // 8 at a time where none is cleared; rotations found on the words as
+    // set, written over their lerp.
+    if (v + 8 <= vertices && (next_cleared == cleared.size() || cleared[next_cleared] >= v + 8)) {
+      uint32_t rotations[8][11];
+      uint32_t rotated = 0;
+      for (uint32_t u = 0; matrices && u < 8; ++u) {
+        const uint32_t* p = pv + u * stride_words;
+        const uint32_t* c = cv + u * stride_words;
+        if (!std::equal(p, p + 11, c) && rigid(p, c)) {
+          rotated |= 1u << u;
+          for (uint32_t k = 0; k < 11; ++k) {
+            rotations[u][k] = xenos::GpuSwap(std::bit_cast<uint32_t>(turned[k]), e);
+          }
+        }
+      }
+      lerp_floats(pv, cv, span, lerp_span);
+      for (uint32_t u = 0; u < 8; ++u) {
+        uint32_t* c = cv + u * stride_words;
+        if (packed_changed) lerp_packed(pv + u * stride_words, c);
+        for (uint32_t k = 0; (rotated >> u) & 1 && k < 11; ++k) {
+          if (k % 4 != 3) c[k] = rotations[u][k];
+        }
+      }
+      v += 8;
+      continue;
+    }
+    ++v;
+    if (next_cleared < cleared.size() && cleared[next_cleared] == v - 1) {
       ++next_cleared;
       continue;
     }
+    // The rest one by one, word by word.
     uint64_t own = 0;  // words written as a rotation
-    if (matrices && !std::equal(prev, prev + 11, cur) && rigid(prev, cur)) {
+    if (matrices && !std::equal(pv, pv + 11, cv) && rigid(pv, cv)) {
       for (uint32_t k = 0; k < 11; ++k) {
-        if (k % 4 != 3) cur[k] = xenos::GpuSwap(std::bit_cast<uint32_t>(turned[k]), e);
+        if (k % 4 != 3) cv[k] = xenos::GpuSwap(std::bit_cast<uint32_t>(turned[k]), e);
       }
       own = 0x777;
     }
     for (uint64_t m = changed & ~own; m; m &= m - 1) {
       const uint32_t w = uint32_t(std::countr_zero(m));
-      if (prev[w] == cur[w]) continue;
-      const float c = load(cur[w]), p = load(prev[w]);
+      if (pv[w] == cv[w]) continue;
+      const float c = load(cv[w]), p = load(pv[w]);
       if (!std::isfinite(c) || !std::isfinite(p)) continue;
-      cur[w] = xenos::GpuSwap(std::bit_cast<uint32_t>(p + (c - p) * t), e);
+      cv[w] = xenos::GpuSwap(std::bit_cast<uint32_t>(p + (c - p) * t), e);
     }
-    for (uint64_t m = packed_changed; m; m &= m - 1) {
-      const uint32_t w = uint32_t(std::countr_zero(m));
-      if (prev[w] != cur[w]) {
-        cur[w] = LerpPacked(prev[w], cur[w], xenos::VertexFormat(packed.format[w]),
-                            (packed.is_signed >> w) & 1, e, t);
-      }
-    }
+    lerp_packed(pv, cv);
   }
   return true;
+}
+}  // namespace
+
+bool LerpVertexFloats(const uint32_t* prev, uint32_t* cur, uint32_t vertices,
+                      uint32_t stride_words, uint64_t float_words, const PackedWords& packed,
+                      uint32_t endian, float t, uint32_t group) {
+  switch (xenos::Endian(endian)) {
+    case xenos::Endian::k8in16:
+      return LerpVertexFloatsT<xenos::Endian::k8in16>(prev, cur, vertices, stride_words,
+                                                      float_words, packed, t, group);
+    case xenos::Endian::k8in32:
+      return LerpVertexFloatsT<xenos::Endian::k8in32>(prev, cur, vertices, stride_words,
+                                                      float_words, packed, t, group);
+    case xenos::Endian::k16in32:
+      return LerpVertexFloatsT<xenos::Endian::k16in32>(prev, cur, vertices, stride_words,
+                                                       float_words, packed, t, group);
+    default:
+      return LerpVertexFloatsT<xenos::Endian::kNone>(prev, cur, vertices, stride_words,
+                                                     float_words, packed, t, group);
+  }
 }
 
 uint32_t LerpPrimitives(const uint32_t* prev, uint32_t prev_vertices, uint32_t* cur,
