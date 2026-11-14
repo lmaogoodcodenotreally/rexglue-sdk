@@ -1851,7 +1851,9 @@ void CommandProcessor::InterpVertexDraw(const Shader& vertex_shader) {
   if (!interp_recording_ || !shared_memory) {
     return;
   }
-  InterpBudgetScope budget(interp_budget_[interp_replaying_ ? 1 : 0]);  // TEMP DIAGNOSTIC
+  // TEMP DIAGNOSTIC, diag builds only: two clock reads a draw were ~1% of the CP.
+  std::optional<InterpBudgetScope> budget;
+  if (rex::diag::enabled()) budget.emplace(interp_budget_[interp_replaying_ ? 1 : 0]);
   const uint32_t packet = shared_memory->interp_packet_;
   auto streams_at = [](const std::vector<InterpVertexStream>& streams, uint32_t at) {
     return std::lower_bound(streams.begin(), streams.end(), at,
