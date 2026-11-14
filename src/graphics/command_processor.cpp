@@ -1315,16 +1315,22 @@ void CommandProcessor::RecordPacket(const memory::RingBuffer& reader) {
         return;
       }
     }
-    peek = reader;  // not recorded as writes: copied as is below
-    peek.ReadAndSwap<uint32_t>();
+    // not recorded as writes: copied as is below
   }
-  if (peek.read_count() + sizeof(uint32_t) < dwords * sizeof(uint32_t)) {
+  if (reader.read_count() < dwords * sizeof(uint32_t)) {
     return;  // malformed; ExecutePacket reports it
   }
-  const size_t at = interp_cur_.size();
-  interp_cur_.resize(at + dwords);
-  memory::RingBuffer copy = reader;
-  copy.Read(reinterpret_cast<uint8_t*>(interp_cur_.data() + at), dwords * sizeof(uint32_t));
+  // Appended straight from the ring (both halves at its wrap): through
+  // RingBuffer::Read, onto a zero-filled resize, recording cost ~5% of the CP.
+  const uint32_t bytes = dwords * sizeof(uint32_t);
+  const uint32_t offset = reader.read_offset();
+  const uint32_t first = std::min(bytes, reader.capacity() - offset);
+  const auto* head = reinterpret_cast<const uint32_t*>(reader.buffer() + offset);
+  interp_cur_.insert(interp_cur_.end(), head, head + first / sizeof(uint32_t));
+  if (first < bytes) {
+    const auto* wrapped = reinterpret_cast<const uint32_t*>(reader.buffer());
+    interp_cur_.insert(interp_cur_.end(), wrapped, wrapped + (bytes - first) / sizeof(uint32_t));
+  }
 }
 
 bool CommandProcessor::HeldSwapDueSoon() const {
