@@ -251,6 +251,14 @@ endif()
 # Third-party dependencies (vendored sources only)
 add_subdirectory(thirdparty)
 
+# For every SDK target, not just rexui: it changes Presenter's layout
+# (GuestOutputPaintConfig members), and rex/ui/presenter.h is included across
+# the SDK, so a target without it read the inline accessors at wrong offsets
+# (host_refresh_hz() was 0 in rexgpu).
+if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include")
+    add_compile_definitions(REX_HAS_FIDELITYFX_SDK=1)
+endif()
+
 # Enable warnings after thirdparty
 add_compile_options(
     -Wall

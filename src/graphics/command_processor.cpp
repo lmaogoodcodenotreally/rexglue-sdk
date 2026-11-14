@@ -1334,6 +1334,9 @@ bool CommandProcessor::HeldSwapDueSoon() const {
                  rex::chrono::Clock::QueryHostTickFrequency() / 500;
 }
 
+// TEMP DIAGNOSTIC (3-frame ticks): host ticks spent in present calls.
+static uint64_t g_present_ticks = 0;
+
 void CommandProcessor::ServiceHeldSwap(bool force) {
   while (interp_held_pending_) {
     if (force) {
@@ -1348,7 +1351,9 @@ void CommandProcessor::ServiceHeldSwap(bool force) {
       ++interp_stat_held_;
       interp_stat_late_ += rex::chrono::Clock::QueryHostTickCount() - held.deadline;
     }
+    const uint64_t present_start = rex::chrono::Clock::QueryHostTickCount();  // TEMP DIAGNOSTIC
     PresentHeldSwapTexture(held.slot, interp_held_width_, interp_held_height_);
+    g_present_ticks += rex::chrono::Clock::QueryHostTickCount() - present_start;
     if (CaptureWanted(g_capture_swap)) {  // TEMP DIAGNOSTIC
       CaptureGuest(graphics_system_, held.slot ? fmt::format("i{}", held.slot).c_str() : "r",
                    g_capture_swap);
@@ -1438,6 +1443,23 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
   const uint64_t period = interp_period_;
   interp_last_swap_ = now;
   static uint64_t g_prev_real = 0, g_prev_cost = 0;  // TEMP DIAGNOSTIC: the guard's inputs
+  // TEMP DIAGNOSTIC: the guard's inputs per stats window: real work, swap cost,
+  // extra-frame estimate (sums), frames judged, frames it cut below the wanted.
+  static uint64_t g_guard[5] = {};
+  static double g_guard_fps = 0.0;  // TEMP DIAGNOSTIC: the last frame's target rate
+  // TEMP DIAGNOSTIC (3-frame ticks), by frames made (index 1..3): ticks, the
+  // guard's estimate, the swap's actual cost, waits and presents inside it,
+  // the interval that followed, slow intervals that followed.
+  struct TickStat { uint64_t n, est, cost, wait, present, next, slow, missed; };
+  static TickStat g_tick[kInterpMaxPresents + 1] = {};
+  static uint32_t g_tick_prev = 0;  // frames made by the previous swap, 0: none
+  static uint64_t g_tick_est = 0;
+  if (g_tick_prev && interval < freq) {
+    g_tick[g_tick_prev].next += interval;
+    g_tick[g_tick_prev].slow += interval * 2000 > freq * 35;
+    g_tick[g_tick_prev].missed += interval * 40 > freq;  // over 25 ms: a guest vblank missed
+  }
+  const uint64_t tick_wait0 = interp_wait_ticks_, tick_present0 = g_present_ticks;
   {  // TEMP DIAGNOSTIC: where a late frame's time went (since the previous swap).
     static uint64_t last_budget[4] = {}, last_wait = 0;
     static uint32_t logged = 0;
@@ -1478,6 +1500,7 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
       ui::Presenter* presenter = graphics_system_ ? graphics_system_->presenter() : nullptr;
       fps = presenter ? presenter->host_refresh_hz() : 0.0;
     }
+    interp_refresh_ticks_ = fps > 0.0 ? uint64_t(double(freq) / fps) : 0;
     const double per_frame =
         std::clamp(fps * double(period) / double(freq), 2.0, double(kInterpMaxPresents));
     most_presents = uint32_t(std::ceil(per_frame - 1e-3));
@@ -1486,10 +1509,22 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
     // not made rather than slow the game. The first in-between frame costs the
     // parse and pairing too; each more one its lerp and replay.
     const uint64_t extra = interp_extra_cost_ ? interp_extra_cost_ : interp_cost_;
-    while (most_presents > 1 && real_work + interp_cost_ + extra * (most_presents - 2) >
-                                    period - period / 16) {
+    const uint32_t most_wanted = most_presents;  // TEMP DIAGNOSTIC
+    // More margin for frames past the first in-between one: optional, and
+    // their lag carries into the next tick (with the same ~1 ms as the first,
+    // 144 Hz cost the guest 3x the missed vblanks of 2 frames a tick).
+    while (most_presents > 1 &&
+           real_work + interp_cost_ + extra * (most_presents - 2) >
+               period - (most_presents > 2 ? period / 8 : period / 16)) {
       --most_presents;
     }
+    g_tick_est = real_work + interp_cost_ + extra * (most_presents > 2 ? most_presents - 2 : 0);
+    g_guard_fps = fps;  // TEMP DIAGNOSTIC
+    g_guard[0] += real_work;  // TEMP DIAGNOSTIC
+    g_guard[1] += interp_cost_;
+    g_guard[2] += extra;
+    ++g_guard[3];
+    g_guard[4] += most_presents < most_wanted;
     interp_phase_ += per_frame;
     const uint32_t wanted = uint32_t(interp_phase_ + 1e-3);
     interp_phase_ = std::max(0.0, interp_phase_ - wanted);
@@ -1545,6 +1580,19 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
     interp_held_count_ = 0;
     interp_held_next_ = 0;
     uint64_t ready = 0;
+    // At least about a display refresh after the frame before, across ticks:
+    // 3 frames in a tick come period / 3 apart, faster than the display takes
+    // them, and the present call then blocks the CP until it does (vsync):
+    // up to 1.3 ms a tick, which slowed the guest. The display shows one a
+    // refresh either way.
+    auto paced = [&](uint64_t deadline) {
+      const uint64_t spacing = interp_refresh_ticks_ - interp_refresh_ticks_ / 32;
+      if (interp_present_last_ && deadline < interp_present_last_ + spacing) {
+        deadline = interp_present_last_ + spacing;
+      }
+      interp_present_last_ = deadline;
+      return deadline;
+    };
     for (uint32_t j = 1; j < presents; ++j) {
       if (j > 1) {
         if (j == 2) {
@@ -1567,12 +1615,15 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
         first_replay = (done - replay_start) * 9 / 8;
       }
       const uint64_t deadline =
-          ready + uint64_t(double(period) * (double(j) / presents - 1.0 / most_presents));
+          paced(ready + uint64_t(double(period) * (double(j) / presents - 1.0 / most_presents)));
       if (deadline > done && HoldSwapTexture(j)) {
         interp_held_[interp_held_count_++] = {deadline, j};
         interp_held_pending_ = true;
       } else {
+        interp_present_last_ = done;
+        const uint64_t present_start = rex::chrono::Clock::QueryHostTickCount();  // TEMP DIAGNOSTIC
         IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+        g_present_ticks += rex::chrono::Clock::QueryHostTickCount() - present_start;
         if (CaptureWanted(g_capture_swap)) {  // TEMP DIAGNOSTIC
           CaptureGuest(graphics_system_, fmt::format("i{}", j).c_str(), g_capture_swap);
         }
@@ -1582,9 +1633,10 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
       extra_ticks = rex::chrono::Clock::QueryHostTickCount() - extra_ticks;
     }
     interp_held_[interp_held_count_++] = {
-        ready + uint64_t(double(period) * (1.0 - 1.0 / most_presents)), 0};
+        paced(ready + uint64_t(double(period) * (1.0 - 1.0 / most_presents))), 0};
     interp_held_pending_ = true;
   } else {
+    interp_present_last_ = rex::chrono::Clock::QueryHostTickCount();
     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
     if (CaptureWanted(g_capture_swap)) {  // TEMP DIAGNOSTIC
       CaptureGuest(graphics_system_, "r", g_capture_swap);
@@ -1652,6 +1704,14 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
                   interp_stat_presents_,
                   interp_stat_held_ ? interp_stat_late_ * 1000000 / freq / interp_stat_held_ : 0);
       interp_stat_presents_ = interp_stat_held_ = interp_stat_late_ = 0;
+      if (g_guard[3]) {  // TEMP DIAGNOSTIC
+        auto avg_us = [&](uint64_t ticks) { return ticks * 1000000 / freq / g_guard[3]; };
+        REXGPU_INFO("frame_interp: guard avg us: real work {}, swap cost {}, extra frame {}, "
+                    "budget {}; cut {} of {} frames; fps {}",
+                    avg_us(g_guard[0]), avg_us(g_guard[1]), avg_us(g_guard[2]),
+                    (period - period / 16) * 1000000 / freq, g_guard[4], g_guard[3], g_guard_fps);
+      }
+      std::fill(std::begin(g_guard), std::end(g_guard), 0);
     }
   }
 
@@ -1677,6 +1737,29 @@ void CommandProcessor::SwapWithInterpolation(uint32_t frontbuffer_ptr,
   }
   interp_swap_end_ = rex::chrono::Clock::QueryHostTickCount();
   interp_swap_end_wait_ = interp_wait_ticks_;
+  {  // TEMP DIAGNOSTIC (3-frame ticks)
+    const uint32_t made = interpolate ? presents : 1;
+    TickStat& ts = g_tick[made];
+    ++ts.n;
+    ts.est += interpolate ? g_tick_est : 0;
+    ts.cost += interp_swap_end_ - now + real_work;
+    ts.wait += interp_wait_ticks_ - tick_wait0;
+    ts.present += g_present_ticks - tick_present0;
+    g_tick_prev = made;
+    if (interp_stat_frames_ == 0) {  // a stats window just closed
+      for (uint32_t k = 1; k <= kInterpMaxPresents; ++k) {
+        const TickStat& t = g_tick[k];
+        if (!t.n) continue;
+        auto avg = [&](uint64_t v) { return v * 1000000 / freq / t.n; };
+        REXGPU_INFO("frame_interp: ticks making {}: {}; avg us: guard estimate {}, actual real "
+                    "work + swap {}, waits in the swap {}, presents {}, next interval {}; {} "
+                    "next intervals over 17.5 ms, {} over 25 ms",
+                    k, t.n, avg(t.est), avg(t.cost), avg(t.wait), avg(t.present), avg(t.next),
+                    t.slow, t.missed);
+      }
+      std::fill(std::begin(g_tick), std::end(g_tick), TickStat{});
+    }
+  }
   if (interpolate) {  // the whole swap: pairing, replay, and submitting and showing both frames
     const uint64_t cost = interp_swap_end_ - now - extra_ticks;
     interp_cost_ = interp_cost_ ? (interp_cost_ * 7 + cost) / 8 : cost;

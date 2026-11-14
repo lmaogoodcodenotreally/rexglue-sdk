@@ -303,6 +303,9 @@ class CommandProcessor {
   bool interp_replaying_ = false;
   bool interp_have_prev_ = false;
   bool interp_held_pending_ = false;  // interp_held_next_ < interp_held_count_
+  // When the last frame was due (host ticks), and the display's refresh
+  // interval: frames are never due closer together than about one refresh.
+  uint64_t interp_present_last_ = 0, interp_refresh_ticks_ = 0;
   struct InterpHeld {
     uint64_t deadline;  // host ticks
     uint32_t slot;
