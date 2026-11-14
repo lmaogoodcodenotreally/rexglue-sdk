@@ -81,6 +81,12 @@ struct Pairing {
   std::vector<uint32_t> match;  // per cur segment: the prev segment, or UINT32_MAX
   std::vector<bool> sure;
   std::vector<uint32_t> copies;
+  // Per cur segment, the jump check's findings, which do not depend on t:
+  // bit 0 jumped, 1 switched, 2 restructured; and its visibly moved vec4
+  // rows, rows[rows_at[i].first, rows_at[i].second).
+  std::vector<uint8_t> found;
+  std::vector<std::pair<uint32_t, uint32_t>> rows_at;
+  std::vector<uint32_t> rows;
   bool filled = false;
 };
 Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cur_be,

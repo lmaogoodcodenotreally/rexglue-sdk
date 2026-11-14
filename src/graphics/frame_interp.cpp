@@ -343,6 +343,9 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
     pr.match.assign(cur.segments.size(), kNone);
     pr.sure.assign(cur.segments.size(), false);
     pr.copies.assign(cur.segments.size(), 0);
+    pr.found.assign(cur.segments.size(), 0);
+    pr.rows_at.assign(cur.segments.size(), {0, 0});
+    pr.rows.clear();
   }
   std::vector<uint32_t>& match = pr.match;
   std::vector<bool> used(prev.segments.size());
@@ -886,7 +889,20 @@ Stats Interpolate(const uint32_t* prev_be, const ParsedFrame& prev, uint32_t* cu
     // pairing that jumped is likely another draw: drawn as is. So is a copy
     // that jumped: as many copies in both frames does not make it the same
     // object (BO's static props blinked halfway to another copy).
-    const bool jumped = !visit(0);
+    // The extra in-between frames of a tick take the first one's findings.
+    bool jumped;
+    if (reuse) {
+      const uint8_t f = pr.found[i];
+      jumped = f & 1;
+      switched = f & 2;
+      restructured = f & 4;
+      rows.assign(pr.rows.begin() + pr.rows_at[i].first, pr.rows.begin() + pr.rows_at[i].second);
+    } else {
+      jumped = !visit(0);
+      pr.found[i] = uint8_t(jumped | switched << 1 | restructured << 2);
+      pr.rows_at[i] = {uint32_t(pr.rows.size()), uint32_t(pr.rows.size() + rows.size())};
+      pr.rows.insert(pr.rows.end(), rows.begin(), rows.end());
+    }
     if (restructured) {
       ++stats.jumped;
       borrow(seg, nullptr);

@@ -755,3 +755,46 @@ TEST_CASE("frame_interp reuses its pairing for more in-between frames") {
   CHECK(second.Float(b) == 15.0f);
   CHECK(second.Float(a) == 8.0f);
 }
+
+TEST_CASE("frame_interp reuses its jump findings alike") {
+  // A switched light, a fast sure motion, a copy that jumped, a turning
+  // matrix: the second in-between frame from the kept findings is the one a
+  // fresh pass makes.
+  Stream prev, cur;
+  auto scene = [](Stream& s, bool now) {
+    s.Shaders(0x1000, 0x2000);
+    s.Constants(0x4000, {2, 0.9f, now ? -3.0f : -2.9f, 1});
+    s.Draw(0x11);
+    s.Shaders(0x3000, 0x4000);
+    s.Constants(0x4000, now ? std::initializer_list<float>{2, 0.9f, -3.0f, 1}
+                            : std::initializer_list<float>{2, 0.8f, -0.2f, 1});
+    s.Draw(0x22);
+    s.Shaders(0x5000, 0x6000);
+    s.Constants(0x4000, {now ? -0.9f : 0.9f, now ? 3.0f : -0.4f});
+    s.Draw(0x33);
+    for (float x : {0.0f, 100.0f}) {
+      s.Shaders(0x7000, 0x8000);
+      s.Constants(0x4000, {now ? x + 50 : x, 1});
+      s.Draw(0x44);
+    }
+    s.Shaders(0x9000, 0xA000);
+    s.Constants(0x4000, now ? std::initializer_list<float>{0, 2, 0, 0, -2, 0, 0, 0, 0, 0, 2, 0, 12, 0, 0, 1}
+                            : std::initializer_list<float>{2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 10, 0, 0, 1});
+    s.Draw(0x55);
+  };
+  scene(prev, false);
+  scene(cur, true);
+  ParsedFrame pp, pc;
+  Parse(prev.be.data(), prev.be.size(), pp);
+  Parse(cur.be.data(), cur.be.size(), pc);
+  Pairing pairing;
+  Stream first = cur, reused = cur, fresh = cur;
+  Interpolate(prev.be.data(), pp, first.be.data(), pc, 1.0f / 3, nullptr, &pairing);
+  const Stats a = Interpolate(prev.be.data(), pp, reused.be.data(), pc, 2.0f / 3, nullptr, &pairing);
+  const Stats b = Interpolate(prev.be.data(), pp, fresh.be.data(), pc, 2.0f / 3);
+  CHECK(a.jumped == b.jumped);
+  CHECK(a.lerped == b.lerped);
+  CHECK(b.jumped >= 2);
+  CHECK(reused.be == fresh.be);
+  CHECK(fresh.be != cur.be);
+}
